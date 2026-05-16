@@ -1,0 +1,6 @@
+{
+  "name": "n repeats last search forward; skips current match",
+  "initial": "<h>ello foo bar foo",
+  "keys": "/foo\rn",
+  "expected": "hello foo bar <foo>"
+}

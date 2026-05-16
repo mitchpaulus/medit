@@ -1,0 +1,6 @@
+{
+  "name": "Shift+N via kitty disambiguated form (CSI 110;2u) works like literal N",
+  "initial": "<h>ello foo bar foo",
+  "keys": "/foo\r\u001b[110;2u\u001b[110;2u",
+  "expected": "hello <foo> bar foo"
+}

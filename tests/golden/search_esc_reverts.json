@@ -1,0 +1,7 @@
+{
+  "name": "Esc in search mode reverts selection to where / was pressed",
+  "initial": "<h>ello foo bar foo",
+  "keys": "/fo\u001b[27u",
+  "expected": "<h>ello foo bar foo",
+  "expected_mode": "normal"
+}

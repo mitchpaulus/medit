@@ -94,7 +94,7 @@ impl Parser {
     pub fn flush(&mut self) -> Option<Event> {
         if self.buf.front() == Some(&0x1B) && self.buf.len() == 1 {
             self.buf.pop_front();
-            return Some(Event::Key(KeyEvent::plain(Key::Esc)));
+            return Some(normalize_event(Event::Key(KeyEvent::plain(Key::Esc))));
         }
         None
     }
@@ -102,6 +102,10 @@ impl Parser {
     /// Pull the next decoded event, or `None` if buffer is empty / contains
     /// only a partial sequence.
     pub fn next_event(&mut self) -> Option<Event> {
+        self.next_event_raw().map(normalize_event)
+    }
+
+    fn next_event_raw(&mut self) -> Option<Event> {
         let first = *self.buf.front()?;
         match first {
             0x1B => {
@@ -284,4 +288,21 @@ fn decode_csi(params: &[u8], final_byte: u8) -> Event {
         _ => Key::Char('?'),
     };
     Event::Key(KeyEvent::with(key, mods))
+}
+
+/// Collapse `Shift + ASCII lowercase letter` to `uppercase letter` with no
+/// SHIFT modifier. Both the legacy encoding (raw 'N' byte) and the kitty
+/// disambiguated form (`CSI 110;2u`) thus produce the same `KeyEvent`, which
+/// lets handlers match on a single canonical key.
+fn normalize_event(event: Event) -> Event {
+    let Event::Key(mut k) = event;
+    if k.mods.contains(Mods::SHIFT) {
+        if let Key::Char(c) = k.key {
+            if c.is_ascii_lowercase() {
+                k.key = Key::Char(c.to_ascii_uppercase());
+                k.mods = Mods(k.mods.0 & !Mods::SHIFT.0);
+            }
+        }
+    }
+    Event::Key(k)
 }

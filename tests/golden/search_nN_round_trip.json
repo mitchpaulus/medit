@@ -1,0 +1,6 @@
+{
+  "name": "n then N returns to the original match (round trip)",
+  "initial": "<h>ello foo bar foo",
+  "keys": "/foo\rnN",
+  "expected": "hello <foo> bar foo"
+}

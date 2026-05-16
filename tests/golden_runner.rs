@@ -5,7 +5,8 @@ use std::path::Path;
 
 use medit::buffer::Buffer;
 use medit::core::{
-    Mode, Registers, Selection, collect_bytes, handle_ex, handle_insert, handle_normal,
+    Mode, Registers, SearchState, Selection, collect_bytes, handle_ex, handle_insert,
+    handle_normal, handle_search,
 };
 use medit::input::{Event, Parser};
 
@@ -62,6 +63,8 @@ fn run_test_file(path: &Path) -> Result<(), String> {
     let mut ex_message = String::new();
     let mut pending_j = false;
     let mut pending_g = false;
+    let mut search_input = String::new();
+    let mut search_state = SearchState::default();
 
     let mut parser = Parser::new();
     parser.feed(keys.as_bytes());
@@ -82,6 +85,7 @@ fn run_test_file(path: &Path) -> Result<(), String> {
                     &mut mode,
                     &mut registers,
                     &mut pending_g,
+                    &mut search_state,
                     k,
                 );
             }
@@ -95,6 +99,17 @@ fn run_test_file(path: &Path) -> Result<(), String> {
                     &mut ex_input,
                     &mut ex_message,
                     None,
+                    k,
+                );
+            }
+            Mode::Search => {
+                handle_search(
+                    &buffer,
+                    &mut sel,
+                    &mut mode,
+                    &mut search_input,
+                    &mut search_state,
+                    &mut ex_message,
                     k,
                 );
             }
@@ -138,6 +153,7 @@ fn parse_mode(s: &str) -> Result<Mode, String> {
         "normal" => Ok(Mode::Normal),
         "insert" => Ok(Mode::Insert),
         "ex" => Ok(Mode::Ex),
+        "search" => Ok(Mode::Search),
         _ => Err(format!("unknown mode: {:?}", s)),
     }
 }

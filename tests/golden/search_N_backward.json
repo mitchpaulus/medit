@@ -1,0 +1,6 @@
+{
+  "name": "N walks backward through matches, wrapping at start",
+  "initial": "<h>ello foo bar foo",
+  "keys": "/foo\rNN",
+  "expected": "hello <foo> bar foo"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "/ + pattern + Enter selects the first match after head",
+  "initial": "<h>ello foo bar foo",
+  "keys": "/foo\r",
+  "expected": "hello <foo> bar foo"
+}

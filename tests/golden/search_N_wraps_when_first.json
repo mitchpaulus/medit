@@ -1,0 +1,6 @@
+{
+  "name": "N from first match wraps to the last match in buffer",
+  "initial": "<h>ello foo bar foo",
+  "keys": "/foo\rN",
+  "expected": "hello foo bar <foo>"
+}

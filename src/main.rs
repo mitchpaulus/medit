@@ -5,13 +5,14 @@ use std::path::PathBuf;
 
 use medit::buffer::Buffer;
 use medit::core::{
-    Mode, Registers, Selection, byte_at_line, collect_bytes, ensure_visible, handle_ex,
-    handle_insert, handle_normal, line_index, utf8_len,
+    Mode, Registers, SearchState, Selection, all_matches, byte_at_line, collect_bytes,
+    ensure_visible, handle_ex, handle_insert, handle_normal, handle_search, line_index, utf8_len,
 };
 use medit::input::{Event, Key, KeyEvent, Mods, Parser};
 use term::{RawMode, Screen};
 
 const SEL_BG: &str = "\x1b[48;5;24m";
+const MATCH_BG: &str = "\x1b[48;5;94m";
 const RESET_BG: &str = "\x1b[49m";
 
 fn main() -> io::Result<()> {
@@ -28,6 +29,8 @@ fn main() -> io::Result<()> {
     let mut ex_message = String::new();
     let mut pending_j = false;
     let mut pending_g = false;
+    let mut search_input = String::new();
+    let mut search_state = SearchState::default();
     let mut last_key: Option<KeyEvent> = None;
     let mut last_bytes: Vec<u8> = Vec::new();
 
@@ -43,6 +46,8 @@ fn main() -> io::Result<()> {
         top_line,
         path.as_deref(),
         &ex_input,
+        &search_input,
+        &search_state,
         &ex_message,
         last_key.as_ref(),
         &last_bytes,
@@ -67,6 +72,8 @@ fn main() -> io::Result<()> {
                 top_line,
                 path.as_deref(),
                 &ex_input,
+                &search_input,
+                &search_state,
                 &ex_message,
                 last_key.as_ref(),
                 &last_bytes,
@@ -97,12 +104,16 @@ fn main() -> io::Result<()> {
                         &mut mode,
                         &mut registers,
                         &mut pending_g,
+                        &mut search_state,
                         k,
                     ) {
                         return Ok(());
                     }
                     if mode == Mode::Ex {
                         ex_input.clear();
+                    }
+                    if mode == Mode::Search {
+                        search_input.clear();
                     }
                 }
                 Mode::Insert => {
@@ -120,6 +131,17 @@ fn main() -> io::Result<()> {
                         return Ok(());
                     }
                 }
+                Mode::Search => {
+                    handle_search(
+                        &buffer,
+                        &mut sel,
+                        &mut mode,
+                        &mut search_input,
+                        &mut search_state,
+                        &mut ex_message,
+                        k,
+                    );
+                }
             }
         }
         let viewport_rows = screen.rows.saturating_sub(1) as usize;
@@ -133,6 +155,8 @@ fn main() -> io::Result<()> {
             top_line,
             path.as_deref(),
             &ex_input,
+            &search_input,
+            &search_state,
             &ex_message,
             last_key.as_ref(),
             &last_bytes,
@@ -195,6 +219,8 @@ fn render(
     top_line: usize,
     path: Option<&std::path::Path>,
     ex_input: &str,
+    search_input: &str,
+    search: &SearchState,
     ex_message: &str,
     last_key: Option<&KeyEvent>,
     last_bytes: &[u8],
@@ -207,6 +233,14 @@ fn render(
     let sel_max = sel.max();
     let head = sel.head;
     let start_byte = byte_at_line(&bytes, top_line);
+
+    let preview_matches: Vec<(usize, usize)> = match (mode, search.preview.as_ref()) {
+        (Mode::Search, Some(re)) => all_matches(&bytes, re),
+        _ => Vec::new(),
+    };
+    let in_preview = |i: usize| -> bool {
+        preview_matches.iter().any(|&(s, e)| i >= s && i < e)
+    };
 
     let mut row: u16 = 1;
     let mut col: u16 = 1;
@@ -226,7 +260,22 @@ fn render(
             Some(&b) => b,
             None => break,
         };
-        let in_span = mode == Mode::Normal && i >= sel_min && i <= sel_max && i != head;
+        let show_selection = matches!(mode, Mode::Normal | Mode::Search);
+        // The terminal cursor only sits on the buffer in Normal/Insert. In
+        // Search/Ex modes it's on the prompt line, so we should paint the
+        // head cell too (otherwise the head char of the selection looks
+        // unhighlighted while the user is typing).
+        let cursor_on_buffer = matches!(mode, Mode::Normal | Mode::Insert);
+        let in_sel =
+            show_selection && i >= sel_min && i <= sel_max && !(cursor_on_buffer && i == head);
+        let in_match = !in_sel && in_preview(i);
+        let bg = if in_sel {
+            Some(SEL_BG)
+        } else if in_match {
+            Some(MATCH_BG)
+        } else {
+            None
+        };
         match b {
             b'\n' => {
                 row = row.saturating_add(1);
@@ -238,10 +287,12 @@ fn render(
             }
             b'\t' => {
                 let advance = 4 - ((col as usize - 1) % 4);
-                if in_span && col <= cols {
-                    let spaces = " ".repeat(advance);
-                    let s = format!("{}{}{}", SEL_BG, spaces, RESET_BG);
-                    screen.write_at(row, col, &s);
+                if let Some(bgc) = bg {
+                    if col <= cols {
+                        let spaces = " ".repeat(advance);
+                        let s = format!("{}{}{}", bgc, spaces, RESET_BG);
+                        screen.write_at(row, col, &s);
+                    }
                 }
                 col = col.saturating_add(advance as u16);
                 i += 1;
@@ -250,8 +301,8 @@ fn render(
                 let letter = (c + 0x40) as char;
                 let body = format!("^{}", letter);
                 if col <= cols {
-                    if in_span {
-                        screen.write_at(row, col, &format!("{}{}{}", SEL_BG, body, RESET_BG));
+                    if let Some(bgc) = bg {
+                        screen.write_at(row, col, &format!("{}{}{}", bgc, body, RESET_BG));
                     } else {
                         screen.write_at(row, col, &body);
                     }
@@ -264,8 +315,8 @@ fn render(
                 let end = (i + n).min(bytes.len());
                 let s = std::str::from_utf8(&bytes[i..end]).unwrap_or("?");
                 if col <= cols {
-                    if in_span {
-                        screen.write_at(row, col, &format!("{}{}{}", SEL_BG, s, RESET_BG));
+                    if let Some(bgc) = bg {
+                        screen.write_at(row, col, &format!("{}{}{}", bgc, s, RESET_BG));
                     } else {
                         screen.write_at(row, col, s);
                     }
@@ -289,11 +340,18 @@ fn render(
         Mode::Normal => "N",
         Mode::Insert => "I",
         Mode::Ex => "X",
+        Mode::Search => "S",
     };
     let cols_usize = cols as usize;
+    let is_prompt = matches!(mode, Mode::Ex | Mode::Search);
 
-    let (status, final_cur_row, final_cur_col) = if mode == Mode::Ex {
-        let prompt = format!(":{}", ex_input);
+    let (status, final_cur_row, final_cur_col) = if is_prompt {
+        let (prefix, input) = if mode == Mode::Ex {
+            (":", ex_input)
+        } else {
+            ("/", search_input)
+        };
+        let prompt = format!("{}{}", prefix, input);
         let col_pos = (prompt.chars().count() as u16).saturating_add(1).max(1);
         (prompt, screen.rows, col_pos)
     } else if !ex_message.is_empty() {
@@ -310,7 +368,7 @@ fn render(
     while padded.chars().count() < cols_usize {
         padded.push(' ');
     }
-    let status_text = if mode == Mode::Ex {
+    let status_text = if is_prompt {
         padded
     } else {
         format!("\x1b[7m{}\x1b[0m", padded)

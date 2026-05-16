@@ -11,11 +11,29 @@ pub enum Mode {
     Normal,
     Insert,
     Ex,
+    Search,
 }
 
 #[derive(Default)]
 pub struct Registers {
     pub default: Vec<u8>,
+}
+
+/// Search machinery.
+///
+/// - `pattern` is the last *committed* regex (after `Enter`), used by `n`/`N`
+///   to repeat searches in normal mode.
+/// - `preview` is the regex compiled from the current incremental input
+///   while in `Mode::Search`. Used by the renderer to highlight matches as
+///   the user types.
+/// - `start` is the selection captured on `/` entry, so `Esc` can revert and
+///   so incremental forward searches start from a stable position rather
+///   than chasing themselves through the buffer.
+#[derive(Default)]
+pub struct SearchState {
+    pub pattern: Option<regex::bytes::Regex>,
+    pub preview: Option<regex::bytes::Regex>,
+    pub start: Option<CursorSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -82,6 +100,7 @@ pub fn handle_normal(
     mode: &mut Mode,
     registers: &mut Registers,
     pending_g: &mut bool,
+    search: &mut SearchState,
     k: KeyEvent,
 ) -> bool {
     let bytes = collect_bytes(buffer);
@@ -121,6 +140,26 @@ pub fn handle_normal(
         sel.anchor = new_head;
         sel.head = new_head;
         sel.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+        return false;
+    }
+
+    // / enters Search mode; n / N repeat last search forward / backward.
+    if k.mods.is_empty() && k.key == Key::Char('/') {
+        search.start = Some(snapshot_of(sel));
+        search.preview = None;
+        *mode = Mode::Search;
+        return false;
+    }
+    if k.mods.is_empty() && k.key == Key::Char('n') {
+        if let Some(re) = search.pattern.as_ref() {
+            find_and_select(sel, &bytes, re, true);
+        }
+        return false;
+    }
+    if k.mods.is_empty() && k.key == Key::Char('N') {
+        if let Some(re) = search.pattern.as_ref() {
+            find_and_select(sel, &bytes, re, false);
+        }
         return false;
     }
 
@@ -316,6 +355,169 @@ fn exit_insert_mode(buffer: &Buffer, sel: &mut Selection, mode: &mut Mode) {
     }
     sel.head = snap_to_char_or_last(&bytes, sel.head);
     sel.anchor = snap_to_char_or_last(&bytes, sel.anchor);
+}
+
+pub fn handle_search(
+    buffer: &Buffer,
+    sel: &mut Selection,
+    mode: &mut Mode,
+    search_input: &mut String,
+    search: &mut SearchState,
+    ex_message: &mut String,
+    k: KeyEvent,
+) {
+    match k.key {
+        Key::Esc => {
+            *mode = Mode::Normal;
+            search_input.clear();
+            // Revert selection to where it was on `/`.
+            if let Some(start) = search.start.take() {
+                apply_snapshot(sel, start);
+            }
+            search.preview = None;
+        }
+        Key::Enter => {
+            let pat = search_input.clone();
+            *mode = Mode::Normal;
+            search_input.clear();
+            search.start = None;
+            search.preview = None;
+            if pat.is_empty() {
+                return;
+            }
+            match regex::bytes::Regex::new(&pat) {
+                Ok(re) => {
+                    // sel already reflects the first match from incremental
+                    // updates; if nothing matched, sel reverted to start.
+                    let bytes = collect_bytes(buffer);
+                    if re.find(&bytes).is_none() {
+                        *ex_message = format!("no match: /{}", pat);
+                    }
+                    search.pattern = Some(re);
+                }
+                Err(e) => {
+                    *ex_message = format!("regex error: {}", e);
+                }
+            }
+        }
+        Key::Backspace => {
+            if search_input.pop().is_none() {
+                *mode = Mode::Normal;
+                if let Some(start) = search.start.take() {
+                    apply_snapshot(sel, start);
+                }
+                search.preview = None;
+                return;
+            }
+            update_search_preview(buffer, sel, search, search_input);
+        }
+        Key::Char(c) => {
+            if k.mods.contains(Mods::CTRL) || k.mods.contains(Mods::ALT) {
+                return;
+            }
+            search_input.push(c);
+            update_search_preview(buffer, sel, search, search_input);
+        }
+        _ => {}
+    }
+}
+
+/// Recompile the incremental regex from `input` and move the selection to
+/// the first match starting at or after `search.start`'s head. On compile
+/// failure or no match, the selection reverts to the captured start and
+/// no preview is published (so the live highlight clears).
+fn update_search_preview(
+    buffer: &Buffer,
+    sel: &mut Selection,
+    search: &mut SearchState,
+    input: &str,
+) {
+    let start = match search.start {
+        Some(s) => s,
+        None => return,
+    };
+    if input.is_empty() {
+        apply_snapshot(sel, start);
+        search.preview = None;
+        return;
+    }
+    let re = match regex::bytes::Regex::new(input) {
+        Ok(re) => re,
+        Err(_) => {
+            // Invalid regex (often: in-flight, e.g. trailing `(`). Don't
+            // change sel; just clear preview so the highlight goes away
+            // until the user fixes it.
+            search.preview = None;
+            return;
+        }
+    };
+    let bytes = collect_bytes(buffer);
+    apply_snapshot(sel, start);
+    let from = next_char_or_end(&bytes, start.head);
+    let first = re.find_at(&bytes, from).or_else(|| re.find(&bytes));
+    if let Some(m) = first {
+        apply_match(sel, &bytes, m.start(), m.end());
+    }
+    search.preview = Some(re);
+}
+
+/// Collect all matches of `re` in `bytes` as (start, end) byte ranges. Used
+/// by the renderer to draw live incremental-search highlights.
+pub fn all_matches(bytes: &[u8], re: &regex::bytes::Regex) -> Vec<(usize, usize)> {
+    re.find_iter(bytes).map(|m| (m.start(), m.end())).collect()
+}
+
+/// Find a match and update `sel` to cover it. Forward search starts AFTER the
+/// current head's char; backward search finds the last match strictly before
+/// the current selection's start. Wraps around if no match is found in the
+/// primary direction. Returns true if any match was found.
+fn find_and_select(
+    sel: &mut Selection,
+    bytes: &[u8],
+    re: &regex::bytes::Regex,
+    forward: bool,
+) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    if forward {
+        let start = next_char_or_end(bytes, sel.head);
+        if let Some(m) = re.find_at(bytes, start) {
+            apply_match(sel, bytes, m.start(), m.end());
+            return true;
+        }
+        if let Some(m) = re.find(bytes) {
+            apply_match(sel, bytes, m.start(), m.end());
+            return true;
+        }
+        false
+    } else {
+        let before = sel.min();
+        let candidates: Vec<_> = re
+            .find_iter(bytes)
+            .take_while(|m| m.end() <= before)
+            .collect();
+        if let Some(m) = candidates.last() {
+            apply_match(sel, bytes, m.start(), m.end());
+            return true;
+        }
+        if let Some(m) = re.find_iter(bytes).last() {
+            apply_match(sel, bytes, m.start(), m.end());
+            return true;
+        }
+        false
+    }
+}
+
+fn apply_match(sel: &mut Selection, bytes: &[u8], start: usize, end: usize) {
+    if start >= end {
+        sel.anchor = start;
+        sel.head = start;
+    } else {
+        sel.anchor = start;
+        sel.head = snap_to_char_or_last(bytes, end - 1).max(start);
+    }
+    sel.desired_col = display_col(bytes, line_start(bytes, sel.head), sel.head);
 }
 
 /// Handles a key while in Ex mode. Returns `true` if a quit command was issued.

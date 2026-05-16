@@ -1,0 +1,7 @@
+{
+  "name": "incremental search: selection follows first match as the user types",
+  "initial": "<h>ello foo bar foo",
+  "keys": "/fo",
+  "expected": "hello <fo>o bar foo",
+  "expected_mode": "search"
+}
