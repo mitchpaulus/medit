@@ -1,0 +1,7 @@
+{
+  "name": "I inserts at start of line",
+  "initial": "<a>bc\ndef",
+  "keys": "IX\u001b[27u",
+  "expected": "<X>abc\ndef",
+  "expected_mode": "normal"
+}

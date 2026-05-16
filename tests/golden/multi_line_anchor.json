@@ -1,0 +1,7 @@
+{
+  "name": "s ^ on a multi-line selection treats ^ as per-line anchor (Kakoune semantics)",
+  "initial": "<abc\ndef\nghi>",
+  "keys": "s^\ri// \u001b[27u",
+  "expected": "<// >abc\n// def\n// ghi",
+  "expected_mode": "normal"
+}

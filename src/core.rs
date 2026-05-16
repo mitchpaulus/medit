@@ -541,6 +541,26 @@ pub fn handle_normal(
                 *mode = Mode::Insert;
                 return false;
             }
+            Key::Char('I') => {
+                for sel in sels.iter_mut() {
+                    let ls = line_start(&bytes, sel.head);
+                    sel.anchor = ls;
+                    sel.head = ls;
+                }
+                buffer.mark_commit_point(snapshot_of(sels.primary()));
+                *mode = Mode::Insert;
+                return false;
+            }
+            Key::Char('A') => {
+                for sel in sels.iter_mut() {
+                    let le = line_end(&bytes, sel.head);
+                    sel.anchor = le;
+                    sel.head = le;
+                }
+                buffer.mark_commit_point(snapshot_of(sels.primary()));
+                *mode = Mode::Insert;
+                return false;
+            }
             Key::Char('u') => {
                 sels.reduce_to_primary();
                 op_undo(buffer, sels.primary_mut());
@@ -775,7 +795,7 @@ pub fn handle_search(
             if pat.is_empty() {
                 return;
             }
-            match regex::bytes::Regex::new(&pat) {
+            match compile_search_regex(&pat) {
                 Ok(re) => match kind {
                     SearchKind::Find => {
                         let bytes = collect_bytes(buffer);
@@ -876,7 +896,7 @@ fn update_search_preview(
         search.preview = None;
         return;
     }
-    let re = match regex::bytes::Regex::new(input) {
+    let re = match compile_search_regex(input) {
         Ok(re) => re,
         Err(_) => {
             search.preview = None;
@@ -899,6 +919,15 @@ fn update_search_preview(
 /// by the renderer to draw live incremental-search highlights.
 pub fn all_matches(bytes: &[u8], re: &regex::bytes::Regex) -> Vec<(usize, usize)> {
     re.find_iter(bytes).map(|m| (m.start(), m.end())).collect()
+}
+
+/// Compile a search pattern with the conventions an editor user expects:
+/// multi-line mode on so `^` and `$` match per-line anchors (matching
+/// Kakoune's default).
+fn compile_search_regex(pat: &str) -> Result<regex::bytes::Regex, regex::Error> {
+    regex::bytes::RegexBuilder::new(pat)
+        .multi_line(true)
+        .build()
 }
 
 /// Find a match and update `sel` to cover it. Forward search starts AFTER the

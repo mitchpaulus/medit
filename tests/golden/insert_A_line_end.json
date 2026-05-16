@@ -1,0 +1,7 @@
+{
+  "name": "A appends at end of line",
+  "initial": "<a>bc\ndef",
+  "keys": "AX\u001b[27u",
+  "expected": "abc<X>\ndef",
+  "expected_mode": "normal"
+}
