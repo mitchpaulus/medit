@@ -1,0 +1,6 @@
+{
+  "name": "s + regex + d deletes every match in the current selection range",
+  "initial": "<foo bar foo>",
+  "keys": "sfoo\rd",
+  "expected": "< >bar "
+}

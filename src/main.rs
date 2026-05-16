@@ -5,8 +5,9 @@ use std::path::PathBuf;
 
 use medit::buffer::Buffer;
 use medit::core::{
-    Mode, Registers, SearchState, Selection, all_matches, byte_at_line, collect_bytes,
-    ensure_visible, handle_ex, handle_insert, handle_normal, handle_search, line_index, utf8_len,
+    Mode, Registers, SearchState, Selections, all_matches, byte_at_line, collect_bytes,
+    ensure_visible, handle_ex, handle_insert, handle_normal, handle_search, line_index,
+    next_char_or_end, utf8_len,
 };
 use medit::input::{Event, Key, KeyEvent, Mods, Parser};
 use term::{RawMode, Screen};
@@ -21,7 +22,7 @@ fn main() -> io::Result<()> {
         Some(p) if p.exists() => Buffer::open(p)?,
         _ => Buffer::empty(),
     };
-    let mut sel = Selection::new();
+    let mut sels = Selections::new();
     let mut mode = Mode::Normal;
     let mut registers = Registers::default();
     let mut top_line: usize = 0;
@@ -41,7 +42,7 @@ fn main() -> io::Result<()> {
     render(
         &mut screen,
         &buffer,
-        &sel,
+        &sels,
         mode,
         top_line,
         path.as_deref(),
@@ -63,11 +64,11 @@ fn main() -> io::Result<()> {
             screen.refresh_size()?;
             let viewport_rows = screen.rows.saturating_sub(1) as usize;
             let bytes = collect_bytes(&buffer);
-            ensure_visible(&bytes, sel.head, &mut top_line, viewport_rows);
+            ensure_visible(&bytes, sels.primary().head, &mut top_line, viewport_rows);
             render(
                 &mut screen,
                 &buffer,
-                &sel,
+                &sels,
                 mode,
                 top_line,
                 path.as_deref(),
@@ -100,7 +101,7 @@ fn main() -> io::Result<()> {
                 Mode::Normal => {
                     if handle_normal(
                         &mut buffer,
-                        &mut sel,
+                        &mut sels,
                         &mut mode,
                         &mut registers,
                         &mut pending_g,
@@ -117,7 +118,7 @@ fn main() -> io::Result<()> {
                     }
                 }
                 Mode::Insert => {
-                    handle_insert(&mut buffer, &mut sel, &mut mode, &mut pending_j, k);
+                    handle_insert(&mut buffer, &mut sels, &mut mode, &mut pending_j, k);
                 }
                 Mode::Ex => {
                     if handle_ex(
@@ -134,7 +135,7 @@ fn main() -> io::Result<()> {
                 Mode::Search => {
                     handle_search(
                         &buffer,
-                        &mut sel,
+                        &mut sels,
                         &mut mode,
                         &mut search_input,
                         &mut search_state,
@@ -146,11 +147,11 @@ fn main() -> io::Result<()> {
         }
         let viewport_rows = screen.rows.saturating_sub(1) as usize;
         let bytes = collect_bytes(&buffer);
-        ensure_visible(&bytes, sel.head, &mut top_line, viewport_rows);
+        ensure_visible(&bytes, sels.primary().head, &mut top_line, viewport_rows);
         render(
             &mut screen,
             &buffer,
-            &sel,
+            &sels,
             mode,
             top_line,
             path.as_deref(),
@@ -214,7 +215,7 @@ fn format_bytes(bytes: &[u8]) -> String {
 fn render(
     screen: &mut Screen,
     buffer: &Buffer,
-    sel: &Selection,
+    sels: &Selections,
     mode: Mode,
     top_line: usize,
     path: Option<&std::path::Path>,
@@ -229,10 +230,25 @@ fn render(
     let bytes = collect_bytes(buffer);
     let cols = screen.cols;
     let viewport_rows = screen.rows.saturating_sub(1);
-    let sel_min = sel.min();
-    let sel_max = sel.max();
-    let head = sel.head;
+    let primary = sels.primary();
+    let head = primary.head;
     let start_byte = byte_at_line(&bytes, top_line);
+
+    // Selection ranges (all selections, primary first). Render highlights
+    // every selection; the primary's head also receives the terminal cursor.
+    let sel_ranges: Vec<(usize, usize)> = sels
+        .iter()
+        .map(|s| {
+            let lo = s.min();
+            let hi = next_char_or_end(&bytes, s.max());
+            (lo, hi)
+        })
+        .collect();
+    let in_any_selection = |i: usize| -> bool {
+        sel_ranges.iter().any(|&(s, e)| i >= s && i < e)
+    };
+    let sel_min = primary.min();
+    let sel_max = primary.max();
 
     let preview_matches: Vec<(usize, usize)> = match (mode, search.preview.as_ref()) {
         (Mode::Search, Some(re)) => all_matches(&bytes, re),
@@ -267,7 +283,7 @@ fn render(
         // unhighlighted while the user is typing).
         let cursor_on_buffer = matches!(mode, Mode::Normal | Mode::Insert);
         let in_sel =
-            show_selection && i >= sel_min && i <= sel_max && !(cursor_on_buffer && i == head);
+            show_selection && in_any_selection(i) && !(cursor_on_buffer && i == head);
         let in_match = !in_sel && in_preview(i);
         let bg = if in_sel {
             Some(SEL_BG)
@@ -328,14 +344,19 @@ fn render(
     }
 
     let path_str = path.and_then(|p| p.to_str()).unwrap_or("[no file]");
-    let sel_size = sel_max.saturating_sub(sel_min) + if bytes.is_empty() { 0 } else { 1 };
+    let primary_size = sel_max.saturating_sub(sel_min) + if bytes.is_empty() { 0 } else { 1 };
+    let multi_label = if sels.len() > 1 {
+        format!("{} sels · ", sels.len())
+    } else {
+        String::new()
+    };
     let key_str = last_key.map(format_key).unwrap_or_else(|| "-".to_string());
     let bytes_str = if last_bytes.is_empty() {
         "-".to_string()
     } else {
         format_bytes(last_bytes)
     };
-    let abs_line = line_index(&bytes, sel.head) + 1;
+    let abs_line = line_index(&bytes, head) + 1;
     let mode_str = match mode {
         Mode::Normal => "N",
         Mode::Insert => "I",
@@ -358,8 +379,8 @@ fn render(
         (format!(" {} ", ex_message), cur_row, cur_col)
     } else {
         let s = format!(
-            " [{}] {} · ln {} col {} · sel {}b · last:{} raw:{} ",
-            mode_str, path_str, abs_line, cur_col, sel_size, key_str, bytes_str
+            " [{}] {} · ln {} col {} · {}sel {}b · last:{} raw:{} ",
+            mode_str, path_str, abs_line, cur_col, multi_label, primary_size, key_str, bytes_str
         );
         (s, cur_row, cur_col)
     };

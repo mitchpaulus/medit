@@ -5,7 +5,7 @@ use std::path::Path;
 
 use medit::buffer::Buffer;
 use medit::core::{
-    Mode, Registers, SearchState, Selection, collect_bytes, handle_ex, handle_insert,
+    Mode, Registers, SearchState, Selection, Selections, collect_bytes, handle_ex, handle_insert,
     handle_normal, handle_search,
 };
 use medit::input::{Event, Parser};
@@ -53,9 +53,11 @@ fn run_test_file(path: &Path) -> Result<(), String> {
     let mode_str = optional_field_str(&v, "mode").unwrap_or_else(|| "normal".into());
     let expected_mode_str = optional_field_str(&v, "expected_mode");
 
-    let (initial_bytes, mut sel) = parse_text(&initial)
+    let (initial_bytes, initial_sel) = parse_text(&initial)
         .map_err(|e| format!("[{}] initial: {}", name, e))?;
     let mut buffer = Buffer::from_bytes(initial_bytes);
+    let mut sels = Selections::new();
+    *sels.primary_mut() = initial_sel;
     let mut mode = parse_mode(&mode_str)
         .map_err(|e| format!("[{}] {}", name, e))?;
     let mut registers = Registers::default();
@@ -81,7 +83,7 @@ fn run_test_file(path: &Path) -> Result<(), String> {
             Mode::Normal => {
                 let _quit = handle_normal(
                     &mut buffer,
-                    &mut sel,
+                    &mut sels,
                     &mut mode,
                     &mut registers,
                     &mut pending_g,
@@ -90,7 +92,7 @@ fn run_test_file(path: &Path) -> Result<(), String> {
                 );
             }
             Mode::Insert => {
-                handle_insert(&mut buffer, &mut sel, &mut mode, &mut pending_j, k);
+                handle_insert(&mut buffer, &mut sels, &mut mode, &mut pending_j, k);
             }
             Mode::Ex => {
                 let _quit = handle_ex(
@@ -105,7 +107,7 @@ fn run_test_file(path: &Path) -> Result<(), String> {
             Mode::Search => {
                 handle_search(
                     &buffer,
-                    &mut sel,
+                    &mut sels,
                     &mut mode,
                     &mut search_input,
                     &mut search_state,
@@ -117,7 +119,7 @@ fn run_test_file(path: &Path) -> Result<(), String> {
     }
 
     let bytes = collect_bytes(&buffer);
-    let actual = serialize_text(&bytes, &sel);
+    let actual = serialize_text(&bytes, sels.primary());
     if actual != expected {
         return Err(format!(
             "[{}] buffer mismatch:\n  expected: {:?}\n  actual:   {:?}",

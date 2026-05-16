@@ -1,0 +1,6 @@
+{
+  "name": "comma reduces multi-cursor selection back to primary",
+  "initial": "<foo bar foo>",
+  "keys": "sfoo\r,",
+  "expected": "<foo> bar foo"
+}

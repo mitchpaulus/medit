@@ -1,0 +1,7 @@
+{
+  "name": "s + regex + i + text + Esc inserts before each match",
+  "initial": "<foo bar foo>",
+  "keys": "sfoo\riX\u001b[27u",
+  "expected": "<X>foo bar Xfoo",
+  "expected_mode": "normal"
+}
