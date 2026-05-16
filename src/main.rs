@@ -36,13 +36,6 @@ impl Selection {
     fn max(&self) -> usize {
         self.anchor.max(self.head)
     }
-
-    fn move_to(&mut self, new_head: usize, extend: bool) {
-        self.head = new_head;
-        if !extend {
-            self.anchor = new_head;
-        }
-    }
 }
 
 fn main() -> io::Result<()> {
@@ -111,8 +104,7 @@ fn main() -> io::Result<()> {
             }
             match mode {
                 Mode::Normal => {
-                    if handle_normal(&buffer, &mut sel, &mut mode, k) {
-                        // explicit quit signal
+                    if handle_normal(&mut buffer, &mut sel, &mut mode, k) {
                         return Ok(());
                     }
                 }
@@ -140,7 +132,7 @@ fn main() -> io::Result<()> {
 
 /// Returns `true` if this key was a quit request.
 fn handle_normal(
-    buffer: &Buffer,
+    buffer: &mut Buffer,
     sel: &mut Selection,
     mode: &mut Mode,
     k: KeyEvent,
@@ -152,7 +144,7 @@ fn handle_normal(
         return true;
     }
 
-    // Mode entry and selection ops
+    // Mode entry, operators, and selection ops
     if k.mods.is_empty() {
         match k.key {
             Key::Char('i') => {
@@ -170,8 +162,23 @@ fn handle_normal(
                 return false;
             }
             Key::Char(';') => {
-                // Collapse selection to cursor.
                 sel.anchor = sel.head;
+                return false;
+            }
+            Key::Char('d') => {
+                op_delete(buffer, sel);
+                return false;
+            }
+            Key::Char('c') => {
+                op_change(buffer, sel, mode);
+                return false;
+            }
+            Key::Char('o') => {
+                op_open_below(buffer, sel, mode);
+                return false;
+            }
+            Key::Char('O') => {
+                op_open_above(buffer, sel, mode);
                 return false;
             }
             _ => {}
@@ -179,7 +186,6 @@ fn handle_normal(
     }
 
     // Motions: lowercase moves, uppercase (or Shift+) extends.
-    // hjkl + arrows
     let (motion, extend) = match k.key {
         Key::Char('h') => (Some(Motion::Left), false),
         Key::Char('H') => (Some(Motion::Left), true),
@@ -189,6 +195,12 @@ fn handle_normal(
         Key::Char('K') => (Some(Motion::Up), true),
         Key::Char('j') => (Some(Motion::Down), false),
         Key::Char('J') => (Some(Motion::Down), true),
+        Key::Char('w') => (Some(Motion::NextWord), false),
+        Key::Char('W') => (Some(Motion::NextWord), true),
+        Key::Char('b') => (Some(Motion::PrevWord), false),
+        Key::Char('B') => (Some(Motion::PrevWord), true),
+        Key::Char('e') => (Some(Motion::EndWord), false),
+        Key::Char('E') => (Some(Motion::EndWord), true),
         Key::Left => (Some(Motion::Left), k.mods.contains(Mods::SHIFT)),
         Key::Right => (Some(Motion::Right), k.mods.contains(Mods::SHIFT)),
         Key::Up => (Some(Motion::Up), k.mods.contains(Mods::SHIFT)),
@@ -212,48 +224,204 @@ enum Motion {
     Down,
     LineStart,
     LineEnd,
+    NextWord,
+    PrevWord,
+    EndWord,
 }
 
 fn apply_motion(bytes: &[u8], sel: &mut Selection, motion: Motion, extend: bool) {
-    match motion {
-        Motion::Left => {
-            let new_head = prev_char(bytes, sel.head);
-            sel.move_to(new_head, extend);
-            sel.desired_col = display_col(bytes, line_start(bytes, new_head), new_head);
-        }
-        Motion::Right => {
-            let new_head = next_char(bytes, sel.head);
-            sel.move_to(new_head, extend);
-            sel.desired_col = display_col(bytes, line_start(bytes, new_head), new_head);
-        }
+    let old_head = sel.head;
+    let (new_head, update_desired) = match motion {
+        Motion::Left => (prev_char(bytes, sel.head), true),
+        Motion::Right => (next_char(bytes, sel.head), true),
         Motion::Up => {
             let ls = line_start(bytes, sel.head);
             if ls == 0 {
                 return;
             }
             let prev_ls = line_start(bytes, ls - 1);
-            let new_head = offset_at_col(bytes, prev_ls, sel.desired_col);
-            sel.move_to(new_head, extend);
+            (offset_at_col(bytes, prev_ls, sel.desired_col), false)
         }
         Motion::Down => {
             let le = line_end(bytes, sel.head);
             if le >= bytes.len() {
                 return;
             }
-            let new_head = offset_at_col(bytes, le + 1, sel.desired_col);
-            sel.move_to(new_head, extend);
+            (offset_at_col(bytes, le + 1, sel.desired_col), false)
         }
-        Motion::LineStart => {
-            let new_head = line_start(bytes, sel.head);
-            sel.move_to(new_head, extend);
-            sel.desired_col = 1;
-        }
-        Motion::LineEnd => {
-            let new_head = end_of_line(bytes, sel.head);
-            sel.move_to(new_head, extend);
-            sel.desired_col = display_col(bytes, line_start(bytes, new_head), new_head);
+        Motion::LineStart => (line_start(bytes, sel.head), true),
+        Motion::LineEnd => (end_of_line(bytes, sel.head), true),
+        Motion::NextWord => (motion_word_forward(bytes, sel.head), true),
+        Motion::PrevWord => (motion_word_backward(bytes, sel.head), true),
+        Motion::EndWord => (motion_word_end(bytes, sel.head), true),
+    };
+
+    let is_object = matches!(
+        motion,
+        Motion::NextWord | Motion::PrevWord | Motion::EndWord
+    );
+    sel.head = new_head;
+    if !extend {
+        sel.anchor = if is_object { old_head } else { new_head };
+    }
+    if update_desired {
+        sel.desired_col = display_col(bytes, line_start(bytes, new_head), new_head);
+    }
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+fn is_whitespace_byte(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+fn motion_word_forward(bytes: &[u8], from: usize) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let mut i = from;
+    if let Some(&b) = bytes.get(i) {
+        i = (i + utf8_len(b)).min(bytes.len());
+    }
+    while i < bytes.len() && is_whitespace_byte(bytes[i]) {
+        i += 1;
+    }
+    if let Some(&b) = bytes.get(i) {
+        let word = is_word_byte(b);
+        while i < bytes.len() {
+            let bi = bytes[i];
+            if is_whitespace_byte(bi) || is_word_byte(bi) != word {
+                break;
+            }
+            i += utf8_len(bi);
         }
     }
+    if i > from {
+        prev_char(bytes, i)
+    } else {
+        from
+    }
+}
+
+fn motion_word_backward(bytes: &[u8], from: usize) -> usize {
+    if from == 0 {
+        return 0;
+    }
+    let mut i = prev_char(bytes, from);
+    while i > 0 && bytes.get(i).map_or(false, |&b| is_whitespace_byte(b)) {
+        i = prev_char(bytes, i);
+    }
+    let word = match bytes.get(i) {
+        Some(&b) => is_word_byte(b),
+        None => return i,
+    };
+    while i > 0 {
+        let p = prev_char(bytes, i);
+        let bp = match bytes.get(p) {
+            Some(&b) => b,
+            None => break,
+        };
+        if is_whitespace_byte(bp) || is_word_byte(bp) != word {
+            break;
+        }
+        i = p;
+    }
+    i
+}
+
+fn motion_word_end(bytes: &[u8], from: usize) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let mut i = from;
+    // If currently on whitespace or at start of a word, advance one then skip ws
+    if let Some(&b) = bytes.get(i) {
+        if is_whitespace_byte(b) {
+            while i < bytes.len() && is_whitespace_byte(bytes[i]) {
+                i += 1;
+            }
+        } else {
+            // Advance one char to make `e` repeatable past current word
+            let next = (i + utf8_len(b)).min(bytes.len());
+            // If next char is whitespace or different class, we're already at end; just stay
+            let advance = match bytes.get(next) {
+                Some(&nb) => !is_whitespace_byte(nb) && is_word_byte(nb) == is_word_byte(b),
+                None => false,
+            };
+            if advance {
+                i = next;
+            }
+            while i < bytes.len() && is_whitespace_byte(bytes[i]) {
+                i += 1;
+            }
+        }
+    }
+    if let Some(&b) = bytes.get(i) {
+        let word = is_word_byte(b);
+        let mut last = i;
+        while i < bytes.len() {
+            let bi = bytes[i];
+            if is_whitespace_byte(bi) || is_word_byte(bi) != word {
+                break;
+            }
+            last = i;
+            i += utf8_len(bi);
+        }
+        last
+    } else {
+        from
+    }
+}
+
+fn op_delete(buffer: &mut Buffer, sel: &mut Selection) {
+    let bytes = collect_bytes(buffer);
+    if bytes.is_empty() {
+        return;
+    }
+    let min = sel.min();
+    let last_byte = next_char_or_end(&bytes, sel.max());
+    let length = last_byte.saturating_sub(min);
+    if length > 0 {
+        buffer.delete(min, length);
+    }
+    let new_bytes = collect_bytes(buffer);
+    let new_head = snap_to_char_or_last(&new_bytes, min);
+    sel.head = new_head;
+    sel.anchor = new_head;
+    sel.desired_col = display_col(&new_bytes, line_start(&new_bytes, new_head), new_head);
+}
+
+fn op_change(buffer: &mut Buffer, sel: &mut Selection, mode: &mut Mode) {
+    let bytes = collect_bytes(buffer);
+    let min = sel.min();
+    let last_byte = next_char_or_end(&bytes, sel.max());
+    let length = last_byte.saturating_sub(min);
+    if length > 0 {
+        buffer.delete(min, length);
+    }
+    sel.head = min;
+    sel.anchor = min;
+    *mode = Mode::Insert;
+}
+
+fn op_open_below(buffer: &mut Buffer, sel: &mut Selection, mode: &mut Mode) {
+    let bytes = collect_bytes(buffer);
+    let le = line_end(&bytes, sel.head);
+    buffer.insert(le, b"\n");
+    sel.head = le + 1;
+    sel.anchor = le + 1;
+    *mode = Mode::Insert;
+}
+
+fn op_open_above(buffer: &mut Buffer, sel: &mut Selection, mode: &mut Mode) {
+    let bytes = collect_bytes(buffer);
+    let ls = line_start(&bytes, sel.head);
+    buffer.insert(ls, b"\n");
+    sel.head = ls;
+    sel.anchor = ls;
+    *mode = Mode::Insert;
 }
 
 fn handle_insert(
