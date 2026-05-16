@@ -15,3 +15,4 @@ Requirements
 - Generally uses Vim keybindings/Emacs readline bindings in insert mode
 - Very well done built-in completion UI
 - Simple spell checking
+- Kakoune-like object-verb

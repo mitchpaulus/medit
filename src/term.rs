@@ -34,16 +34,21 @@ impl Drop for RawMode {
 pub struct Screen {
     pub cols: u16,
     pub rows: u16,
+    back: Vec<u8>,
 }
 
 impl Screen {
     pub fn enter() -> io::Result<Self> {
         let mut out = io::stdout();
-        out.write_all(b"\x1b[?1049h\x1b[?25l")?;
+        out.write_all(b"\x1b[?1049h")?;
         out.write_all(b"\x1b[>17u")?;
         out.flush()?;
         let (cols, rows) = term_size()?;
-        Ok(Self { cols, rows })
+        Ok(Self {
+            cols,
+            rows,
+            back: Vec::with_capacity(8192),
+        })
     }
 
     pub fn refresh_size(&mut self) -> io::Result<()> {
@@ -53,26 +58,20 @@ impl Screen {
         Ok(())
     }
 
-    pub fn draw_banner(&self) -> io::Result<()> {
-        let mut out = io::stdout();
-        out.write_all(b"\x1b[2J\x1b[H")?;
-        let banner = "medit — M0 skeleton";
-        let info = format!(
-            "term: {}x{} · press q or Ctrl-C to exit",
-            self.cols, self.rows
-        );
-        let row_mid = self.rows / 2;
-        let col_banner = (self.cols.saturating_sub(banner.len() as u16) / 2).max(1);
-        let col_info = (self.cols.saturating_sub(info.len() as u16) / 2).max(1);
-        write!(out, "\x1b[{};{}H{}", row_mid, col_banner, banner)?;
-        write!(out, "\x1b[{};{}H{}", row_mid + 2, col_info, info)?;
-        out.flush()
+    pub fn begin_frame(&mut self) {
+        self.back.clear();
+        // Hide cursor + clear screen + home
+        self.back.extend_from_slice(b"\x1b[?25l\x1b[2J\x1b[H");
     }
 
-    pub fn show_text(&self, text: &str) -> io::Result<()> {
+    pub fn write_at(&mut self, row: u16, col: u16, text: &str) {
+        let _ = write!(self.back, "\x1b[{};{}H{}", row, col, text);
+    }
+
+    pub fn end_frame(&mut self, cursor_row: u16, cursor_col: u16) -> io::Result<()> {
+        let _ = write!(self.back, "\x1b[{};{}H\x1b[?25h", cursor_row, cursor_col);
         let mut out = io::stdout();
-        write!(out, "\x1b[{};1H\x1b[2K", self.rows)?;
-        write!(out, "{}", text)?;
+        out.write_all(&self.back)?;
         out.flush()
     }
 }
