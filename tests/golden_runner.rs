@@ -5,8 +5,8 @@ use std::path::Path;
 
 use medit::buffer::Buffer;
 use medit::core::{
-    Mode, Registers, SearchState, Selection, Selections, collect_bytes, handle_ex, handle_insert,
-    handle_normal, handle_search,
+    Mode, ObjectKind, Registers, SearchState, Selection, Selections, collect_bytes, handle_ex,
+    handle_insert, handle_normal, handle_search,
 };
 use medit::input::{Event, Parser};
 
@@ -65,6 +65,7 @@ fn run_test_file(path: &Path) -> Result<(), String> {
     let mut ex_message = String::new();
     let mut pending_j = false;
     let mut pending_g = false;
+    let mut pending_object: Option<ObjectKind> = None;
     let mut search_input = String::new();
     let mut search_state = SearchState::default();
 
@@ -87,6 +88,7 @@ fn run_test_file(path: &Path) -> Result<(), String> {
                     &mut mode,
                     &mut registers,
                     &mut pending_g,
+                    &mut pending_object,
                     &mut search_state,
                     k,
                 );

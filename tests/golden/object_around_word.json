@@ -1,0 +1,6 @@
+{
+  "name": "Alt-a w includes trailing whitespace",
+  "initial": "hello <w>orld foo",
+  "keys": "\u001baw",
+  "expected": "hello <world >foo"
+}

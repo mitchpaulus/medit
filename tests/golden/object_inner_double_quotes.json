@@ -1,0 +1,6 @@
+{
+  "name": "Alt-i \" selects inside double quotes",
+  "initial": "hello \"wor<l>d\" foo",
+  "keys": "\u001bi\"",
+  "expected": "hello \"<world>\" foo"
+}

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use medit::buffer::Buffer;
 use medit::core::{
-    Mode, Registers, SearchState, Selections, all_matches, byte_at_line, collect_bytes,
+    Mode, ObjectKind, Registers, SearchState, Selections, all_matches, byte_at_line, collect_bytes,
     ensure_visible, handle_ex, handle_insert, handle_normal, handle_search, line_index,
     next_char_or_end, utf8_len,
 };
@@ -30,6 +30,7 @@ fn main() -> io::Result<()> {
     let mut ex_message = String::new();
     let mut pending_j = false;
     let mut pending_g = false;
+    let mut pending_object: Option<ObjectKind> = None;
     let mut search_input = String::new();
     let mut search_state = SearchState::default();
     let mut last_key: Option<KeyEvent> = None;
@@ -105,6 +106,7 @@ fn main() -> io::Result<()> {
                         &mut mode,
                         &mut registers,
                         &mut pending_g,
+                        &mut pending_object,
                         &mut search_state,
                         k,
                     ) {

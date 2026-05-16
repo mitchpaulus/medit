@@ -1,0 +1,6 @@
+{
+  "name": "Alt-i p selects current paragraph",
+  "initial": "line1\nlin<e>2\nline3\n\nline4",
+  "keys": "\u001bip",
+  "expected": "<line1\nline2\nline3>\n\nline4"
+}

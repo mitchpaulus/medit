@@ -1,0 +1,6 @@
+{
+  "name": "Alt-i ( selects inside parentheses",
+  "initial": "foo(b<a>r)baz",
+  "keys": "\u001bi(",
+  "expected": "foo(<bar>)baz"
+}

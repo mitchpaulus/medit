@@ -1,0 +1,6 @@
+{
+  "name": "Alt-i w selects the word at cursor",
+  "initial": "hello <w>orld foo",
+  "keys": "\u001biw",
+  "expected": "hello <world> foo"
+}

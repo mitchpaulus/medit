@@ -190,6 +190,218 @@ pub enum Motion {
     EndWord,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    Inner,
+    Around,
+}
+
+/// Compute the byte range `[start, end)` of a text object containing
+/// `offset`. Returns `None` if no object of that kind exists here. Used by
+/// `<a-i>X` / `<a-a>X` text-object selectors.
+pub fn text_object(bytes: &[u8], offset: usize, kind: ObjectKind, key: Key) -> Option<(usize, usize)> {
+    match key {
+        Key::Char('w') => word_object(bytes, offset, kind),
+        Key::Char('p') => paragraph_object(bytes, offset, kind),
+        Key::Char('"') => quoted_object(bytes, offset, kind, b'"'),
+        Key::Char('\'') => quoted_object(bytes, offset, kind, b'\''),
+        Key::Char('`') => quoted_object(bytes, offset, kind, b'`'),
+        Key::Char('(') | Key::Char(')') => bracket_object(bytes, offset, kind, b'(', b')'),
+        Key::Char('{') | Key::Char('}') => bracket_object(bytes, offset, kind, b'{', b'}'),
+        Key::Char('[') | Key::Char(']') => bracket_object(bytes, offset, kind, b'[', b']'),
+        _ => None,
+    }
+}
+
+fn apply_object_for_all(sels: &mut Selections, bytes: &[u8], kind: ObjectKind, key: Key) {
+    for sel in sels.iter_mut() {
+        if let Some((s, e)) = text_object(bytes, sel.head, kind, key) {
+            sel.anchor = s;
+            sel.head = if e > s {
+                snap_to_char_or_last(bytes, e - 1).max(s)
+            } else {
+                s
+            };
+            sel.desired_col = display_col(bytes, line_start(bytes, sel.head), sel.head);
+        }
+    }
+}
+
+fn word_object(bytes: &[u8], offset: usize, kind: ObjectKind) -> Option<(usize, usize)> {
+    if offset >= bytes.len() {
+        return None;
+    }
+    if !is_word_byte(bytes[offset]) {
+        return None;
+    }
+    // Find start
+    let mut start = offset;
+    while start > 0 {
+        let p = prev_char(bytes, start);
+        if bytes.get(p).map_or(false, |&b| is_word_byte(b)) {
+            start = p;
+        } else {
+            break;
+        }
+    }
+    // Find end (exclusive)
+    let mut end = offset;
+    while end < bytes.len() {
+        let b = match bytes.get(end) {
+            Some(&b) => b,
+            None => break,
+        };
+        if !is_word_byte(b) {
+            break;
+        }
+        end += utf8_len(b);
+    }
+    if matches!(kind, ObjectKind::Around) {
+        // Include trailing whitespace (Vim's `aw` semantics).
+        while end < bytes.len() && bytes[end] == b' ' {
+            end += 1;
+        }
+    }
+    Some((start, end))
+}
+
+fn paragraph_object(bytes: &[u8], offset: usize, kind: ObjectKind) -> Option<(usize, usize)> {
+    if bytes.is_empty() {
+        return None;
+    }
+    // Walk back to first non-blank line of this paragraph.
+    let mut start = line_start(bytes, offset);
+    while start > 0 {
+        let prev_line_end = start - 1;
+        let prev_line_start = line_start(bytes, prev_line_end);
+        if prev_line_start == prev_line_end {
+            // prev line is blank; stop.
+            break;
+        }
+        start = prev_line_start;
+    }
+    // Walk forward to last non-blank line.
+    let mut end = line_end(bytes, offset);
+    loop {
+        if end >= bytes.len() {
+            break;
+        }
+        let next_line_start = end + 1;
+        if next_line_start >= bytes.len() {
+            break;
+        }
+        let next_line_end = line_end(bytes, next_line_start);
+        if next_line_start == next_line_end {
+            // next line is blank; stop.
+            break;
+        }
+        end = next_line_end;
+    }
+    if matches!(kind, ObjectKind::Around) {
+        // Include trailing blank line(s).
+        while end < bytes.len() && bytes[end] == b'\n' {
+            end += 1;
+        }
+    }
+    Some((start, end))
+}
+
+fn quoted_object(bytes: &[u8], offset: usize, kind: ObjectKind, q: u8) -> Option<(usize, usize)> {
+    if bytes.is_empty() {
+        return None;
+    }
+    // Find left quote at or before offset.
+    let mut left = None;
+    let mut i = offset.min(bytes.len().saturating_sub(1));
+    loop {
+        if bytes.get(i) == Some(&q) {
+            left = Some(i);
+            break;
+        }
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+    }
+    let left = left?;
+    // Find right quote strictly after left.
+    let mut right = None;
+    let mut j = left + 1;
+    while j < bytes.len() {
+        if bytes[j] == q {
+            right = Some(j);
+            break;
+        }
+        j += 1;
+    }
+    let right = right?;
+    match kind {
+        ObjectKind::Inner => Some((left + 1, right)),
+        ObjectKind::Around => Some((left, right + 1)),
+    }
+}
+
+fn bracket_object(
+    bytes: &[u8],
+    offset: usize,
+    kind: ObjectKind,
+    open: u8,
+    close: u8,
+) -> Option<(usize, usize)> {
+    if bytes.is_empty() {
+        return None;
+    }
+    // If offset is on a closing bracket, treat as just-inside.
+    let start_search = if bytes.get(offset) == Some(&close) && offset > 0 {
+        offset - 1
+    } else {
+        offset
+    };
+    // Walk back with depth counting.
+    let mut depth: i32 = 1;
+    let mut i = start_search;
+    let left = loop {
+        if i >= bytes.len() {
+            return None;
+        }
+        let b = bytes[i];
+        if b == close && i != start_search {
+            depth += 1;
+        } else if b == open {
+            depth -= 1;
+            if depth == 0 {
+                break i;
+            }
+        }
+        if i == 0 {
+            return None;
+        }
+        i -= 1;
+    };
+    // Walk forward with depth counting.
+    let mut depth: i32 = 1;
+    let mut j = left + 1;
+    let right = loop {
+        if j >= bytes.len() {
+            return None;
+        }
+        let b = bytes[j];
+        if b == open {
+            depth += 1;
+        } else if b == close {
+            depth -= 1;
+            if depth == 0 {
+                break j;
+            }
+        }
+        j += 1;
+    };
+    match kind {
+        ObjectKind::Inner => Some((left + 1, right)),
+        ObjectKind::Around => Some((left, right + 1)),
+    }
+}
+
 /// Returns `true` if this key was a quit request.
 pub fn handle_normal(
     buffer: &mut Buffer,
@@ -197,14 +409,30 @@ pub fn handle_normal(
     mode: &mut Mode,
     registers: &mut Registers,
     pending_g: &mut bool,
+    pending_object: &mut Option<ObjectKind>,
     search: &mut SearchState,
     k: KeyEvent,
 ) -> bool {
     let bytes = collect_bytes(buffer);
 
-    // Resolve g-prefix from previous keystroke. `gg` is the only mapping for
-    // now; any other follow-up to a pending `g` is silently dropped (Vim-style
-    // unknown-command behavior). `gg` reduces multi-selection to primary.
+    // Resolve text-object selector pending from a previous Alt-i / Alt-a.
+    if let Some(kind) = pending_object.take() {
+        if k.mods.is_empty() {
+            apply_object_for_all(sels, &bytes, kind, k.key);
+        }
+        return false;
+    }
+
+    // Alt+i / Alt+a enter "select inner / around object" pending state.
+    if k.mods == Mods::ALT && k.key == Key::Char('i') {
+        *pending_object = Some(ObjectKind::Inner);
+        return false;
+    }
+    if k.mods == Mods::ALT && k.key == Key::Char('a') {
+        *pending_object = Some(ObjectKind::Around);
+        return false;
+    }
+
     if *pending_g {
         *pending_g = false;
         if k.mods.is_empty() && k.key == Key::Char('g') {
