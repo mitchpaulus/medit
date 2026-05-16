@@ -81,12 +81,47 @@ pub fn handle_normal(
     sel: &mut Selection,
     mode: &mut Mode,
     registers: &mut Registers,
+    pending_g: &mut bool,
     k: KeyEvent,
 ) -> bool {
     let bytes = collect_bytes(buffer);
 
+    // Resolve g-prefix from previous keystroke. `gg` is the only mapping for
+    // now; any other follow-up to a pending `g` is silently dropped (Vim-style
+    // unknown-command behavior).
+    if *pending_g {
+        *pending_g = false;
+        if k.mods.is_empty() && k.key == Key::Char('g') {
+            let new_head = if bytes.is_empty() {
+                0
+            } else {
+                snap_to_char_or_last(&bytes, 0)
+            };
+            sel.anchor = new_head;
+            sel.head = new_head;
+            sel.desired_col = 1;
+        }
+        return false;
+    }
+
+    // Start a g-prefix if a bare `g` was pressed.
+    if k.mods.is_empty() && k.key == Key::Char('g') {
+        *pending_g = true;
+        return false;
+    }
+
     if k.mods.is_empty() && k.key == Key::Char('q') {
         return true;
+    }
+
+    // G: jump to start of last non-empty line. Slides (collapses).
+    if k.mods.is_empty() && k.key == Key::Char('G') {
+        let new_head = last_line_start(&bytes);
+        let new_head = snap_to_char_or_last(&bytes, new_head);
+        sel.anchor = new_head;
+        sel.head = new_head;
+        sel.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+        return false;
     }
 
     if k.mods.is_empty() {
@@ -186,17 +221,42 @@ pub fn handle_normal(
     false
 }
 
-pub fn handle_insert(buffer: &mut Buffer, sel: &mut Selection, mode: &mut Mode, k: KeyEvent) {
-    match k.key {
-        Key::Esc => {
-            *mode = Mode::Normal;
-            let bytes = collect_bytes(buffer);
-            if sel.head > sel.anchor {
-                sel.head = prev_char(&bytes, sel.head);
+pub fn handle_insert(
+    buffer: &mut Buffer,
+    sel: &mut Selection,
+    mode: &mut Mode,
+    pending_j: &mut bool,
+    k: KeyEvent,
+) {
+    // `jf` Esc-replacement: see `[[feedback-modal-keybindings]]`.
+    // If a previous keystroke buffered a literal `j`, this keystroke decides.
+    // Pressing `f` collapses the pair to a mode-exit. Anything else emits the
+    // buffered `j` first, then processes this key normally. Esc clears the
+    // buffered `j` silently. Limitation: with no follow-up key, the `j`
+    // stays buffered until something else is typed — a timeout-driven flush
+    // is the proper fix and lives behind non-blocking I/O.
+    if *pending_j {
+        *pending_j = false;
+        match k.key {
+            Key::Char('f') if k.mods.is_empty() => {
+                exit_insert_mode(buffer, sel, mode);
+                return;
             }
-            sel.head = snap_to_char_or_last(&bytes, sel.head);
-            sel.anchor = snap_to_char_or_last(&bytes, sel.anchor);
+            Key::Esc => {
+                exit_insert_mode(buffer, sel, mode);
+                return;
+            }
+            _ => {
+                // Insert the buffered 'j', then fall through to process this
+                // key normally on the post-`j` state.
+                buffer.insert(sel.head, b"j");
+                sel.head += 1;
+            }
         }
+    }
+
+    match k.key {
+        Key::Esc => exit_insert_mode(buffer, sel, mode),
         Key::Enter => {
             buffer.insert(sel.head, b"\n");
             sel.head += 1;
@@ -235,6 +295,10 @@ pub fn handle_insert(buffer: &mut Buffer, sel: &mut Selection, mode: &mut Mode, 
             if k.mods.contains(Mods::CTRL) || k.mods.contains(Mods::ALT) {
                 return;
             }
+            if c == 'j' && k.mods.is_empty() {
+                *pending_j = true;
+                return;
+            }
             let mut buf = [0u8; 4];
             let s = c.encode_utf8(&mut buf);
             buffer.insert(sel.head, s.as_bytes());
@@ -242,6 +306,16 @@ pub fn handle_insert(buffer: &mut Buffer, sel: &mut Selection, mode: &mut Mode, 
         }
         _ => {}
     }
+}
+
+fn exit_insert_mode(buffer: &Buffer, sel: &mut Selection, mode: &mut Mode) {
+    *mode = Mode::Normal;
+    let bytes = collect_bytes(buffer);
+    if sel.head > sel.anchor {
+        sel.head = prev_char(&bytes, sel.head);
+    }
+    sel.head = snap_to_char_or_last(&bytes, sel.head);
+    sel.anchor = snap_to_char_or_last(&bytes, sel.anchor);
 }
 
 /// Handles a key while in Ex mode. Returns `true` if a quit command was issued.
@@ -512,6 +586,23 @@ pub fn op_undo(buffer: &mut Buffer, sel: &mut Selection) {
         sel.head = snap_to_char_or_last(&bytes, sel.head);
         sel.anchor = snap_to_char_or_last(&bytes, sel.anchor);
     }
+}
+
+/// Byte offset of the start of the last non-empty line in the buffer.
+/// For empty buffer or single-line buffer (including ones with a trailing
+/// newline), returns 0.
+pub fn last_line_start(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let mut p = bytes.len();
+    while p > 0 {
+        p -= 1;
+        if bytes[p] == b'\n' && p + 1 < bytes.len() {
+            return p + 1;
+        }
+    }
+    0
 }
 
 pub fn op_redo(buffer: &mut Buffer, sel: &mut Selection) {

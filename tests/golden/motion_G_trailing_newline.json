@@ -1,0 +1,6 @@
+{
+  "name": "G with trailing newline skips the empty trailing line",
+  "initial": "<a>bc\ndef\n",
+  "keys": "G",
+  "expected": "abc\n<d>ef\n"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "literal j is inserted when followed by a non-f key",
+  "initial": "<a>bc",
+  "keys": "ijK\u001b[27u",
+  "expected": "<jK>abc",
+  "expected_mode": "normal"
+}

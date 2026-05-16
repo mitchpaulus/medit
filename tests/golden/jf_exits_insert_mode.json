@@ -1,0 +1,7 @@
+{
+  "name": "jf exits insert mode (Esc replacement); selection covers typed text",
+  "initial": "<a>bc",
+  "keys": "iHellojf",
+  "expected": "<Hello>abc",
+  "expected_mode": "normal"
+}

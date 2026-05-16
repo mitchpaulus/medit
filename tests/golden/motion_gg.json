@@ -1,0 +1,6 @@
+{
+  "name": "gg jumps to start of buffer",
+  "initial": "abc\ndef\n<g>hi",
+  "keys": "gg",
+  "expected": "<a>bc\ndef\nghi"
+}

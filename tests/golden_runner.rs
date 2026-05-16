@@ -60,6 +60,8 @@ fn run_test_file(path: &Path) -> Result<(), String> {
     let mut registers = Registers::default();
     let mut ex_input = String::new();
     let mut ex_message = String::new();
+    let mut pending_j = false;
+    let mut pending_g = false;
 
     let mut parser = Parser::new();
     parser.feed(keys.as_bytes());
@@ -74,10 +76,17 @@ fn run_test_file(path: &Path) -> Result<(), String> {
         let Event::Key(k) = event;
         match mode {
             Mode::Normal => {
-                let _quit = handle_normal(&mut buffer, &mut sel, &mut mode, &mut registers, k);
+                let _quit = handle_normal(
+                    &mut buffer,
+                    &mut sel,
+                    &mut mode,
+                    &mut registers,
+                    &mut pending_g,
+                    k,
+                );
             }
             Mode::Insert => {
-                handle_insert(&mut buffer, &mut sel, &mut mode, k);
+                handle_insert(&mut buffer, &mut sel, &mut mode, &mut pending_j, k);
             }
             Mode::Ex => {
                 let _quit = handle_ex(

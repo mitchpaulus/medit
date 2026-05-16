@@ -26,6 +26,8 @@ fn main() -> io::Result<()> {
     let mut top_line: usize = 0;
     let mut ex_input = String::new();
     let mut ex_message = String::new();
+    let mut pending_j = false;
+    let mut pending_g = false;
     let mut last_key: Option<KeyEvent> = None;
     let mut last_bytes: Vec<u8> = Vec::new();
 
@@ -89,7 +91,14 @@ fn main() -> io::Result<()> {
             }
             match mode {
                 Mode::Normal => {
-                    if handle_normal(&mut buffer, &mut sel, &mut mode, &mut registers, k) {
+                    if handle_normal(
+                        &mut buffer,
+                        &mut sel,
+                        &mut mode,
+                        &mut registers,
+                        &mut pending_g,
+                        k,
+                    ) {
                         return Ok(());
                     }
                     if mode == Mode::Ex {
@@ -97,7 +106,7 @@ fn main() -> io::Result<()> {
                     }
                 }
                 Mode::Insert => {
-                    handle_insert(&mut buffer, &mut sel, &mut mode, k);
+                    handle_insert(&mut buffer, &mut sel, &mut mode, &mut pending_j, k);
                 }
                 Mode::Ex => {
                     if handle_ex(

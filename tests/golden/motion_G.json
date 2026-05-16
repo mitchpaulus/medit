@@ -1,0 +1,6 @@
+{
+  "name": "G jumps to start of last line",
+  "initial": "<a>bc\ndef\nghi",
+  "keys": "G",
+  "expected": "abc\ndef\n<g>hi"
+}
