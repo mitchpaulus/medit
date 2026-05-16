@@ -68,6 +68,13 @@ impl Screen {
         let _ = write!(self.back, "\x1b[{};{}H{}", row, col, text);
     }
 
+    /// Set the terminal cursor shape. `block` = block cursor (normal mode);
+    /// `false` = bar cursor (insert mode). Steady, not blinking.
+    pub fn set_cursor_shape(&mut self, block: bool) {
+        let seq: &[u8] = if block { b"\x1b[2 q" } else { b"\x1b[6 q" };
+        self.back.extend_from_slice(seq);
+    }
+
     pub fn end_frame(&mut self, cursor_row: u16, cursor_col: u16) -> io::Result<()> {
         let _ = write!(self.back, "\x1b[{};{}H\x1b[?25h", cursor_row, cursor_col);
         let mut out = io::stdout();
@@ -80,6 +87,7 @@ impl Drop for Screen {
     fn drop(&mut self) {
         let mut out = io::stdout();
         let _ = out.write_all(b"\x1b[<u");
+        let _ = out.write_all(b"\x1b[0 q");
         let _ = out.write_all(b"\x1b[?25h\x1b[?1049l");
         let _ = out.flush();
     }

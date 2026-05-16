@@ -9,6 +9,12 @@ use buffer::Buffer;
 use input::{Event, Key, KeyEvent, Mods, Parser};
 use term::{RawMode, Screen};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Normal,
+    Insert,
+}
+
 struct Selection {
     anchor: usize,
     head: usize,
@@ -41,11 +47,12 @@ impl Selection {
 
 fn main() -> io::Result<()> {
     let path: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
-    let buffer = match path.as_ref() {
+    let mut buffer = match path.as_ref() {
         Some(p) => Buffer::open(p)?,
         None => Buffer::empty(),
     };
     let mut sel = Selection::new();
+    let mut mode = Mode::Normal;
     let mut top_line: usize = 0;
     let mut last_key: Option<KeyEvent> = None;
     let mut last_bytes: Vec<u8> = Vec::new();
@@ -58,6 +65,7 @@ fn main() -> io::Result<()> {
         &mut screen,
         &buffer,
         &sel,
+        mode,
         top_line,
         path.as_deref(),
         last_key.as_ref(),
@@ -79,6 +87,7 @@ fn main() -> io::Result<()> {
                 &mut screen,
                 &buffer,
                 &sel,
+                mode,
                 top_line,
                 path.as_deref(),
                 last_key.as_ref(),
@@ -96,20 +105,30 @@ fn main() -> io::Result<()> {
         while let Some(event) = parser.next_event() {
             let Event::Key(k) = event;
             last_key = Some(k);
-            if is_quit(&k) {
+            // Emergency exit (works in any mode)
+            if k.mods.contains(Mods::CTRL) && k.key == Key::Char('c') {
                 return Ok(());
             }
-            handle_navigation(&buffer, &mut sel, k);
+            match mode {
+                Mode::Normal => {
+                    if handle_normal(&buffer, &mut sel, &mut mode, k) {
+                        // explicit quit signal
+                        return Ok(());
+                    }
+                }
+                Mode::Insert => {
+                    handle_insert(&mut buffer, &mut sel, &mut mode, k);
+                }
+            }
         }
         let viewport_rows = screen.rows.saturating_sub(1) as usize;
         let bytes = collect_bytes(&buffer);
         ensure_visible(&bytes, sel.head, &mut top_line, viewport_rows);
-        // Always re-render after a read so debug indicators update even when
-        // the parser produced no event (e.g. incomplete sequence).
         render(
             &mut screen,
             &buffer,
             &sel,
+            mode,
             top_line,
             path.as_deref(),
             last_key.as_ref(),
@@ -119,60 +138,228 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn is_quit(k: &KeyEvent) -> bool {
-    (k.mods.is_empty() && k.key == Key::Char('q'))
-        || (k.mods.contains(Mods::CTRL) && k.key == Key::Char('c'))
+/// Returns `true` if this key was a quit request.
+fn handle_normal(
+    buffer: &Buffer,
+    sel: &mut Selection,
+    mode: &mut Mode,
+    k: KeyEvent,
+) -> bool {
+    let bytes = collect_bytes(buffer);
+
+    // Quit (placeholder until `:q`)
+    if k.mods.is_empty() && k.key == Key::Char('q') {
+        return true;
+    }
+
+    // Mode entry and selection ops
+    if k.mods.is_empty() {
+        match k.key {
+            Key::Char('i') => {
+                let min = sel.min();
+                sel.anchor = min;
+                sel.head = min;
+                *mode = Mode::Insert;
+                return false;
+            }
+            Key::Char('a') => {
+                let after = next_char_or_end(&bytes, sel.max());
+                sel.anchor = after;
+                sel.head = after;
+                *mode = Mode::Insert;
+                return false;
+            }
+            Key::Char(';') => {
+                // Collapse selection to cursor.
+                sel.anchor = sel.head;
+                return false;
+            }
+            _ => {}
+        }
+    }
+
+    // Motions: lowercase moves, uppercase (or Shift+) extends.
+    // hjkl + arrows
+    let (motion, extend) = match k.key {
+        Key::Char('h') => (Some(Motion::Left), false),
+        Key::Char('H') => (Some(Motion::Left), true),
+        Key::Char('l') => (Some(Motion::Right), false),
+        Key::Char('L') => (Some(Motion::Right), true),
+        Key::Char('k') => (Some(Motion::Up), false),
+        Key::Char('K') => (Some(Motion::Up), true),
+        Key::Char('j') => (Some(Motion::Down), false),
+        Key::Char('J') => (Some(Motion::Down), true),
+        Key::Left => (Some(Motion::Left), k.mods.contains(Mods::SHIFT)),
+        Key::Right => (Some(Motion::Right), k.mods.contains(Mods::SHIFT)),
+        Key::Up => (Some(Motion::Up), k.mods.contains(Mods::SHIFT)),
+        Key::Down => (Some(Motion::Down), k.mods.contains(Mods::SHIFT)),
+        Key::Home => (Some(Motion::LineStart), k.mods.contains(Mods::SHIFT)),
+        Key::End => (Some(Motion::LineEnd), k.mods.contains(Mods::SHIFT)),
+        _ => (None, false),
+    };
+
+    if let Some(m) = motion {
+        apply_motion(&bytes, sel, m, extend);
+    }
+
+    false
 }
 
-fn handle_navigation(buffer: &Buffer, sel: &mut Selection, k: KeyEvent) -> bool {
-    let bytes = collect_bytes(buffer);
-    let extend = k.mods.contains(Mods::SHIFT);
-    match k.key {
-        Key::Left => {
-            let new_head = prev_char(&bytes, sel.head);
+enum Motion {
+    Left,
+    Right,
+    Up,
+    Down,
+    LineStart,
+    LineEnd,
+}
+
+fn apply_motion(bytes: &[u8], sel: &mut Selection, motion: Motion, extend: bool) {
+    match motion {
+        Motion::Left => {
+            let new_head = prev_char(bytes, sel.head);
             sel.move_to(new_head, extend);
-            sel.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
-            true
+            sel.desired_col = display_col(bytes, line_start(bytes, new_head), new_head);
         }
-        Key::Right => {
-            let new_head = next_char(&bytes, sel.head);
+        Motion::Right => {
+            let new_head = next_char(bytes, sel.head);
             sel.move_to(new_head, extend);
-            sel.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
-            true
+            sel.desired_col = display_col(bytes, line_start(bytes, new_head), new_head);
         }
-        Key::Up => {
-            let ls = line_start(&bytes, sel.head);
+        Motion::Up => {
+            let ls = line_start(bytes, sel.head);
             if ls == 0 {
-                return false;
+                return;
             }
-            let prev_ls = line_start(&bytes, ls - 1);
-            let new_head = offset_at_col(&bytes, prev_ls, sel.desired_col);
+            let prev_ls = line_start(bytes, ls - 1);
+            let new_head = offset_at_col(bytes, prev_ls, sel.desired_col);
             sel.move_to(new_head, extend);
-            true
         }
-        Key::Down => {
-            let le = line_end(&bytes, sel.head);
+        Motion::Down => {
+            let le = line_end(bytes, sel.head);
             if le >= bytes.len() {
-                return false;
+                return;
             }
-            let new_head = offset_at_col(&bytes, le + 1, sel.desired_col);
+            let new_head = offset_at_col(bytes, le + 1, sel.desired_col);
             sel.move_to(new_head, extend);
-            true
         }
-        Key::Home => {
-            let new_head = line_start(&bytes, sel.head);
+        Motion::LineStart => {
+            let new_head = line_start(bytes, sel.head);
             sel.move_to(new_head, extend);
             sel.desired_col = 1;
-            true
         }
-        Key::End => {
-            let new_head = end_of_line(&bytes, sel.head);
+        Motion::LineEnd => {
+            let new_head = end_of_line(bytes, sel.head);
             sel.move_to(new_head, extend);
-            sel.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
-            true
+            sel.desired_col = display_col(bytes, line_start(bytes, new_head), new_head);
         }
-        _ => false,
     }
+}
+
+fn handle_insert(
+    buffer: &mut Buffer,
+    sel: &mut Selection,
+    mode: &mut Mode,
+    k: KeyEvent,
+) {
+    match k.key {
+        Key::Esc => {
+            *mode = Mode::Normal;
+            let bytes = collect_bytes(buffer);
+            // If we inserted anything, pull head back to last inserted char so
+            // selection covers what was just typed.
+            if sel.head > sel.anchor {
+                sel.head = prev_char(&bytes, sel.head);
+            }
+            // Snap to a valid char boundary; if head is past end, fall back to
+            // the last char.
+            sel.head = snap_to_char_or_last(&bytes, sel.head);
+            sel.anchor = snap_to_char_or_last(&bytes, sel.anchor);
+            return;
+        }
+        Key::Enter => {
+            buffer.insert(sel.head, b"\n");
+            sel.head += 1;
+            return;
+        }
+        Key::Backspace => {
+            if sel.head > 0 {
+                let bytes = collect_bytes(buffer);
+                let new_head = prev_char(&bytes, sel.head);
+                let len = sel.head - new_head;
+                buffer.delete(new_head, len);
+                sel.head = new_head;
+                if sel.anchor > sel.head {
+                    sel.anchor = sel.anchor.saturating_sub(len);
+                }
+            }
+            return;
+        }
+        Key::Tab => {
+            buffer.insert(sel.head, b"\t");
+            sel.head += 1;
+            return;
+        }
+        Key::Left | Key::Right | Key::Up | Key::Down | Key::Home | Key::End => {
+            let bytes = collect_bytes(buffer);
+            let motion = match k.key {
+                Key::Left => Motion::Left,
+                Key::Right => Motion::Right,
+                Key::Up => Motion::Up,
+                Key::Down => Motion::Down,
+                Key::Home => Motion::LineStart,
+                Key::End => Motion::LineEnd,
+                _ => return,
+            };
+            apply_motion(&bytes, sel, motion, false);
+            sel.anchor = sel.head;
+            return;
+        }
+        Key::Char(c) => {
+            if k.mods.contains(Mods::CTRL) || k.mods.contains(Mods::ALT) {
+                // Reserved for emacs readline bindings later; ignore for now.
+                return;
+            }
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            buffer.insert(sel.head, s.as_bytes());
+            sel.head += s.len();
+            return;
+        }
+        _ => {}
+    }
+}
+
+/// Like `next_char` but allows landing on `bytes.len()` (one-past-end), which
+/// is the natural caret position for "insert after" in insert mode.
+fn next_char_or_end(bytes: &[u8], offset: usize) -> usize {
+    let b = match bytes.get(offset) {
+        Some(&b) => b,
+        None => return bytes.len(),
+    };
+    (offset + utf8_len(b)).min(bytes.len())
+}
+
+/// Snap `offset` to a valid char boundary, never past the last char (so the
+/// caller always lands ON a character in normal mode). For empty buffers,
+/// returns 0.
+fn snap_to_char_or_last(bytes: &[u8], offset: usize) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let clamped = offset.min(bytes.len());
+    if clamped == bytes.len() {
+        return prev_char(bytes, bytes.len());
+    }
+    // Walk back to a leading byte if we're inside a multibyte char.
+    let mut p = clamped;
+    while p > 0 {
+        match bytes.get(p) {
+            Some(&b) if b & 0xC0 == 0x80 => p -= 1,
+            _ => break,
+        }
+    }
+    p
 }
 
 const SEL_BG: &str = "\x1b[48;5;24m";
@@ -227,6 +414,7 @@ fn render(
     screen: &mut Screen,
     buffer: &Buffer,
     sel: &Selection,
+    mode: Mode,
     top_line: usize,
     path: Option<&std::path::Path>,
     last_key: Option<&KeyEvent>,
@@ -261,7 +449,7 @@ fn render(
             Some(&b) => b,
             None => break,
         };
-        let in_span = i >= sel_min && i <= sel_max && i != head;
+        let in_span = mode == Mode::Normal && i >= sel_min && i <= sel_max && i != head;
         match b {
             b'\n' => {
                 row = row.saturating_add(1);
@@ -321,9 +509,13 @@ fn render(
         format_bytes(last_bytes)
     };
     let abs_line = line_index(&bytes, sel.head) + 1;
+    let mode_str = match mode {
+        Mode::Normal => "N",
+        Mode::Insert => "I",
+    };
     let status = format!(
-        " {} · ln {} col {} · sel {}b · last:{} raw:{} ",
-        path_str, abs_line, cur_col, sel_size, key_str, bytes_str
+        " [{}] {} · ln {} col {} · sel {}b · last:{} raw:{} ",
+        mode_str, path_str, abs_line, cur_col, sel_size, key_str, bytes_str
     );
     let cols_usize = cols as usize;
     let mut padded: String = status.chars().take(cols_usize).collect();
@@ -333,6 +525,7 @@ fn render(
     let status_text = format!("\x1b[7m{}\x1b[0m", padded);
     screen.write_at(screen.rows, 1, &status_text);
 
+    screen.set_cursor_shape(mode == Mode::Normal);
     screen.end_frame(cur_row, cur_col)
 }
 
