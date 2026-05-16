@@ -7,17 +7,39 @@ enum Source {
     Append,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Piece {
     source: Source,
     start: usize,
     len: usize,
 }
 
+/// Snapshot of editor cursor state, stored alongside each undo entry so that
+/// undo/redo restore both the buffer and the user's cursor position.
+#[derive(Debug, Clone, Copy)]
+pub struct CursorSnapshot {
+    pub anchor: usize,
+    pub head: usize,
+    pub desired_col: usize,
+}
+
+#[derive(Clone)]
+struct UndoEntry {
+    pieces: Vec<Piece>,
+    cursor: CursorSnapshot,
+}
+
 pub struct Buffer {
     original: Vec<u8>,
     append: Vec<u8>,
     pieces: Vec<Piece>,
+    undo_stack: Vec<UndoEntry>,
+    redo_stack: Vec<UndoEntry>,
+    /// When `Some`, the next mutating call (`insert` or `delete`) will first
+    /// snapshot the current `pieces` and the saved cursor onto `undo_stack`.
+    /// Consumed on commit. Multiple mutations between commit points collapse
+    /// into one undo step (coarse-grained, Vim-like).
+    pending_commit: Option<CursorSnapshot>,
 }
 
 impl Buffer {
@@ -26,6 +48,9 @@ impl Buffer {
             original: Vec::new(),
             append: Vec::new(),
             pieces: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            pending_commit: None,
         }
     }
 
@@ -43,6 +68,9 @@ impl Buffer {
             original: content,
             append: Vec::new(),
             pieces,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            pending_commit: None,
         }
     }
 
@@ -89,10 +117,83 @@ impl Buffer {
         (self.pieces.len(), 0)
     }
 
+    /// Mark a point where the next mutation should snapshot for undo. The
+    /// `cursor` is the state to restore on undo. Multiple mutations between
+    /// mark points collapse into one undo step.
+    pub fn mark_commit_point(&mut self, cursor: CursorSnapshot) {
+        self.pending_commit = Some(cursor);
+    }
+
+    /// GURQ-orithm: if `redo_stack` is non-empty when a new commit lands,
+    /// don't throw away the redo states. Fold them into the undo stack as
+    /// "forward replay + backward replay" so the full history of where the
+    /// user has been is preserved and reachable by walking undo. The trade-off
+    /// is exponential memory growth in pathological cases (alternating
+    /// edit/undo loops), which is fine for a personal editor.
+    ///
+    /// Without redos pending, this is the boring "snapshot once" commit.
+    fn maybe_commit(&mut self) {
+        let cursor = match self.pending_commit.take() {
+            Some(c) => c,
+            None => return,
+        };
+        let pre_snapshot = UndoEntry {
+            pieces: self.pieces.clone(),
+            cursor,
+        };
+        if self.redo_stack.is_empty() {
+            self.undo_stack.push(pre_snapshot);
+            return;
+        }
+        // Forward replay: walk redo top→bottom (= iter().rev()) and push
+        // each entry onto undo so that undoing later visits them in the
+        // original forward order.
+        self.undo_stack.push(pre_snapshot.clone());
+        for entry in self.redo_stack.iter().rev() {
+            self.undo_stack.push(entry.clone());
+        }
+        // Backward replay: walk redo bottom→top, skipping the deepest entry
+        // (which is the forward-most state we just landed on via the forward
+        // replay). Then push the pre-edit state one more time so undoing
+        // from the upcoming new state lands back at the pre-edit cursor.
+        for entry in self.redo_stack.iter().skip(1) {
+            self.undo_stack.push(entry.clone());
+        }
+        self.undo_stack.push(pre_snapshot);
+        self.redo_stack.clear();
+    }
+
+    /// Pop the most recent commit. Returns the saved cursor snapshot (to
+    /// restore) if anything was undone. The caller passes its current cursor
+    /// so it can be saved on the redo stack.
+    pub fn undo(&mut self, current_cursor: CursorSnapshot) -> Option<CursorSnapshot> {
+        let entry = self.undo_stack.pop()?;
+        let current_pieces = std::mem::replace(&mut self.pieces, entry.pieces);
+        self.redo_stack.push(UndoEntry {
+            pieces: current_pieces,
+            cursor: current_cursor,
+        });
+        self.pending_commit = None;
+        Some(entry.cursor)
+    }
+
+    /// Re-apply the most recently undone commit. Returns the saved cursor.
+    pub fn redo(&mut self, current_cursor: CursorSnapshot) -> Option<CursorSnapshot> {
+        let entry = self.redo_stack.pop()?;
+        let current_pieces = std::mem::replace(&mut self.pieces, entry.pieces);
+        self.undo_stack.push(UndoEntry {
+            pieces: current_pieces,
+            cursor: current_cursor,
+        });
+        self.pending_commit = None;
+        Some(entry.cursor)
+    }
+
     pub fn insert(&mut self, offset: usize, text: &[u8]) {
         if text.is_empty() {
             return;
         }
+        self.maybe_commit();
         let total = self.len();
         let offset = offset.min(total);
         let start = self.append.len();
@@ -141,6 +242,7 @@ impl Buffer {
         if offset >= end {
             return;
         }
+        self.maybe_commit();
         let mut remaining = end - offset;
         let (mut pi, po) = self.locate(offset);
 

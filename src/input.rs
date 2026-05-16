@@ -87,6 +87,18 @@ impl Parser {
         self.buf.extend(bytes.iter().copied());
     }
 
+    /// Resolve any pending partial sequence when no more input is expected.
+    /// A lone trailing ESC byte (not yet followed by `[` / `O` to form a
+    /// CSI/SS3 sequence) is emitted as a plain `Key::Esc`. Used by tests and
+    /// at shutdown. In the live loop the terminal's own timing resolves this.
+    pub fn flush(&mut self) -> Option<Event> {
+        if self.buf.front() == Some(&0x1B) && self.buf.len() == 1 {
+            self.buf.pop_front();
+            return Some(Event::Key(KeyEvent::plain(Key::Esc)));
+        }
+        None
+    }
+
     /// Pull the next decoded event, or `None` if buffer is empty / contains
     /// only a partial sequence.
     pub fn next_event(&mut self) -> Option<Event> {

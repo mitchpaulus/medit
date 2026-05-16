@@ -1,0 +1,6 @@
+{
+  "name": "GURQ: undo after edit-undo-edit reaches the originally undone state",
+  "initial": "",
+  "keys": "iA\u001b[27uuiB\u001b[27uuu",
+  "expected": "<A>"
+}

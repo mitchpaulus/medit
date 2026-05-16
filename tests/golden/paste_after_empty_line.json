@@ -1,0 +1,6 @@
+{
+  "name": "p on empty line inserts into the line, not the next (regression)",
+  "initial": "<a>bc\n\ndef",
+  "keys": "yjp",
+  "expected": "abc\n<a>\ndef"
+}

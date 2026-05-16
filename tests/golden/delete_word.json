@@ -1,0 +1,6 @@
+{
+  "name": "wd selects then deletes first word",
+  "initial": "<h>ello world",
+  "keys": "wd",
+  "expected": "< >world"
+}

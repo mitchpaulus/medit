@@ -1,0 +1,6 @@
+{
+  "name": "w selects to end of next word",
+  "initial": "<h>ello world",
+  "keys": "w",
+  "expected": "<hello> world"
+}

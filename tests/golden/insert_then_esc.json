@@ -1,0 +1,7 @@
+{
+  "name": "i + text + Esc leaves selection over what was inserted",
+  "initial": "<a>bc",
+  "keys": "iX\u001b[27u",
+  "expected": "<X>abc",
+  "expected_mode": "normal"
+}

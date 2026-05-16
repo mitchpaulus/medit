@@ -1,0 +1,6 @@
+{
+  "name": "U redoes after undo, restoring inserted text",
+  "initial": "<a>bc",
+  "keys": "iX\u001b[27uuU",
+  "expected": "<X>abc"
+}

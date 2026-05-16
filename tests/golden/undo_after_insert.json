@@ -1,0 +1,6 @@
+{
+  "name": "u undoes the insert session and restores cursor",
+  "initial": "<a>bc",
+  "keys": "iX\u001b[27uu",
+  "expected": "<a>bc"
+}

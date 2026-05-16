@@ -1,0 +1,6 @@
+{
+  "name": "EE extends selection through two words (regression for repeatable e/E)",
+  "initial": "<h>ello world foo",
+  "keys": "EE",
+  "expected": "<hello world> foo"
+}

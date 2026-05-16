@@ -1,0 +1,6 @@
+{
+  "name": "one u undoes the entire insert session, not per-char",
+  "initial": "<a>bc",
+  "keys": "iXYZ\u001b[27uu",
+  "expected": "<a>bc"
+}
