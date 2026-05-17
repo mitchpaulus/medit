@@ -1,0 +1,6 @@
+{
+  "name": "} jumps to last non-blank line of current paragraph",
+  "initial": "<l>ine1\nline2\nline3\n\npara2",
+  "keys": "}",
+  "expected": "line1\nline2\n<l>ine3\n\npara2"
+}

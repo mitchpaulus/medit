@@ -1,0 +1,6 @@
+{
+  "name": "{ jumps to first non-blank line of previous paragraph",
+  "initial": "line1\nline2\nline3\n\n<p>ara2",
+  "keys": "{",
+  "expected": "<l>ine1\nline2\nline3\n\npara2"
+}

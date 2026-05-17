@@ -1,0 +1,6 @@
+{
+  "name": "Ctrl+U moves cursor up 10 lines",
+  "initial": "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\n<l>",
+  "keys": "\u0015",
+  "expected": "a\n<b>\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl"
+}

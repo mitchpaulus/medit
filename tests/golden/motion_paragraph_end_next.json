@@ -1,0 +1,6 @@
+{
+  "name": "} from end of paragraph jumps to end of next paragraph",
+  "initial": "<l>ine1\nline2\nline3\n\npara2",
+  "keys": "}}",
+  "expected": "line1\nline2\nline3\n\n<p>ara2"
+}

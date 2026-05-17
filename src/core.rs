@@ -431,9 +431,12 @@ pub fn handle_normal(
     mode: &mut Mode,
     registers: &mut Registers,
     pending_g: &mut bool,
+    pending_z: &mut bool,
     pending_object: &mut Option<ObjectKind>,
     search: &mut SearchState,
     lsp_action: &mut Option<LspAction>,
+    top_line: &mut usize,
+    viewport_rows: usize,
     k: KeyEvent,
 ) -> bool {
     let bytes = collect_bytes(buffer);
@@ -483,6 +486,58 @@ pub fn handle_normal(
 
     if k.mods.is_empty() && k.key == Key::Char('g') {
         *pending_g = true;
+        return false;
+    }
+
+    // z-prefix: `zz` centers the cursor's line in the viewport.
+    if *pending_z {
+        *pending_z = false;
+        if k.mods.is_empty() && k.key == Key::Char('z') {
+            let head_line = line_index(&bytes, sels.primary().head);
+            let half = viewport_rows / 2;
+            *top_line = head_line.saturating_sub(half);
+        }
+        return false;
+    }
+    if k.mods.is_empty() && k.key == Key::Char('z') {
+        *pending_z = true;
+        return false;
+    }
+
+    // Ctrl+D / Ctrl+U: move down/up 10 lines (per-cursor).
+    if k.mods == Mods::CTRL && k.key == Key::Char('d') {
+        for sel in sels.iter_mut() {
+            move_line_relative(&bytes, sel, 10);
+        }
+        return false;
+    }
+    if k.mods == Mods::CTRL && k.key == Key::Char('u') {
+        for sel in sels.iter_mut() {
+            move_line_relative(&bytes, sel, -10);
+        }
+        return false;
+    }
+
+    // `{` and `}` jump by paragraph. `}` lands on the last non-blank line of
+    // the current paragraph (or the next, if already there); `{` lands on
+    // the first non-blank line. Unlike Vim, we never stop on the blank line
+    // between paragraphs.
+    if k.mods.is_empty() && k.key == Key::Char('}') {
+        for sel in sels.iter_mut() {
+            let new_head = paragraph_end_forward(&bytes, sel.head);
+            sel.head = new_head;
+            sel.anchor = new_head;
+            sel.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+        }
+        return false;
+    }
+    if k.mods.is_empty() && k.key == Key::Char('{') {
+        for sel in sels.iter_mut() {
+            let new_head = paragraph_start_backward(&bytes, sel.head);
+            sel.head = new_head;
+            sel.anchor = new_head;
+            sel.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+        }
         return false;
     }
 
@@ -1598,6 +1653,106 @@ pub fn op_undo(buffer: &mut Buffer, sel: &mut Selection) {
         sel.head = snap_to_char_or_last(&bytes, sel.head);
         sel.anchor = snap_to_char_or_last(&bytes, sel.anchor);
     }
+}
+
+fn line_is_blank(bytes: &[u8], line: usize) -> bool {
+    let s = byte_at_line(bytes, line);
+    let e = line_end(bytes, s);
+    s == e
+}
+
+/// Move a selection up or down by `delta` lines, preserving `desired_col`.
+/// Positive delta moves down, negative moves up. Clamps at buffer edges.
+pub fn move_line_relative(bytes: &[u8], sel: &mut Selection, delta: i64) {
+    if bytes.is_empty() {
+        return;
+    }
+    let total = line_index(bytes, bytes.len());
+    let current = line_index(bytes, sel.head) as i64;
+    let target = (current + delta).max(0).min(total as i64) as usize;
+    let line_start_byte = byte_at_line(bytes, target);
+    let new_head = offset_at_col(bytes, line_start_byte, sel.desired_col);
+    sel.head = new_head;
+    sel.anchor = new_head;
+}
+
+/// Find the byte offset of the last non-blank line of the next paragraph
+/// (or the current one, if the cursor isn't already at its end). Never
+/// lands on a blank separator line. Returns the original offset if there's
+/// no paragraph forward of here.
+pub fn paragraph_end_forward(bytes: &[u8], from: usize) -> usize {
+    if bytes.is_empty() {
+        return from;
+    }
+    let total = line_index(bytes, bytes.len());
+    let start_line = line_index(bytes, from);
+    let mut line = start_line;
+    if line_is_blank(bytes, line) {
+        while line <= total && line_is_blank(bytes, line) {
+            line += 1;
+        }
+        if line > total {
+            return from;
+        }
+    }
+    while line < total && !line_is_blank(bytes, line + 1) {
+        line += 1;
+    }
+    if line == start_line {
+        // Already at end of current paragraph; advance to end of next.
+        if line >= total {
+            return from;
+        }
+        line += 1;
+        while line <= total && line_is_blank(bytes, line) {
+            line += 1;
+        }
+        if line > total {
+            return from;
+        }
+        while line < total && !line_is_blank(bytes, line + 1) {
+            line += 1;
+        }
+    }
+    byte_at_line(bytes, line)
+}
+
+/// Symmetric counterpart to `paragraph_end_forward`: jump to the first
+/// non-blank line of the current paragraph, or the previous paragraph if
+/// the cursor is already at the start.
+pub fn paragraph_start_backward(bytes: &[u8], from: usize) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let start_line = line_index(bytes, from);
+    let mut line = start_line;
+    if line_is_blank(bytes, line) {
+        while line > 0 && line_is_blank(bytes, line) {
+            line -= 1;
+        }
+        if line_is_blank(bytes, line) {
+            return from;
+        }
+    }
+    while line > 0 && !line_is_blank(bytes, line - 1) {
+        line -= 1;
+    }
+    if line == start_line {
+        if line == 0 {
+            return from;
+        }
+        line -= 1;
+        while line > 0 && line_is_blank(bytes, line) {
+            line -= 1;
+        }
+        if line_is_blank(bytes, line) {
+            return from;
+        }
+        while line > 0 && !line_is_blank(bytes, line - 1) {
+            line -= 1;
+        }
+    }
+    byte_at_line(bytes, line)
 }
 
 /// Byte offset of the start of the last non-empty line in the buffer.

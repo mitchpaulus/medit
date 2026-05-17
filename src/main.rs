@@ -47,6 +47,7 @@ fn main() -> io::Result<()> {
     let mut ex_message = String::new();
     let mut pending_j = false;
     let mut pending_g = false;
+    let mut pending_z = false;
     let mut pending_object: Option<ObjectKind> = None;
     let mut pending_lsp_action: Option<LspAction> = None;
     let mut search_input = String::new();
@@ -143,15 +144,19 @@ fn main() -> io::Result<()> {
             }
             match mode {
                 Mode::Normal => {
+                    let viewport_rows = screen.rows.saturating_sub(1) as usize;
                     if handle_normal(
                         &mut buffer,
                         &mut sels,
                         &mut mode,
                         &mut registers,
                         &mut pending_g,
+                        &mut pending_z,
                         &mut pending_object,
                         &mut search_state,
                         &mut pending_lsp_action,
+                        &mut top_line,
+                        viewport_rows,
                         k,
                     ) {
                         return Ok(());

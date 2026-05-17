@@ -1,0 +1,6 @@
+{
+  "name": "Ctrl+D moves cursor down 10 lines",
+  "initial": "<a>\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl",
+  "keys": "\u0004",
+  "expected": "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n<k>\nl"
+}
