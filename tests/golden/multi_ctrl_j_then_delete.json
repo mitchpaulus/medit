@@ -1,0 +1,6 @@
+{
+  "name": "Ctrl+J twice yields 3 selections; d deletes all of them",
+  "initial": "<h>ello foo bar foo baz foo",
+  "keys": "/foo\r\u001b[106;5u\u001b[106;5ud",
+  "expected": "hello  bar  baz< >"
+}

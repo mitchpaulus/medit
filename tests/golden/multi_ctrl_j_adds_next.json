@@ -1,0 +1,6 @@
+{
+  "name": "Ctrl+J adds the next match as a new selection (primary)",
+  "initial": "<h>ello foo bar foo",
+  "keys": "/foo\r\u001b[106;5u",
+  "expected": "hello foo bar <foo>"
+}

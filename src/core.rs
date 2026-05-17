@@ -144,6 +144,19 @@ impl Selections {
         idx
     }
 
+    /// Append a new selection and make it primary.
+    pub fn append_as_primary(&mut self, sel: Selection) {
+        self.list.push(sel);
+        self.primary = self.list.len() - 1;
+    }
+
+    /// Set primary to a specific index (clamped to valid range).
+    pub fn set_primary(&mut self, idx: usize) {
+        if !self.list.is_empty() {
+            self.primary = idx.min(self.list.len() - 1);
+        }
+    }
+
     /// Rotate which selection is primary by `step` (positive = forward in
     /// the list, negative = backward), wrapping around.
     pub fn rotate_primary(&mut self, step: i32) {
@@ -501,6 +514,22 @@ pub fn handle_normal(
         if let Some(re) = search.pattern.as_ref() {
             sels.reduce_to_primary();
             find_and_select(sels.primary_mut(), &bytes, re, false);
+        }
+        return false;
+    }
+    // Ctrl+J / Ctrl+K: add the next / previous match as a new selection,
+    // making it primary. The existing selections stay; this is how you
+    // grow a multi-cursor edit one match at a time. Wraps at file edges.
+    // (Avoids Alt+n/Alt+p which terminals/WMs often bind to tab navigation.)
+    if k.mods == Mods::CTRL && k.key == Key::Char('j') {
+        if let Some(re) = search.pattern.as_ref() {
+            add_next_match(sels, &bytes, re, true);
+        }
+        return false;
+    }
+    if k.mods == Mods::CTRL && k.key == Key::Char('k') {
+        if let Some(re) = search.pattern.as_ref() {
+            add_next_match(sels, &bytes, re, false);
         }
         return false;
     }
@@ -928,6 +957,62 @@ fn compile_search_regex(pat: &str) -> Result<regex::bytes::Regex, regex::Error> 
     regex::bytes::RegexBuilder::new(pat)
         .multi_line(true)
         .build()
+}
+
+/// Find the next match (in `forward` direction) relative to the primary
+/// selection and append it to the selections list as the new primary.
+/// Wraps at the buffer edge. No-op if the match is already in the list or
+/// if no match exists at all.
+fn add_next_match(
+    sels: &mut Selections,
+    bytes: &[u8],
+    re: &regex::bytes::Regex,
+    forward: bool,
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    let primary = *sels.primary();
+    let m = if forward {
+        let from = next_char_or_end(bytes, primary.max());
+        re.find_at(bytes, from)
+            .or_else(|| re.find(bytes))
+            .map(|m| (m.start(), m.end()))
+    } else {
+        let candidates: Vec<_> = re
+            .find_iter(bytes)
+            .take_while(|m| m.end() <= primary.min())
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        candidates
+            .last()
+            .copied()
+            .or_else(|| re.find_iter(bytes).last().map(|m| (m.start(), m.end())))
+    };
+    let (s, e) = match m {
+        Some(p) => p,
+        None => return,
+    };
+    // Dedupe: if this exact range is already a selection, just promote it
+    // to primary instead of adding a duplicate.
+    let existing = sels
+        .iter()
+        .position(|sel| sel.min() == s && next_char_or_end(bytes, sel.max()) == e);
+    if let Some(idx) = existing {
+        sels.set_primary(idx);
+        return;
+    }
+    let head = if e > s {
+        snap_to_char_or_last(bytes, e - 1).max(s)
+    } else {
+        s
+    };
+    let new_sel = Selection {
+        anchor: s,
+        head,
+        desired_col: display_col(bytes, line_start(bytes, head), head),
+    };
+    sels.append_as_primary(new_sel);
 }
 
 /// Find a match and update `sel` to cover it. Forward search starts AFTER the
