@@ -1,13 +1,14 @@
 mod term;
 
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use medit::buffer::Buffer;
 use medit::core::{
-    LspAction, Mode, ObjectKind, Registers, SearchState, Selections, all_matches, byte_at_line,
-    collect_bytes, display_col, ensure_visible, handle_ex, handle_insert, handle_normal,
-    handle_search, line_index, line_start, next_char_or_end, snap_to_char_or_last, utf8_len,
+    ExAction, LspAction, Mode, ObjectKind, Registers, SearchState, Selections, all_matches,
+    byte_at_line, collect_bytes, display_col, ensure_visible, handle_ex, handle_insert,
+    handle_normal, handle_search, line_index, line_start, next_char_or_end, snap_to_char_or_last,
+    utf8_len,
 };
 use medit::input::{Event, Key, KeyEvent, Mods, Parser};
 use medit::lsp::{self, LspClient};
@@ -19,8 +20,35 @@ const RESET_BG: &str = "\x1b[49m";
 const LINENO_FG: &str = "\x1b[38;5;240m";
 const RESET_FG: &str = "\x1b[39m";
 
-/// Draw a right-aligned line number in the left gutter at `row`. The gutter
-/// is `gutter` columns wide: digits plus one trailing space.
+/// Per-buffer editor state. The main loop holds a `Vec<EditorBuffer>` and a
+/// `current` index; switching buffers means moving the index.
+struct EditorBuffer {
+    buffer: Buffer,
+    sels: Selections,
+    top_line: usize,
+    path: Option<PathBuf>,
+}
+
+impl EditorBuffer {
+    fn new(buffer: Buffer, path: Option<PathBuf>) -> Self {
+        Self {
+            buffer,
+            sels: Selections::new(),
+            top_line: 0,
+            path,
+        }
+    }
+
+    fn display_name(&self) -> String {
+        self.path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "[no name]".to_string())
+    }
+}
+
 fn draw_lineno(screen: &mut Screen, row: u16, lineno: usize, gutter: u16) {
     let digits = gutter.saturating_sub(1) as usize;
     let text = format!(
@@ -34,15 +62,16 @@ fn draw_lineno(screen: &mut Screen, row: u16, lineno: usize, gutter: u16) {
 }
 
 fn main() -> io::Result<()> {
-    let path: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
-    let mut buffer = match path.as_ref() {
+    let initial_path: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
+    let initial_buffer = match initial_path.as_ref() {
         Some(p) if p.exists() => Buffer::open(p)?,
         _ => Buffer::empty(),
     };
-    let mut sels = Selections::new();
+    let mut buffers: Vec<EditorBuffer> = vec![EditorBuffer::new(initial_buffer, initial_path)];
+    let mut current: usize = 0;
+
     let mut mode = Mode::Normal;
     let mut registers = Registers::default();
-    let mut top_line: usize = 0;
     let mut ex_input = String::new();
     let mut ex_message = String::new();
     let mut pending_j = false;
@@ -50,47 +79,28 @@ fn main() -> io::Result<()> {
     let mut pending_z = false;
     let mut pending_object: Option<ObjectKind> = None;
     let mut pending_lsp_action: Option<LspAction> = None;
+    let mut pending_ex_action: Option<ExAction> = None;
     let mut search_input = String::new();
     let mut search_state = SearchState::default();
-
-    // Start an LSP server if the opened file is one we recognize. We only
-    // wire up Go (gopls) for now. Failures (gopls not installed, file not
-    // in a Go module, etc.) just leave LSP off — editor still runs.
-    let mut lsp_client: Option<LspClient> = None;
-    let mut lsp_uri: Option<String> = None;
-    if let Some(p) = path.as_ref() {
-        let lang_id = match p.extension().and_then(|e| e.to_str()) {
-            Some("go") => Some("go"),
-            _ => None,
-        };
-        if let Some(lang_id) = lang_id {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            if let Ok(root_uri) = lsp::path_to_uri(&cwd) {
-                if let Ok(mut client) = LspClient::spawn("gopls", &root_uri) {
-                    if let Ok(uri) = lsp::path_to_uri(p) {
-                        let text = String::from_utf8_lossy(&collect_bytes(&buffer)).into_owned();
-                        let _ = client.did_open(&uri, lang_id, &text);
-                        lsp_uri = Some(uri);
-                    }
-                    lsp_client = Some(client);
-                }
-            }
-        }
-    }
     let mut last_key: Option<KeyEvent> = None;
     let mut last_bytes: Vec<u8> = Vec::new();
+
+    // LSP. We spawn a server on demand the first time we open a Go file
+    // (initial buffer or via `:e`). One client serves all buffers.
+    let mut lsp_client: Option<LspClient> = None;
+    if let Some(p) = buffers[0].path.clone() {
+        maybe_start_lsp_and_open(&mut lsp_client, &p, &buffers[0].buffer);
+    }
 
     let _raw = RawMode::enable()?;
     let mut screen = Screen::enter()?;
     term::install_sigwinch_handler()?;
 
-    render(
+    render_all(
         &mut screen,
-        &buffer,
-        &sels,
+        &buffers,
+        current,
         mode,
-        top_line,
-        path.as_deref(),
         &ex_input,
         &search_input,
         &search_state,
@@ -108,15 +118,16 @@ fn main() -> io::Result<()> {
         if term::take_resize_flag() {
             screen.refresh_size()?;
             let viewport_rows = screen.rows.saturating_sub(1) as usize;
-            let bytes = collect_bytes(&buffer);
-            ensure_visible(&bytes, sels.primary().head, &mut top_line, viewport_rows);
-            render(
+            {
+                let cur = &mut buffers[current];
+                let bytes = collect_bytes(&cur.buffer);
+                ensure_visible(&bytes, cur.sels.primary().head, &mut cur.top_line, viewport_rows);
+            }
+            render_all(
                 &mut screen,
-                &buffer,
-                &sels,
+                &buffers,
+                current,
                 mode,
-                top_line,
-                path.as_deref(),
                 &ex_input,
                 &search_input,
                 &search_state,
@@ -145,9 +156,10 @@ fn main() -> io::Result<()> {
             match mode {
                 Mode::Normal => {
                     let viewport_rows = screen.rows.saturating_sub(1) as usize;
+                    let cur = &mut buffers[current];
                     if handle_normal(
-                        &mut buffer,
-                        &mut sels,
+                        &mut cur.buffer,
+                        &mut cur.sels,
                         &mut mode,
                         &mut registers,
                         &mut pending_g,
@@ -155,7 +167,7 @@ fn main() -> io::Result<()> {
                         &mut pending_object,
                         &mut search_state,
                         &mut pending_lsp_action,
-                        &mut top_line,
+                        &mut cur.top_line,
                         viewport_rows,
                         k,
                     ) {
@@ -171,17 +183,17 @@ fn main() -> io::Result<()> {
                         dispatch_lsp(
                             action,
                             lsp_client.as_mut(),
-                            lsp_uri.as_deref(),
-                            &mut buffer,
-                            &mut sels,
+                            &mut buffers,
+                            &mut current,
                             &mut ex_message,
                         );
                     }
                 }
                 Mode::Insert => {
+                    let cur = &mut buffers[current];
                     handle_insert(
-                        &mut buffer,
-                        &mut sels,
+                        &mut cur.buffer,
+                        &mut cur.sels,
                         &mut mode,
                         &mut pending_j,
                         &mut registers,
@@ -189,21 +201,46 @@ fn main() -> io::Result<()> {
                     );
                 }
                 Mode::Ex => {
-                    if handle_ex(
-                        &buffer,
+                    let path_owned = buffers[current].path.clone();
+                    let quit = handle_ex(
+                        &buffers[current].buffer,
                         &mut mode,
                         &mut ex_input,
                         &mut ex_message,
-                        path.as_deref(),
+                        &mut pending_ex_action,
+                        path_owned.as_deref(),
                         k,
-                    ) {
+                    );
+                    if let Some(action) = pending_ex_action.take() {
+                        dispatch_ex_action(
+                            action,
+                            &mut buffers,
+                            &mut current,
+                            lsp_client.as_mut(),
+                            &mut ex_message,
+                        );
+                        // If LSP needs to be started lazily for a newly-
+                        // opened file:
+                        if lsp_client.is_none() {
+                            let p_opt = buffers[current].path.clone();
+                            if let Some(p) = p_opt {
+                                maybe_start_lsp_and_open(
+                                    &mut lsp_client,
+                                    &p,
+                                    &buffers[current].buffer,
+                                );
+                            }
+                        }
+                    }
+                    if quit {
                         return Ok(());
                     }
                 }
                 Mode::Search => {
+                    let cur = &mut buffers[current];
                     handle_search(
-                        &buffer,
-                        &mut sels,
+                        &cur.buffer,
+                        &mut cur.sels,
                         &mut mode,
                         &mut search_input,
                         &mut search_state,
@@ -213,16 +250,17 @@ fn main() -> io::Result<()> {
                 }
             }
         }
-        let viewport_rows = screen.rows.saturating_sub(1) as usize;
-        let bytes = collect_bytes(&buffer);
-        ensure_visible(&bytes, sels.primary().head, &mut top_line, viewport_rows);
-        render(
+        {
+            let viewport_rows = screen.rows.saturating_sub(1) as usize;
+            let cur = &mut buffers[current];
+            let bytes = collect_bytes(&cur.buffer);
+            ensure_visible(&bytes, cur.sels.primary().head, &mut cur.top_line, viewport_rows);
+        }
+        render_all(
             &mut screen,
-            &buffer,
-            &sels,
+            &buffers,
+            current,
             mode,
-            top_line,
-            path.as_deref(),
             &ex_input,
             &search_input,
             &search_state,
@@ -234,15 +272,46 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-/// Handle an `LspAction` queued by the modal layer. Sends the request,
-/// blocks for a response, and either updates the selection (if the result
-/// is in the current file) or sets a status-bar message.
+/// Spawn an LSP server for `path` (if it's a recognized language) and send
+/// didOpen for its current buffer content. No-op if a server is already
+/// running, or if the language isn't recognized, or if spawn fails. Adds
+/// new files to an existing server when called repeatedly.
+fn maybe_start_lsp_and_open(
+    lsp_client: &mut Option<LspClient>,
+    path: &Path,
+    buffer: &Buffer,
+) {
+    let lang_id = match path.extension().and_then(|e| e.to_str()) {
+        Some("go") => "go",
+        _ => return,
+    };
+    if lsp_client.is_none() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let root_uri = match lsp::path_to_uri(&cwd) {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        match LspClient::spawn("gopls", &root_uri) {
+            Ok(c) => *lsp_client = Some(c),
+            Err(_) => return,
+        }
+    }
+    if let (Some(client), Ok(uri)) = (lsp_client.as_mut(), lsp::path_to_uri(path)) {
+        let text = String::from_utf8_lossy(&collect_bytes(buffer)).into_owned();
+        let _ = client.did_open(&uri, lang_id, &text);
+    }
+}
+
+/// Handle an `LspAction` queued by the modal layer. For goto-definition we
+/// send the request, then either:
+/// - Same-file result: jump the cursor in the current buffer.
+/// - Cross-file result: open or switch to that file as a new buffer, then
+///   jump the cursor there.
 fn dispatch_lsp(
     action: LspAction,
     client: Option<&mut LspClient>,
-    current_uri: Option<&str>,
-    buffer: &mut Buffer,
-    sels: &mut Selections,
+    buffers: &mut Vec<EditorBuffer>,
+    current: &mut usize,
     ex_message: &mut String,
 ) {
     let client = match client {
@@ -252,7 +321,11 @@ fn dispatch_lsp(
             return;
         }
     };
-    let uri = match current_uri {
+    let cur_uri = match buffers[*current]
+        .path
+        .as_ref()
+        .and_then(|p| lsp::path_to_uri(p).ok())
+    {
         Some(u) => u,
         None => {
             *ex_message = "LSP: current buffer has no URI".to_string();
@@ -261,36 +334,135 @@ fn dispatch_lsp(
     };
     match action {
         LspAction::GotoDefinition => {
-            let bytes = collect_bytes(buffer);
-            let head = sels.primary().head;
-            let line = line_index(&bytes, head) as u32;
-            let line_start_byte = byte_at_line(&bytes, line as usize);
-            let character = head.saturating_sub(line_start_byte) as u32;
-            match client.definition(uri, line, character) {
-                Ok(Some(loc)) => {
-                    if loc.uri == uri {
-                        let target_line_start = byte_at_line(&bytes, loc.line as usize);
-                        let target = target_line_start.saturating_add(loc.character as usize);
-                        let new_head = snap_to_char_or_last(&bytes, target);
-                        sels.reduce_to_primary();
-                        let p = sels.primary_mut();
-                        p.anchor = new_head;
-                        p.head = new_head;
-                        p.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
-                    } else {
-                        let path = lsp::uri_to_path(&loc.uri)
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| loc.uri.clone());
-                        *ex_message = format!("definition in {} (different file)", path);
-                    }
-                }
+            let (line, character) = {
+                let cur = &buffers[*current];
+                let bytes = collect_bytes(&cur.buffer);
+                let head = cur.sels.primary().head;
+                let line = line_index(&bytes, head) as u32;
+                let line_start_byte = byte_at_line(&bytes, line as usize);
+                let character = head.saturating_sub(line_start_byte) as u32;
+                (line, character)
+            };
+            let loc = match client.definition(&cur_uri, line, character) {
+                Ok(Some(loc)) => loc,
                 Ok(None) => {
                     *ex_message = "no definition found".to_string();
+                    return;
                 }
                 Err(e) => {
                     *ex_message = format!("LSP error: {}", e);
+                    return;
+                }
+            };
+            // If the definition is in another file, open it (or switch to
+            // an already-open buffer) before jumping the cursor.
+            if loc.uri != cur_uri {
+                let target_path = match lsp::uri_to_path(&loc.uri) {
+                    Some(p) => p,
+                    None => {
+                        *ex_message = format!("LSP: cannot parse target URI: {}", loc.uri);
+                        return;
+                    }
+                };
+                if !open_or_switch_to(buffers, current, &target_path, Some(client), ex_message) {
+                    return;
                 }
             }
+            // Now buffers[current] is the target buffer; jump the cursor.
+            let cur = &mut buffers[*current];
+            let bytes = collect_bytes(&cur.buffer);
+            let target_line_start = byte_at_line(&bytes, loc.line as usize);
+            let target = target_line_start.saturating_add(loc.character as usize);
+            let new_head = snap_to_char_or_last(&bytes, target);
+            cur.sels.reduce_to_primary();
+            let p = cur.sels.primary_mut();
+            p.anchor = new_head;
+            p.head = new_head;
+            p.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+        }
+    }
+}
+
+/// Open `path` as a new buffer (or switch to it if already open). On a new
+/// open, also notifies the LSP server via `didOpen` if applicable. Returns
+/// `false` and sets `ex_message` on failure (e.g. can't read the file).
+fn open_or_switch_to(
+    buffers: &mut Vec<EditorBuffer>,
+    current: &mut usize,
+    path: &Path,
+    lsp_client: Option<&mut LspClient>,
+    ex_message: &mut String,
+) -> bool {
+    if let Some(idx) = buffers
+        .iter()
+        .position(|b| b.path.as_deref() == Some(path))
+    {
+        *current = idx;
+        return true;
+    }
+    let buffer = if path.exists() {
+        match Buffer::open(path) {
+            Ok(b) => b,
+            Err(e) => {
+                *ex_message = format!("open failed: {}", e);
+                return false;
+            }
+        }
+    } else {
+        Buffer::empty()
+    };
+    let eb = EditorBuffer::new(buffer, Some(path.to_path_buf()));
+    buffers.push(eb);
+    *current = buffers.len() - 1;
+    if let Some(client) = lsp_client {
+        let lang_id = match path.extension().and_then(|e| e.to_str()) {
+            Some("go") => Some("go"),
+            _ => None,
+        };
+        if let Some(lang_id) = lang_id {
+            if let Ok(uri) = lsp::path_to_uri(path) {
+                let text =
+                    String::from_utf8_lossy(&collect_bytes(&buffers[*current].buffer)).into_owned();
+                let _ = client.did_open(&uri, lang_id, &text);
+            }
+        }
+    }
+    true
+}
+
+/// Handle a buffer-list-level Ex action. Loads/switches/lists buffers and
+/// notifies the LSP server about newly opened files.
+fn dispatch_ex_action(
+    action: ExAction,
+    buffers: &mut Vec<EditorBuffer>,
+    current: &mut usize,
+    lsp_client: Option<&mut LspClient>,
+    ex_message: &mut String,
+) {
+    match action {
+        ExAction::OpenFile(path) => {
+            open_or_switch_to(buffers, current, &path, lsp_client, ex_message);
+        }
+        ExAction::NextBuffer => {
+            if buffers.len() > 1 {
+                *current = (*current + 1) % buffers.len();
+            }
+        }
+        ExAction::PrevBuffer => {
+            if buffers.len() > 1 {
+                *current = (*current + buffers.len() - 1) % buffers.len();
+            }
+        }
+        ExAction::ListBuffers => {
+            let parts: Vec<String> = buffers
+                .iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    let marker = if i == *current { "*" } else { " " };
+                    format!("{}{} {}", marker, i + 1, b.display_name())
+                })
+                .collect();
+            *ex_message = parts.join("  ");
         }
     }
 }
@@ -341,13 +513,49 @@ fn format_bytes(bytes: &[u8]) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn render_all(
+    screen: &mut Screen,
+    buffers: &[EditorBuffer],
+    current: usize,
+    mode: Mode,
+    ex_input: &str,
+    search_input: &str,
+    search: &SearchState,
+    ex_message: &str,
+    last_key: Option<&KeyEvent>,
+    last_bytes: &[u8],
+) -> io::Result<()> {
+    let cur = &buffers[current];
+    let buffer_count = buffers.len();
+    let buffer_label = if buffer_count > 1 {
+        format!("[{}/{}] {}", current + 1, buffer_count, cur.display_name())
+    } else {
+        cur.display_name()
+    };
+    render(
+        screen,
+        &cur.buffer,
+        &cur.sels,
+        mode,
+        cur.top_line,
+        &buffer_label,
+        ex_input,
+        search_input,
+        search,
+        ex_message,
+        last_key,
+        last_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render(
     screen: &mut Screen,
     buffer: &Buffer,
     sels: &Selections,
     mode: Mode,
     top_line: usize,
-    path: Option<&std::path::Path>,
+    buffer_label: &str,
     ex_input: &str,
     search_input: &str,
     search: &SearchState,
@@ -363,9 +571,6 @@ fn render(
     let head = primary.head;
     let start_byte = byte_at_line(&bytes, top_line);
 
-    // Gutter sizing: enough digits for the largest line number in the file,
-    // plus one space of padding. Bail out (no gutter) if the terminal is too
-    // narrow to fit anything else.
     let total_lines = line_index(&bytes, bytes.len()) + 1;
     let line_digits = total_lines.to_string().len() as u16;
     let gutter: u16 = if cols > line_digits + 2 {
@@ -375,8 +580,6 @@ fn render(
     };
     let content_cols = cols.saturating_sub(gutter);
 
-    // Selection ranges (all selections, primary first). Render highlights
-    // every selection; the primary's head also receives the terminal cursor.
     let sel_ranges: Vec<(usize, usize)> = sels
         .iter()
         .map(|s| {
@@ -385,9 +588,8 @@ fn render(
             (lo, hi)
         })
         .collect();
-    let in_any_selection = |i: usize| -> bool {
-        sel_ranges.iter().any(|&(s, e)| i >= s && i < e)
-    };
+    let in_any_selection =
+        |i: usize| -> bool { sel_ranges.iter().any(|&(s, e)| i >= s && i < e) };
     let sel_min = primary.min();
     let sel_max = primary.max();
 
@@ -395,14 +597,13 @@ fn render(
         (Mode::Search, Some(re)) => all_matches(&bytes, re),
         _ => Vec::new(),
     };
-    let in_preview = |i: usize| -> bool {
-        preview_matches.iter().any(|&(s, e)| i >= s && i < e)
-    };
+    let in_preview =
+        |i: usize| -> bool { preview_matches.iter().any(|&(s, e)| i >= s && i < e) };
 
     let mut row: u16 = 1;
-    let mut col: u16 = 1; // 1-indexed within the content area (after gutter)
+    let mut col: u16 = 1;
     let mut cur_row: u16 = 1;
-    let mut cur_col: u16 = 1; // also content-area-relative; gutter added at end_frame
+    let mut cur_col: u16 = 1;
     let mut i = start_byte;
     let mut current_lineno = top_line + 1;
     if gutter > 0 && row <= viewport_rows {
@@ -422,10 +623,6 @@ fn render(
             None => break,
         };
         let show_selection = matches!(mode, Mode::Normal | Mode::Search);
-        // The terminal cursor only sits on the buffer in Normal/Insert. In
-        // Search/Ex modes it's on the prompt line, so we should paint the
-        // head cell too (otherwise the head char of the selection looks
-        // unhighlighted while the user is typing).
         let cursor_on_buffer = matches!(mode, Mode::Normal | Mode::Insert);
         let in_sel =
             show_selection && in_any_selection(i) && !(cursor_on_buffer && i == head);
@@ -496,7 +693,6 @@ fn render(
         }
     }
 
-    let path_str = path.and_then(|p| p.to_str()).unwrap_or("[no file]");
     let primary_size = sel_max.saturating_sub(sel_min) + if bytes.is_empty() { 0 } else { 1 };
     let multi_label = if sels.len() > 1 {
         format!("{} sels · ", sels.len())
@@ -519,9 +715,6 @@ fn render(
     let cols_usize = cols as usize;
     let is_prompt = matches!(mode, Mode::Ex | Mode::Search);
 
-    // `cur_col` above is content-area-relative; viewport cursors need the
-    // gutter offset to land in the right screen column. Prompts position
-    // the cursor on the status line and don't get the offset.
     let viewport_cur_col = cur_col.saturating_add(gutter);
     let (status, final_cur_row, final_cur_col) = if is_prompt {
         let (prefix, input) = if mode == Mode::Ex {
@@ -537,7 +730,14 @@ fn render(
     } else {
         let s = format!(
             " [{}] {} · ln {} col {} · {}sel {}b · last:{} raw:{} ",
-            mode_str, path_str, abs_line, cur_col, multi_label, primary_size, key_str, bytes_str
+            mode_str,
+            buffer_label,
+            abs_line,
+            cur_col,
+            multi_label,
+            primary_size,
+            key_str,
+            bytes_str
         );
         (s, cur_row, viewport_cur_col)
     };

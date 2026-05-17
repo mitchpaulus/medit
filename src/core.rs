@@ -217,6 +217,17 @@ pub enum LspAction {
     GotoDefinition,
 }
 
+/// Actions requested from Ex mode that touch the buffer registry (which
+/// `handle_ex` doesn't have access to). The main loop dispatches and
+/// clears.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExAction {
+    OpenFile(std::path::PathBuf),
+    NextBuffer,
+    PrevBuffer,
+    ListBuffers,
+}
+
 /// Compute the byte range `[start, end)` of a text object containing
 /// `offset`. Returns `None` if no object of that kind exists here. Used by
 /// `<a-i>X` / `<a-a>X` text-object selectors.
@@ -1335,6 +1346,7 @@ pub fn handle_ex(
     mode: &mut Mode,
     ex_input: &mut String,
     ex_message: &mut String,
+    ex_action: &mut Option<ExAction>,
     path: Option<&std::path::Path>,
     k: KeyEvent,
 ) -> bool {
@@ -1348,7 +1360,7 @@ pub fn handle_ex(
             let cmd = ex_input.trim().to_string();
             *mode = Mode::Normal;
             ex_input.clear();
-            execute_ex(buffer, path, &cmd, ex_message)
+            execute_ex(buffer, path, &cmd, ex_message, ex_action)
         }
         Key::Backspace => {
             if ex_input.pop().is_none() {
@@ -1372,7 +1384,18 @@ pub fn execute_ex(
     path: Option<&std::path::Path>,
     cmd: &str,
     message: &mut String,
+    action: &mut Option<ExAction>,
 ) -> bool {
+    // Commands with arguments: `:e <path>` opens a file.
+    if let Some(rest) = cmd.strip_prefix("e ") {
+        let p = std::path::PathBuf::from(rest.trim());
+        if p.as_os_str().is_empty() {
+            *message = "usage: :e <path>".to_string();
+        } else {
+            *action = Some(ExAction::OpenFile(p));
+        }
+        return false;
+    }
     match cmd {
         "" => false,
         "w" => match path {
@@ -1405,6 +1428,18 @@ pub fn execute_ex(
                 false
             }
         },
+        "bn" | "bnext" => {
+            *action = Some(ExAction::NextBuffer);
+            false
+        }
+        "bp" | "bprev" | "bprevious" => {
+            *action = Some(ExAction::PrevBuffer);
+            false
+        }
+        "ls" | "buffers" => {
+            *action = Some(ExAction::ListBuffers);
+            false
+        }
         other => {
             *message = format!("unknown command: :{}", other);
             false
