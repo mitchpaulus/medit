@@ -5,8 +5,8 @@ use std::path::Path;
 
 use medit::buffer::Buffer;
 use medit::core::{
-    Mode, ObjectKind, Registers, SearchState, Selection, Selections, collect_bytes, handle_ex,
-    handle_insert, handle_normal, handle_search,
+    LspAction, Mode, ObjectKind, Registers, SearchState, Selection, Selections, collect_bytes,
+    handle_ex, handle_insert, handle_normal, handle_search,
 };
 use medit::input::{Event, Parser};
 
@@ -66,6 +66,7 @@ fn run_test_file(path: &Path) -> Result<(), String> {
     let mut pending_j = false;
     let mut pending_g = false;
     let mut pending_object: Option<ObjectKind> = None;
+    let mut pending_lsp_action: Option<LspAction> = None;
     let mut search_input = String::new();
     let mut search_state = SearchState::default();
 
@@ -90,8 +91,11 @@ fn run_test_file(path: &Path) -> Result<(), String> {
                     &mut pending_g,
                     &mut pending_object,
                     &mut search_state,
+                    &mut pending_lsp_action,
                     k,
                 );
+                // LSP actions are not dispatched in tests (no server).
+                pending_lsp_action = None;
             }
             Mode::Insert => {
                 handle_insert(

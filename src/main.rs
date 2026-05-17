@@ -5,11 +5,12 @@ use std::path::PathBuf;
 
 use medit::buffer::Buffer;
 use medit::core::{
-    Mode, ObjectKind, Registers, SearchState, Selections, all_matches, byte_at_line, collect_bytes,
-    ensure_visible, handle_ex, handle_insert, handle_normal, handle_search, line_index,
-    next_char_or_end, utf8_len,
+    LspAction, Mode, ObjectKind, Registers, SearchState, Selections, all_matches, byte_at_line,
+    collect_bytes, display_col, ensure_visible, handle_ex, handle_insert, handle_normal,
+    handle_search, line_index, line_start, next_char_or_end, snap_to_char_or_last, utf8_len,
 };
 use medit::input::{Event, Key, KeyEvent, Mods, Parser};
+use medit::lsp::{self, LspClient};
 use term::{RawMode, Screen};
 
 const SEL_BG: &str = "\x1b[48;5;24m";
@@ -47,8 +48,34 @@ fn main() -> io::Result<()> {
     let mut pending_j = false;
     let mut pending_g = false;
     let mut pending_object: Option<ObjectKind> = None;
+    let mut pending_lsp_action: Option<LspAction> = None;
     let mut search_input = String::new();
     let mut search_state = SearchState::default();
+
+    // Start an LSP server if the opened file is one we recognize. We only
+    // wire up Go (gopls) for now. Failures (gopls not installed, file not
+    // in a Go module, etc.) just leave LSP off — editor still runs.
+    let mut lsp_client: Option<LspClient> = None;
+    let mut lsp_uri: Option<String> = None;
+    if let Some(p) = path.as_ref() {
+        let lang_id = match p.extension().and_then(|e| e.to_str()) {
+            Some("go") => Some("go"),
+            _ => None,
+        };
+        if let Some(lang_id) = lang_id {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            if let Ok(root_uri) = lsp::path_to_uri(&cwd) {
+                if let Ok(mut client) = LspClient::spawn("gopls", &root_uri) {
+                    if let Ok(uri) = lsp::path_to_uri(p) {
+                        let text = String::from_utf8_lossy(&collect_bytes(&buffer)).into_owned();
+                        let _ = client.did_open(&uri, lang_id, &text);
+                        lsp_uri = Some(uri);
+                    }
+                    lsp_client = Some(client);
+                }
+            }
+        }
+    }
     let mut last_key: Option<KeyEvent> = None;
     let mut last_bytes: Vec<u8> = Vec::new();
 
@@ -124,6 +151,7 @@ fn main() -> io::Result<()> {
                         &mut pending_g,
                         &mut pending_object,
                         &mut search_state,
+                        &mut pending_lsp_action,
                         k,
                     ) {
                         return Ok(());
@@ -133,6 +161,16 @@ fn main() -> io::Result<()> {
                     }
                     if mode == Mode::Search {
                         search_input.clear();
+                    }
+                    if let Some(action) = pending_lsp_action.take() {
+                        dispatch_lsp(
+                            action,
+                            lsp_client.as_mut(),
+                            lsp_uri.as_deref(),
+                            &mut buffer,
+                            &mut sels,
+                            &mut ex_message,
+                        );
                     }
                 }
                 Mode::Insert => {
@@ -189,6 +227,67 @@ fn main() -> io::Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Handle an `LspAction` queued by the modal layer. Sends the request,
+/// blocks for a response, and either updates the selection (if the result
+/// is in the current file) or sets a status-bar message.
+fn dispatch_lsp(
+    action: LspAction,
+    client: Option<&mut LspClient>,
+    current_uri: Option<&str>,
+    buffer: &mut Buffer,
+    sels: &mut Selections,
+    ex_message: &mut String,
+) {
+    let client = match client {
+        Some(c) => c,
+        None => {
+            *ex_message = "no LSP server for this file".to_string();
+            return;
+        }
+    };
+    let uri = match current_uri {
+        Some(u) => u,
+        None => {
+            *ex_message = "LSP: current buffer has no URI".to_string();
+            return;
+        }
+    };
+    match action {
+        LspAction::GotoDefinition => {
+            let bytes = collect_bytes(buffer);
+            let head = sels.primary().head;
+            let line = line_index(&bytes, head) as u32;
+            let line_start_byte = byte_at_line(&bytes, line as usize);
+            let character = head.saturating_sub(line_start_byte) as u32;
+            match client.definition(uri, line, character) {
+                Ok(Some(loc)) => {
+                    if loc.uri == uri {
+                        let target_line_start = byte_at_line(&bytes, loc.line as usize);
+                        let target = target_line_start.saturating_add(loc.character as usize);
+                        let new_head = snap_to_char_or_last(&bytes, target);
+                        sels.reduce_to_primary();
+                        let p = sels.primary_mut();
+                        p.anchor = new_head;
+                        p.head = new_head;
+                        p.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+                    } else {
+                        let path = lsp::uri_to_path(&loc.uri)
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| loc.uri.clone());
+                        *ex_message = format!("definition in {} (different file)", path);
+                    }
+                }
+                Ok(None) => {
+                    *ex_message = "no definition found".to_string();
+                }
+                Err(e) => {
+                    *ex_message = format!("LSP error: {}", e);
+                }
+            }
+        }
+    }
 }
 
 fn format_key(k: &KeyEvent) -> String {

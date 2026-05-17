@@ -209,6 +209,14 @@ pub enum ObjectKind {
     Around,
 }
 
+/// Out-of-band action requested by the modal layer that the main loop has
+/// to dispatch (because it needs resources the handler doesn't have, e.g.
+/// the LSP client). Cleared after handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LspAction {
+    GotoDefinition,
+}
+
 /// Compute the byte range `[start, end)` of a text object containing
 /// `offset`. Returns `None` if no object of that kind exists here. Used by
 /// `<a-i>X` / `<a-a>X` text-object selectors.
@@ -416,6 +424,7 @@ fn bracket_object(
 }
 
 /// Returns `true` if this key was a quit request.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_normal(
     buffer: &mut Buffer,
     sels: &mut Selections,
@@ -424,6 +433,7 @@ pub fn handle_normal(
     pending_g: &mut bool,
     pending_object: &mut Option<ObjectKind>,
     search: &mut SearchState,
+    lsp_action: &mut Option<LspAction>,
     k: KeyEvent,
 ) -> bool {
     let bytes = collect_bytes(buffer);
@@ -448,17 +458,25 @@ pub fn handle_normal(
 
     if *pending_g {
         *pending_g = false;
-        if k.mods.is_empty() && k.key == Key::Char('g') {
-            sels.reduce_to_primary();
-            let new_head = if bytes.is_empty() {
-                0
-            } else {
-                snap_to_char_or_last(&bytes, 0)
-            };
-            let sel = sels.primary_mut();
-            sel.anchor = new_head;
-            sel.head = new_head;
-            sel.desired_col = 1;
+        if k.mods.is_empty() {
+            match k.key {
+                Key::Char('g') => {
+                    sels.reduce_to_primary();
+                    let new_head = if bytes.is_empty() {
+                        0
+                    } else {
+                        snap_to_char_or_last(&bytes, 0)
+                    };
+                    let sel = sels.primary_mut();
+                    sel.anchor = new_head;
+                    sel.head = new_head;
+                    sel.desired_col = 1;
+                }
+                Key::Char('d') => {
+                    *lsp_action = Some(LspAction::GotoDefinition);
+                }
+                _ => {}
+            }
         }
         return false;
     }
