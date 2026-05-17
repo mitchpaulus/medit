@@ -10,13 +10,14 @@ use medit::core::{
     handle_normal, handle_search, line_index, line_start, next_char_or_end, snap_to_char_or_last,
     utf8_len,
 };
+use medit::highlight::{Highlighter, flatten_to_byte_scopes};
 use medit::input::{Event, Key, KeyEvent, Mods, Parser};
 use medit::lsp::{self, LspClient};
+use medit::theme::{self, ScopeId};
 use term::{RawMode, Screen};
 
 const SEL_BG: &str = "\x1b[48;5;24m";
 const MATCH_BG: &str = "\x1b[48;5;94m";
-const RESET_BG: &str = "\x1b[49m";
 const LINENO_FG: &str = "\x1b[38;5;240m";
 const RESET_FG: &str = "\x1b[39m";
 
@@ -27,15 +28,25 @@ struct EditorBuffer {
     sels: Selections,
     top_line: usize,
     path: Option<PathBuf>,
+    /// Syntax highlighting state. `lang_id` is set when the file extension
+    /// matches a registered grammar; `tree` is the most recent parse;
+    /// `flat_scopes` is a dense byte → scope lookup for the renderer.
+    lang_id: Option<&'static str>,
+    tree: Option<tree_sitter::Tree>,
+    flat_scopes: Vec<ScopeId>,
 }
 
 impl EditorBuffer {
     fn new(buffer: Buffer, path: Option<PathBuf>) -> Self {
+        let lang_id = path.as_deref().and_then(Highlighter::language_for_path);
         Self {
             buffer,
             sels: Selections::new(),
             top_line: 0,
             path,
+            lang_id,
+            tree: None,
+            flat_scopes: Vec::new(),
         }
     }
 
@@ -47,6 +58,47 @@ impl EditorBuffer {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "[no name]".to_string())
     }
+}
+
+/// Re-parse `eb` from scratch and rebuild its `flat_scopes`. Called after
+/// the buffer is loaded/replaced. Incremental updates (post-edit) are a
+/// separate, later step.
+fn reparse_and_highlight(eb: &mut EditorBuffer, hl: &Highlighter) {
+    let lang_id = match eb.lang_id {
+        Some(l) => l,
+        None => return,
+    };
+    let mut parser = match hl.parser_for(lang_id) {
+        Some(p) => p,
+        None => return,
+    };
+    let bytes = collect_bytes(&eb.buffer);
+    let tree = match parser.parse(&bytes, eb.tree.as_ref()) {
+        Some(t) => t,
+        None => return,
+    };
+    let spans = hl.highlight(lang_id, &tree, &bytes);
+    eb.flat_scopes = flatten_to_byte_scopes(&spans, bytes.len());
+    eb.tree = Some(tree);
+}
+
+/// Wrap `text` with optional fg and bg SGR sequences. If neither is set,
+/// returns the text unchanged. Always closes with `\x1b[0m` to reset all
+/// attributes after the styled run.
+fn styled(fg: Option<&str>, bg: Option<&str>, text: &str) -> String {
+    if fg.is_none() && bg.is_none() {
+        return text.to_string();
+    }
+    let mut s = String::with_capacity(text.len() + 16);
+    if let Some(f) = fg {
+        s.push_str(f);
+    }
+    if let Some(b) = bg {
+        s.push_str(b);
+    }
+    s.push_str(text);
+    s.push_str("\x1b[0m");
+    s
 }
 
 fn draw_lineno(screen: &mut Screen, row: u16, lineno: usize, gutter: u16) {
@@ -67,7 +119,12 @@ fn main() -> io::Result<()> {
         Some(p) if p.exists() => Buffer::open(p)?,
         _ => Buffer::empty(),
     };
-    let mut buffers: Vec<EditorBuffer> = vec![EditorBuffer::new(initial_buffer, initial_path)];
+    let highlighter = Highlighter::new();
+    let mut buffers: Vec<EditorBuffer> = {
+        let mut eb = EditorBuffer::new(initial_buffer, initial_path);
+        reparse_and_highlight(&mut eb, &highlighter);
+        vec![eb]
+    };
     let mut current: usize = 0;
 
     let mut mode = Mode::Normal;
@@ -185,6 +242,7 @@ fn main() -> io::Result<()> {
                             lsp_client.as_mut(),
                             &mut buffers,
                             &mut current,
+                            &highlighter,
                             &mut ex_message,
                         );
                     }
@@ -217,6 +275,7 @@ fn main() -> io::Result<()> {
                             &mut buffers,
                             &mut current,
                             lsp_client.as_mut(),
+                            &highlighter,
                             &mut ex_message,
                         );
                         // If LSP needs to be started lazily for a newly-
@@ -312,6 +371,7 @@ fn dispatch_lsp(
     client: Option<&mut LspClient>,
     buffers: &mut Vec<EditorBuffer>,
     current: &mut usize,
+    highlighter: &Highlighter,
     ex_message: &mut String,
 ) {
     let client = match client {
@@ -364,7 +424,14 @@ fn dispatch_lsp(
                         return;
                     }
                 };
-                if !open_or_switch_to(buffers, current, &target_path, Some(client), ex_message) {
+                if !open_or_switch_to(
+                    buffers,
+                    current,
+                    &target_path,
+                    Some(client),
+                    highlighter,
+                    ex_message,
+                ) {
                     return;
                 }
             }
@@ -384,13 +451,15 @@ fn dispatch_lsp(
 }
 
 /// Open `path` as a new buffer (or switch to it if already open). On a new
-/// open, also notifies the LSP server via `didOpen` if applicable. Returns
-/// `false` and sets `ex_message` on failure (e.g. can't read the file).
+/// open, runs the syntax highlighter and notifies the LSP server via
+/// `didOpen` if applicable. Returns `false` and sets `ex_message` on
+/// failure (e.g. can't read the file).
 fn open_or_switch_to(
     buffers: &mut Vec<EditorBuffer>,
     current: &mut usize,
     path: &Path,
     lsp_client: Option<&mut LspClient>,
+    highlighter: &Highlighter,
     ex_message: &mut String,
 ) -> bool {
     if let Some(idx) = buffers
@@ -411,7 +480,8 @@ fn open_or_switch_to(
     } else {
         Buffer::empty()
     };
-    let eb = EditorBuffer::new(buffer, Some(path.to_path_buf()));
+    let mut eb = EditorBuffer::new(buffer, Some(path.to_path_buf()));
+    reparse_and_highlight(&mut eb, highlighter);
     buffers.push(eb);
     *current = buffers.len() - 1;
     if let Some(client) = lsp_client {
@@ -437,11 +507,12 @@ fn dispatch_ex_action(
     buffers: &mut Vec<EditorBuffer>,
     current: &mut usize,
     lsp_client: Option<&mut LspClient>,
+    highlighter: &Highlighter,
     ex_message: &mut String,
 ) {
     match action {
         ExAction::OpenFile(path) => {
-            open_or_switch_to(buffers, current, &path, lsp_client, ex_message);
+            open_or_switch_to(buffers, current, &path, lsp_client, highlighter, ex_message);
         }
         ExAction::NextBuffer => {
             if buffers.len() > 1 {
@@ -536,6 +607,7 @@ fn render_all(
         screen,
         &cur.buffer,
         &cur.sels,
+        &cur.flat_scopes,
         mode,
         cur.top_line,
         &buffer_label,
@@ -553,6 +625,7 @@ fn render(
     screen: &mut Screen,
     buffer: &Buffer,
     sels: &Selections,
+    scopes: &[ScopeId],
     mode: Mode,
     top_line: usize,
     buffer_label: &str,
@@ -634,6 +707,12 @@ fn render(
         } else {
             None
         };
+        let scope = scopes.get(i).copied().unwrap_or(ScopeId::Default);
+        let fg_seq = if scope == ScopeId::Default {
+            None
+        } else {
+            Some(theme::fg_for_scope(scope))
+        };
         match b {
             b'\n' => {
                 row = row.saturating_add(1);
@@ -649,12 +728,13 @@ fn render(
             }
             b'\t' => {
                 let advance = 4 - ((col as usize - 1) % 4);
-                if let Some(bgc) = bg {
-                    if col <= content_cols {
-                        let spaces = " ".repeat(advance);
-                        let s = format!("{}{}{}", bgc, spaces, RESET_BG);
-                        screen.write_at(row, col + gutter, &s);
-                    }
+                if bg.is_some() && col <= content_cols {
+                    let spaces = " ".repeat(advance);
+                    screen.write_at(
+                        row,
+                        col + gutter,
+                        &styled(fg_seq, bg, &spaces),
+                    );
                 }
                 col = col.saturating_add(advance as u16);
                 i += 1;
@@ -663,15 +743,7 @@ fn render(
                 let letter = (c + 0x40) as char;
                 let body = format!("^{}", letter);
                 if col <= content_cols {
-                    if let Some(bgc) = bg {
-                        screen.write_at(
-                            row,
-                            col + gutter,
-                            &format!("{}{}{}", bgc, body, RESET_BG),
-                        );
-                    } else {
-                        screen.write_at(row, col + gutter, &body);
-                    }
+                    screen.write_at(row, col + gutter, &styled(fg_seq, bg, &body));
                 }
                 col = col.saturating_add(2);
                 i += 1;
@@ -681,11 +753,7 @@ fn render(
                 let end = (i + n).min(bytes.len());
                 let s = std::str::from_utf8(&bytes[i..end]).unwrap_or("?");
                 if col <= content_cols {
-                    if let Some(bgc) = bg {
-                        screen.write_at(row, col + gutter, &format!("{}{}{}", bgc, s, RESET_BG));
-                    } else {
-                        screen.write_at(row, col + gutter, s);
-                    }
+                    screen.write_at(row, col + gutter, &styled(fg_seq, bg, s));
                 }
                 col = col.saturating_add(1);
                 i = end;

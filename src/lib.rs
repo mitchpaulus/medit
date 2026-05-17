@@ -4,5 +4,7 @@
 
 pub mod buffer;
 pub mod core;
+pub mod highlight;
 pub mod input;
 pub mod lsp;
+pub mod theme;
