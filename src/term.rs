@@ -68,6 +68,18 @@ impl Screen {
         let _ = write!(self.back, "\x1b[{};{}H{}", row, col, text);
     }
 
+    /// Append raw bytes to the back buffer without any cursor positioning.
+    /// Used for emitting SGR transitions that span cells.
+    pub fn append_raw(&mut self, text: &str) {
+        self.back.extend_from_slice(text.as_bytes());
+    }
+
+    /// Direct access to the back buffer for hot-path rendering that wants
+    /// to emit bytes without going through `format!`/`String` allocations.
+    pub fn back_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.back
+    }
+
     /// Set the terminal cursor shape. `block` = block cursor (normal mode);
     /// `false` = bar cursor (insert mode). Steady, not blinking.
     pub fn set_cursor_shape(&mut self, block: bool) {

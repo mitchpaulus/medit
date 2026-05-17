@@ -435,6 +435,11 @@ fn bracket_object(
 }
 
 /// Returns `true` if this key was a quit request.
+/// `cached_bytes` / `cached_line_starts`: pre-built flat byte view and
+/// line-starts index from the caller's cache. Both stay valid through
+/// this call provided no mutating op is invoked; mutating ops (`d`, `c`,
+/// `p`, etc.) each re-collect their own fresh bytes internally so they
+/// don't rely on these slices.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_normal(
     buffer: &mut Buffer,
@@ -448,14 +453,17 @@ pub fn handle_normal(
     lsp_action: &mut Option<LspAction>,
     top_line: &mut usize,
     viewport_rows: usize,
+    cached_bytes: &[u8],
+    cached_line_starts: &[usize],
     k: KeyEvent,
 ) -> bool {
-    let bytes = collect_bytes(buffer);
+    let bytes: &[u8] = cached_bytes;
+    let line_starts: &[usize] = cached_line_starts;
 
     // Resolve text-object selector pending from a previous Alt-i / Alt-a.
     if let Some(kind) = pending_object.take() {
         if k.mods.is_empty() {
-            apply_object_for_all(sels, &bytes, kind, k.key);
+            apply_object_for_all(sels, bytes, kind, k.key);
         }
         return false;
     }
@@ -479,7 +487,7 @@ pub fn handle_normal(
                     let new_head = if bytes.is_empty() {
                         0
                     } else {
-                        snap_to_char_or_last(&bytes, 0)
+                        snap_to_char_or_last(bytes, 0)
                     };
                     let sel = sels.primary_mut();
                     sel.anchor = new_head;
@@ -504,7 +512,7 @@ pub fn handle_normal(
     if *pending_z {
         *pending_z = false;
         if k.mods.is_empty() && k.key == Key::Char('z') {
-            let head_line = line_index(&bytes, sels.primary().head);
+            let head_line = line_index(bytes, sels.primary().head);
             let half = viewport_rows / 2;
             *top_line = head_line.saturating_sub(half);
         }
@@ -518,13 +526,13 @@ pub fn handle_normal(
     // Ctrl+D / Ctrl+U: move down/up 10 lines (per-cursor).
     if k.mods == Mods::CTRL && k.key == Key::Char('d') {
         for sel in sels.iter_mut() {
-            move_line_relative(&bytes, sel, 10);
+            move_line_relative_cached(bytes, line_starts, sel, 10);
         }
         return false;
     }
     if k.mods == Mods::CTRL && k.key == Key::Char('u') {
         for sel in sels.iter_mut() {
-            move_line_relative(&bytes, sel, -10);
+            move_line_relative_cached(bytes, line_starts, sel, -10);
         }
         return false;
     }
@@ -535,19 +543,19 @@ pub fn handle_normal(
     // between paragraphs.
     if k.mods.is_empty() && k.key == Key::Char('}') {
         for sel in sels.iter_mut() {
-            let new_head = paragraph_end_forward(&bytes, sel.head);
+            let new_head = paragraph_end_forward(bytes, sel.head);
             sel.head = new_head;
             sel.anchor = new_head;
-            sel.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+            sel.desired_col = display_col(bytes, line_start(bytes, new_head), new_head);
         }
         return false;
     }
     if k.mods.is_empty() && k.key == Key::Char('{') {
         for sel in sels.iter_mut() {
-            let new_head = paragraph_start_backward(&bytes, sel.head);
+            let new_head = paragraph_start_backward(bytes, sel.head);
             sel.head = new_head;
             sel.anchor = new_head;
-            sel.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+            sel.desired_col = display_col(bytes, line_start(bytes, new_head), new_head);
         }
         return false;
     }
@@ -559,11 +567,11 @@ pub fn handle_normal(
     // G: jump to start of last non-empty line. Slides (collapses to primary).
     if k.mods.is_empty() && k.key == Key::Char('G') {
         sels.reduce_to_primary();
-        let new_head = snap_to_char_or_last(&bytes, last_line_start(&bytes));
+        let new_head = snap_to_char_or_last(bytes, last_line_start(bytes));
         let sel = sels.primary_mut();
         sel.anchor = new_head;
         sel.head = new_head;
-        sel.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+        sel.desired_col = display_col(bytes, line_start(bytes, new_head), new_head);
         return false;
     }
 
@@ -590,14 +598,14 @@ pub fn handle_normal(
     if k.mods.is_empty() && k.key == Key::Char('n') {
         if let Some(re) = search.pattern.as_ref() {
             sels.reduce_to_primary();
-            find_and_select(sels.primary_mut(), &bytes, re, true);
+            find_and_select(sels.primary_mut(), bytes, re, true);
         }
         return false;
     }
     if k.mods.is_empty() && k.key == Key::Char('N') {
         if let Some(re) = search.pattern.as_ref() {
             sels.reduce_to_primary();
-            find_and_select(sels.primary_mut(), &bytes, re, false);
+            find_and_select(sels.primary_mut(), bytes, re, false);
         }
         return false;
     }
@@ -607,11 +615,11 @@ pub fn handle_normal(
     // back to the last committed search regex. The derived pattern also
     // becomes the new search pattern so n/N continue iterating it.
     if k.mods == Mods::CTRL && k.key == Key::Char('j') {
-        add_next_smart(sels, &bytes, search, true);
+        add_next_smart(sels, bytes, search, true);
         return false;
     }
     if k.mods == Mods::CTRL && k.key == Key::Char('k') {
-        add_next_smart(sels, &bytes, search, false);
+        add_next_smart(sels, bytes, search, false);
         return false;
     }
 
@@ -643,7 +651,7 @@ pub fn handle_normal(
             }
             Key::Char('a') => {
                 for sel in sels.iter_mut() {
-                    let after = next_char_or_end(&bytes, sel.max());
+                    let after = next_char_or_end(bytes, sel.max());
                     sel.anchor = after;
                     sel.head = after;
                 }
@@ -653,7 +661,7 @@ pub fn handle_normal(
             }
             Key::Char('I') => {
                 for sel in sels.iter_mut() {
-                    let ls = line_start(&bytes, sel.head);
+                    let ls = line_start(bytes, sel.head);
                     sel.anchor = ls;
                     sel.head = ls;
                 }
@@ -663,7 +671,7 @@ pub fn handle_normal(
             }
             Key::Char('A') => {
                 for sel in sels.iter_mut() {
-                    let le = line_end(&bytes, sel.head);
+                    let le = line_end(bytes, sel.head);
                     sel.anchor = le;
                     sel.head = le;
                 }
@@ -753,7 +761,7 @@ pub fn handle_normal(
 
     if let Some(m) = motion {
         for sel in sels.iter_mut() {
-            apply_motion(&bytes, sel, m, extend);
+            apply_motion(bytes, sel, m, extend);
         }
     }
 
@@ -1911,9 +1919,18 @@ pub fn motion_word_end(bytes: &[u8], from: usize) -> usize {
 // ===== Buffer helpers =====
 
 pub fn collect_bytes(buffer: &Buffer) -> Vec<u8> {
+    let traced = crate::trace::enabled();
+    let start = if traced {
+        Some(crate::trace::tic())
+    } else {
+        None
+    };
     let mut v = Vec::with_capacity(buffer.len());
     for s in buffer.slices() {
         v.extend_from_slice(s);
+    }
+    if let Some(s) = start {
+        crate::trace::record_collect(crate::trace::toc(s));
     }
     v
 }
@@ -2039,6 +2056,42 @@ pub fn byte_at_line(bytes: &[u8], line: usize) -> usize {
         }
     }
     bytes.len()
+}
+
+/// O(log L) line lookup for a byte offset, using a pre-built line-starts
+/// index. `line_starts[k]` must be the byte offset of the start of line
+/// `k`; the caller is responsible for keeping this in sync with edits.
+pub fn line_index_cached(line_starts: &[usize], offset: usize) -> usize {
+    match line_starts.binary_search(&offset) {
+        Ok(idx) => idx,
+        Err(idx) => idx.saturating_sub(1),
+    }
+}
+
+/// O(1) "start byte of line `line`" lookup. Returns `bytes_len` if the
+/// requested line is past the end of the buffer.
+pub fn byte_at_line_cached(line_starts: &[usize], line: usize, bytes_len: usize) -> usize {
+    line_starts.get(line).copied().unwrap_or(bytes_len)
+}
+
+/// Cached version of `move_line_relative` that uses a pre-built line
+/// index. Same semantics; just no O(N) walks.
+pub fn move_line_relative_cached(
+    bytes: &[u8],
+    line_starts: &[usize],
+    sel: &mut Selection,
+    delta: i64,
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    let total = line_starts.len().saturating_sub(1);
+    let current = line_index_cached(line_starts, sel.head) as i64;
+    let target = (current + delta).max(0).min(total as i64) as usize;
+    let line_start_byte = byte_at_line_cached(line_starts, target, bytes.len());
+    let new_head = offset_at_col(bytes, line_start_byte, sel.desired_col);
+    sel.head = new_head;
+    sel.anchor = new_head;
 }
 
 pub fn ensure_visible(bytes: &[u8], head: usize, top_line: &mut usize, viewport_rows: usize) {

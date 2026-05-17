@@ -86,6 +86,15 @@ fn run_test_file(path: &Path) -> Result<(), String> {
         let Event::Key(k) = event;
         match mode {
             Mode::Normal => {
+                // Tests rebuild the cache per-keystroke. Real callers cache
+                // it across frames; the perf wins don't matter here.
+                let cached_bytes = collect_bytes(&buffer);
+                let mut line_starts = vec![0usize];
+                for (i, b) in cached_bytes.iter().enumerate() {
+                    if *b == b'\n' {
+                        line_starts.push(i + 1);
+                    }
+                }
                 let _quit = handle_normal(
                     &mut buffer,
                     &mut sels,
@@ -98,6 +107,8 @@ fn run_test_file(path: &Path) -> Result<(), String> {
                     &mut pending_lsp_action,
                     &mut top_line,
                     24,
+                    &cached_bytes,
+                    &line_starts,
                     k,
                 );
                 // LSP actions are not dispatched in tests (no server).

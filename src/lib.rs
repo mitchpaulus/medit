@@ -8,3 +8,4 @@ pub mod highlight;
 pub mod input;
 pub mod lsp;
 pub mod theme;
+pub mod trace;

@@ -6,20 +6,20 @@ use std::path::{Path, PathBuf};
 use medit::buffer::Buffer;
 use medit::core::{
     ExAction, LspAction, Mode, ObjectKind, Registers, SearchState, Selections, all_matches,
-    byte_at_line, collect_bytes, display_col, ensure_visible, handle_ex, handle_insert,
-    handle_normal, handle_search, line_index, line_start, next_char_or_end, snap_to_char_or_last,
-    utf8_len,
+    byte_at_line, byte_at_line_cached, collect_bytes, display_col, handle_ex, handle_insert,
+    handle_normal, handle_search, line_index, line_index_cached, line_start, next_char_or_end,
+    snap_to_char_or_last, utf8_len,
 };
 use medit::highlight::{Highlighter, flatten_to_byte_scopes};
 use medit::input::{Event, Key, KeyEvent, Mods, Parser};
 use medit::lsp::{self, LspClient};
 use medit::theme::{self, ScopeId};
+use medit::trace;
 use term::{RawMode, Screen};
 
 const SEL_BG: &str = "\x1b[48;5;24m";
 const MATCH_BG: &str = "\x1b[48;5;94m";
 const LINENO_FG: &str = "\x1b[38;5;240m";
-const RESET_FG: &str = "\x1b[39m";
 
 /// Per-buffer editor state. The main loop holds a `Vec<EditorBuffer>` and a
 /// `current` index; switching buffers means moving the index.
@@ -34,6 +34,17 @@ struct EditorBuffer {
     lang_id: Option<&'static str>,
     tree: Option<tree_sitter::Tree>,
     flat_scopes: Vec<ScopeId>,
+    /// Cached flat byte view of `buffer`. Refreshed lazily by
+    /// `refresh_bytes_cache` when `buffer.version()` doesn't match
+    /// `cached_version`. Saves the per-frame `collect_bytes` walk for
+    /// read-only consumers (the renderer and `ensure_visible`).
+    cached_bytes: Vec<u8>,
+    /// `line_starts[k]` is the byte offset of the start of line `k`. Always
+    /// has at least one entry (0 for the first line). Built alongside
+    /// `cached_bytes`. Lets `line_index_cached` use binary search and
+    /// `byte_at_line_cached` index in O(1).
+    line_starts: Vec<usize>,
+    cached_version: Option<u64>,
 }
 
 impl EditorBuffer {
@@ -47,6 +58,9 @@ impl EditorBuffer {
             lang_id,
             tree: None,
             flat_scopes: Vec::new(),
+            cached_bytes: Vec::new(),
+            line_starts: vec![0],
+            cached_version: None,
         }
     }
 
@@ -57,6 +71,51 @@ impl EditorBuffer {
             .and_then(|s| s.to_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "[no name]".to_string())
+    }
+}
+
+/// Ensure `eb.cached_bytes` and `eb.line_starts` reflect the current
+/// buffer state. Cheap when versions match; otherwise rebuilds both in a
+/// single linear pass.
+fn refresh_bytes_cache(eb: &mut EditorBuffer) {
+    let v = eb.buffer.version();
+    if eb.cached_version == Some(v) {
+        return;
+    }
+    eb.cached_bytes.clear();
+    eb.cached_bytes.reserve(eb.buffer.len());
+    eb.line_starts.clear();
+    eb.line_starts.push(0);
+    for slice in eb.buffer.slices() {
+        let base = eb.cached_bytes.len();
+        eb.cached_bytes.extend_from_slice(slice);
+        // Index newline positions as we copy; recording byte offsets of
+        // the byte *after* each '\n' (i.e. the start of the next line).
+        for (i, &b) in slice.iter().enumerate() {
+            if b == b'\n' {
+                eb.line_starts.push(base + i + 1);
+            }
+        }
+    }
+    eb.cached_version = Some(v);
+}
+
+/// Cached counterpart to `core::ensure_visible`. Same semantics, but uses
+/// the cached line-starts index for O(log L) line lookup.
+fn ensure_visible_indexed(
+    line_starts: &[usize],
+    head: usize,
+    top_line: &mut usize,
+    viewport_rows: usize,
+) {
+    if viewport_rows == 0 {
+        return;
+    }
+    let head_line = line_index_cached(line_starts, head);
+    if head_line < *top_line {
+        *top_line = head_line;
+    } else if head_line >= top_line.saturating_add(viewport_rows) {
+        *top_line = head_line + 1 - viewport_rows;
     }
 }
 
@@ -82,38 +141,120 @@ fn reparse_and_highlight(eb: &mut EditorBuffer, hl: &Highlighter) {
     eb.tree = Some(tree);
 }
 
-/// Wrap `text` with optional fg and bg SGR sequences. If neither is set,
-/// returns the text unchanged. Always closes with `\x1b[0m` to reset all
-/// attributes after the styled run.
-fn styled(fg: Option<&str>, bg: Option<&str>, text: &str) -> String {
-    if fg.is_none() && bg.is_none() {
-        return text.to_string();
+/// Compute the SGR transition string needed to go from `(cur_fg, cur_bg)`
+/// to `(new_fg, new_bg)`. Returns an empty string if no change is needed.
+/// Emits only the channels that changed (and uses minimal-form resets for
+/// single-channel transitions to default).
+/// Write the minimal SGR transition from (cur_fg, cur_bg) to (new_fg, new_bg)
+/// directly into `out`. No-op when state matches. Hot path — must not
+/// allocate.
+fn append_style_transition(
+    out: &mut Vec<u8>,
+    cur_fg: Option<&str>,
+    cur_bg: Option<&str>,
+    new_fg: Option<&str>,
+    new_bg: Option<&str>,
+) {
+    if cur_fg == new_fg && cur_bg == new_bg {
+        return;
     }
-    let mut s = String::with_capacity(text.len() + 16);
-    if let Some(f) = fg {
-        s.push_str(f);
+    let fg_to_default = cur_fg.is_some() && new_fg.is_none();
+    let bg_to_default = cur_bg.is_some() && new_bg.is_none();
+    if fg_to_default && bg_to_default {
+        out.extend_from_slice(b"\x1b[0m");
+        return;
     }
-    if let Some(b) = bg {
-        s.push_str(b);
+    if fg_to_default {
+        out.extend_from_slice(b"\x1b[39m");
     }
-    s.push_str(text);
-    s.push_str("\x1b[0m");
-    s
+    if bg_to_default {
+        out.extend_from_slice(b"\x1b[49m");
+    }
+    if new_fg != cur_fg {
+        if let Some(f) = new_fg {
+            out.extend_from_slice(f.as_bytes());
+        }
+    }
+    if new_bg != cur_bg {
+        if let Some(b) = new_bg {
+            out.extend_from_slice(b.as_bytes());
+        }
+    }
+}
+
+/// Write `\x1b[row;colH` directly into `out` without allocating an
+/// intermediate `String`. Hot path.
+fn append_cursor_pos(out: &mut Vec<u8>, row: u16, col: u16) {
+    out.push(0x1b);
+    out.push(b'[');
+    append_u16(out, row);
+    out.push(b';');
+    append_u16(out, col);
+    out.push(b'H');
+}
+
+fn append_u16(out: &mut Vec<u8>, mut n: u16) {
+    if n == 0 {
+        out.push(b'0');
+        return;
+    }
+    let mut buf = [0u8; 5];
+    let mut i = 0;
+    while n > 0 {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        out.push(buf[i]);
+    }
+}
+
+/// Emit a styled cell at `(row, col)` directly into the screen's back
+/// buffer. Handles cursor-position coalescing (skips the position escape
+/// when the terminal cursor is already at the target) and SGR
+/// coalescing (only emits transitions when style state actually changed).
+/// Updates `cursor_at`, `style_fg`, `style_bg` in place. No allocations.
+#[allow(clippy::too_many_arguments)]
+fn emit_styled_cell(
+    screen: &mut Screen,
+    cursor_at: &mut Option<(u16, u16)>,
+    style_fg: &mut Option<&'static str>,
+    style_bg: &mut Option<&'static str>,
+    row: u16,
+    col: u16,
+    width: u16,
+    new_fg: Option<&'static str>,
+    new_bg: Option<&'static str>,
+    body: &[u8],
+) {
+    let back = screen.back_mut();
+    if *cursor_at != Some((row, col)) {
+        append_cursor_pos(back, row, col);
+    }
+    append_style_transition(back, *style_fg, *style_bg, new_fg, new_bg);
+    back.extend_from_slice(body);
+    *cursor_at = Some((row, col + width));
+    *style_fg = new_fg;
+    *style_bg = new_bg;
 }
 
 fn draw_lineno(screen: &mut Screen, row: u16, lineno: usize, gutter: u16) {
+    // Wrap the line number with explicit resets so style state is
+    // predictable on either side (caller can assume default after).
     let digits = gutter.saturating_sub(1) as usize;
     let text = format!(
-        "{}{:>width$} {}",
+        "\x1b[0m{}{:>width$} \x1b[0m",
         LINENO_FG,
         lineno,
-        RESET_FG,
         width = digits
     );
     screen.write_at(row, 1, &text);
 }
 
 fn main() -> io::Result<()> {
+    trace::init_from_env();
     let initial_path: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
     let initial_buffer = match initial_path.as_ref() {
         Some(p) if p.exists() => Buffer::open(p)?,
@@ -153,6 +294,9 @@ fn main() -> io::Result<()> {
     let mut screen = Screen::enter()?;
     term::install_sigwinch_handler()?;
 
+    // Populate cache before the first frame; subsequent frames refresh in
+    // the main loop.
+    refresh_bytes_cache(&mut buffers[current]);
     render_all(
         &mut screen,
         &buffers,
@@ -177,8 +321,9 @@ fn main() -> io::Result<()> {
             let viewport_rows = screen.rows.saturating_sub(1) as usize;
             {
                 let cur = &mut buffers[current];
-                let bytes = collect_bytes(&cur.buffer);
-                ensure_visible(&bytes, cur.sels.primary().head, &mut cur.top_line, viewport_rows);
+                refresh_bytes_cache(cur);
+                let head = cur.sels.primary().head;
+                ensure_visible_indexed(&cur.line_starts, head, &mut cur.top_line, viewport_rows);
             }
             render_all(
                 &mut screen,
@@ -199,6 +344,10 @@ fn main() -> io::Result<()> {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
+        // Frame timing starts after the blocking read so we don't measure
+        // input-wait latency.
+        let frame_start = trace::tic();
+        let handle_start = trace::tic();
         last_bytes = io_buf[..n].to_vec();
         parser.feed(&io_buf[..n]);
         while let Some(event) = parser.next_event() {
@@ -214,9 +363,23 @@ fn main() -> io::Result<()> {
                 Mode::Normal => {
                     let viewport_rows = screen.rows.saturating_sub(1) as usize;
                     let cur = &mut buffers[current];
+                    refresh_bytes_cache(cur);
+                    // Split the borrow: handle_normal needs `&mut cur.buffer`
+                    // *and* immutable views of `cur.cached_bytes` /
+                    // `cur.line_starts`. The cache stays valid for the
+                    // duration of the call — mutating ops inside re-collect
+                    // their own fresh bytes.
+                    let EditorBuffer {
+                        buffer,
+                        sels,
+                        top_line,
+                        cached_bytes,
+                        line_starts,
+                        ..
+                    } = cur;
                     if handle_normal(
-                        &mut cur.buffer,
-                        &mut cur.sels,
+                        buffer,
+                        sels,
                         &mut mode,
                         &mut registers,
                         &mut pending_g,
@@ -224,8 +387,10 @@ fn main() -> io::Result<()> {
                         &mut pending_object,
                         &mut search_state,
                         &mut pending_lsp_action,
-                        &mut cur.top_line,
+                        top_line,
                         viewport_rows,
+                        cached_bytes,
+                        line_starts,
                         k,
                     ) {
                         return Ok(());
@@ -309,11 +474,14 @@ fn main() -> io::Result<()> {
                 }
             }
         }
+        let handle_ns = trace::toc(handle_start);
+        let render_start = trace::tic();
         {
             let viewport_rows = screen.rows.saturating_sub(1) as usize;
             let cur = &mut buffers[current];
-            let bytes = collect_bytes(&cur.buffer);
-            ensure_visible(&bytes, cur.sels.primary().head, &mut cur.top_line, viewport_rows);
+            refresh_bytes_cache(cur);
+            let head = cur.sels.primary().head;
+            ensure_visible_indexed(&cur.line_starts, head, &mut cur.top_line, viewport_rows);
         }
         render_all(
             &mut screen,
@@ -327,6 +495,14 @@ fn main() -> io::Result<()> {
             last_key.as_ref(),
             &last_bytes,
         )?;
+        let render_ns = trace::toc(render_start);
+        let total_ns = trace::toc(frame_start);
+        trace::emit_frame(
+            total_ns,
+            handle_ns,
+            render_ns,
+            buffers[current].buffer.len(),
+        );
     }
     Ok(())
 }
@@ -605,7 +781,8 @@ fn render_all(
     };
     render(
         screen,
-        &cur.buffer,
+        &cur.cached_bytes,
+        &cur.line_starts,
         &cur.sels,
         &cur.flat_scopes,
         mode,
@@ -623,7 +800,8 @@ fn render_all(
 #[allow(clippy::too_many_arguments)]
 fn render(
     screen: &mut Screen,
-    buffer: &Buffer,
+    bytes: &[u8],
+    line_starts: &[usize],
     sels: &Selections,
     scopes: &[ScopeId],
     mode: Mode,
@@ -637,14 +815,16 @@ fn render(
     last_bytes: &[u8],
 ) -> io::Result<()> {
     screen.begin_frame();
-    let bytes = collect_bytes(buffer);
     let cols = screen.cols;
     let viewport_rows = screen.rows.saturating_sub(1);
     let primary = sels.primary();
     let head = primary.head;
-    let start_byte = byte_at_line(&bytes, top_line);
+    let start_byte = byte_at_line_cached(line_starts, top_line, bytes.len());
 
-    let total_lines = line_index(&bytes, bytes.len()) + 1;
+    // `line_starts.len()` is always at least 1 (we always seed with 0); the
+    // total number of newline-terminated lines is `line_starts.len()` and
+    // the visible-line count is the same (we count trailing partial lines).
+    let total_lines = line_starts.len();
     let line_digits = total_lines.to_string().len() as u16;
     let gutter: u16 = if cols > line_digits + 2 {
         line_digits + 1
@@ -657,7 +837,7 @@ fn render(
         .iter()
         .map(|s| {
             let lo = s.min();
-            let hi = next_char_or_end(&bytes, s.max());
+            let hi = next_char_or_end(bytes, s.max());
             (lo, hi)
         })
         .collect();
@@ -667,7 +847,7 @@ fn render(
     let sel_max = primary.max();
 
     let preview_matches: Vec<(usize, usize)> = match (mode, search.preview.as_ref()) {
-        (Mode::Search, Some(re)) => all_matches(&bytes, re),
+        (Mode::Search, Some(re)) => all_matches(bytes, re),
         _ => Vec::new(),
     };
     let in_preview =
@@ -679,8 +859,20 @@ fn render(
     let mut cur_col: u16 = 1;
     let mut i = start_byte;
     let mut current_lineno = top_line + 1;
+    // Tracked SGR + cursor state.
+    // - `style_fg/bg`: last emitted SGR fg/bg. Cells emit transition strings
+    //   only when this changes.
+    // - `cursor_at`: where the terminal cursor is *after* the most recent
+    //   emit. If a cell wants to write at exactly that position we can skip
+    //   the `\x1b[r;cH` escape entirely (terminal advances cursor with each
+    //   printed glyph). Reset to `None` on any discontinuity (a skipped
+    //   cell, row change without a line-number, etc.).
+    let mut style_fg: Option<&'static str> = None;
+    let mut style_bg: Option<&'static str> = None;
+    let mut cursor_at: Option<(u16, u16)> = None;
     if gutter > 0 && row <= viewport_rows {
         draw_lineno(screen, row, current_lineno, gutter);
+        cursor_at = Some((row, gutter + 1));
     }
 
     loop {
@@ -700,7 +892,7 @@ fn render(
         let in_sel =
             show_selection && in_any_selection(i) && !(cursor_on_buffer && i == head);
         let in_match = !in_sel && in_preview(i);
-        let bg = if in_sel {
+        let bg: Option<&'static str> = if in_sel {
             Some(SEL_BG)
         } else if in_match {
             Some(MATCH_BG)
@@ -708,7 +900,7 @@ fn render(
             None
         };
         let scope = scopes.get(i).copied().unwrap_or(ScopeId::Default);
-        let fg_seq = if scope == ScopeId::Default {
+        let fg_seq: Option<&'static str> = if scope == ScopeId::Default {
             None
         } else {
             Some(theme::fg_for_scope(scope))
@@ -720,6 +912,11 @@ fn render(
                 current_lineno += 1;
                 if gutter > 0 && row <= viewport_rows {
                     draw_lineno(screen, row, current_lineno, gutter);
+                    cursor_at = Some((row, gutter + 1));
+                    style_fg = None;
+                    style_bg = None;
+                } else {
+                    cursor_at = None;
                 }
                 i += 1;
             }
@@ -729,21 +926,46 @@ fn render(
             b'\t' => {
                 let advance = 4 - ((col as usize - 1) % 4);
                 if bg.is_some() && col <= content_cols {
-                    let spaces = " ".repeat(advance);
-                    screen.write_at(
+                    // Tabs only need a visible body when there's a bg to
+                    // paint; otherwise we just advance the column counter
+                    // and let the next emit position past the gap.
+                    const SPACES: &[u8; 4] = b"    ";
+                    emit_styled_cell(
+                        screen,
+                        &mut cursor_at,
+                        &mut style_fg,
+                        &mut style_bg,
                         row,
                         col + gutter,
-                        &styled(fg_seq, bg, &spaces),
+                        advance as u16,
+                        fg_seq,
+                        bg,
+                        &SPACES[..advance],
                     );
+                } else {
+                    cursor_at = None;
                 }
                 col = col.saturating_add(advance as u16);
                 i += 1;
             }
             c if c < 0x20 => {
-                let letter = (c + 0x40) as char;
-                let body = format!("^{}", letter);
+                let letter = c + 0x40;
+                let body = [b'^', letter];
                 if col <= content_cols {
-                    screen.write_at(row, col + gutter, &styled(fg_seq, bg, &body));
+                    emit_styled_cell(
+                        screen,
+                        &mut cursor_at,
+                        &mut style_fg,
+                        &mut style_bg,
+                        row,
+                        col + gutter,
+                        2,
+                        fg_seq,
+                        bg,
+                        &body,
+                    );
+                } else {
+                    cursor_at = None;
                 }
                 col = col.saturating_add(2);
                 i += 1;
@@ -751,14 +973,32 @@ fn render(
             _ => {
                 let n = utf8_len(b);
                 let end = (i + n).min(bytes.len());
-                let s = std::str::from_utf8(&bytes[i..end]).unwrap_or("?");
                 if col <= content_cols {
-                    screen.write_at(row, col + gutter, &styled(fg_seq, bg, s));
+                    let glyph = bytes.get(i..end).unwrap_or(b"?");
+                    emit_styled_cell(
+                        screen,
+                        &mut cursor_at,
+                        &mut style_fg,
+                        &mut style_bg,
+                        row,
+                        col + gutter,
+                        1,
+                        fg_seq,
+                        bg,
+                        glyph,
+                    );
+                } else {
+                    cursor_at = None;
                 }
                 col = col.saturating_add(1);
                 i = end;
             }
         }
+    }
+
+    // End of buffer rendering — reset SGR so the status bar starts clean.
+    if style_fg.is_some() || style_bg.is_some() {
+        screen.append_raw("\x1b[0m");
     }
 
     let primary_size = sel_max.saturating_sub(sel_min) + if bytes.is_empty() { 0 } else { 1 };
@@ -773,7 +1013,7 @@ fn render(
     } else {
         format_bytes(last_bytes)
     };
-    let abs_line = line_index(&bytes, head) + 1;
+    let abs_line = line_index_cached(line_starts, head) + 1;
     let mode_str = match mode {
         Mode::Normal => "N",
         Mode::Insert => "I",

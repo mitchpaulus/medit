@@ -40,6 +40,10 @@ pub struct Buffer {
     /// Consumed on commit. Multiple mutations between commit points collapse
     /// into one undo step (coarse-grained, Vim-like).
     pending_commit: Option<CursorSnapshot>,
+    /// Monotonically incremented on every successful mutation. Lets
+    /// downstream caches (notably the flat-bytes cache in the editor
+    /// front-end) invalidate without re-comparing piece tables.
+    version: u64,
 }
 
 impl Buffer {
@@ -51,6 +55,7 @@ impl Buffer {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             pending_commit: None,
+            version: 0,
         }
     }
 
@@ -71,6 +76,7 @@ impl Buffer {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             pending_commit: None,
+            version: 0,
         }
     }
 
@@ -174,6 +180,7 @@ impl Buffer {
             cursor: current_cursor,
         });
         self.pending_commit = None;
+        self.version = self.version.wrapping_add(1);
         Some(entry.cursor)
     }
 
@@ -186,13 +193,22 @@ impl Buffer {
             cursor: current_cursor,
         });
         self.pending_commit = None;
+        self.version = self.version.wrapping_add(1);
         Some(entry.cursor)
+    }
+
+    /// Monotonically incremented on every successful mutation. Cheap stable
+    /// key for downstream caches (e.g. flat-bytes vec) to detect when their
+    /// view of the buffer is stale.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     pub fn insert(&mut self, offset: usize, text: &[u8]) {
         if text.is_empty() {
             return;
         }
+        self.version = self.version.wrapping_add(1);
         self.maybe_commit();
         let total = self.len();
         let offset = offset.min(total);
@@ -242,6 +258,7 @@ impl Buffer {
         if offset >= end {
             return;
         }
+        self.version = self.version.wrapping_add(1);
         self.maybe_commit();
         let mut remaining = end - offset;
         let (mut pi, po) = self.locate(offset);
