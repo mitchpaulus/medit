@@ -517,20 +517,17 @@ pub fn handle_normal(
         }
         return false;
     }
-    // Ctrl+J / Ctrl+K: add the next / previous match as a new selection,
-    // making it primary. The existing selections stay; this is how you
-    // grow a multi-cursor edit one match at a time. Wraps at file edges.
-    // (Avoids Alt+n/Alt+p which terminals/WMs often bind to tab navigation.)
+    // Ctrl+J / Ctrl+K: add the next / previous occurrence of whatever's
+    // most natural to search for. If the primary selection is extended
+    // (anchor ≠ head), use its bytes as a literal pattern. Otherwise fall
+    // back to the last committed search regex. The derived pattern also
+    // becomes the new search pattern so n/N continue iterating it.
     if k.mods == Mods::CTRL && k.key == Key::Char('j') {
-        if let Some(re) = search.pattern.as_ref() {
-            add_next_match(sels, &bytes, re, true);
-        }
+        add_next_smart(sels, &bytes, search, true);
         return false;
     }
     if k.mods == Mods::CTRL && k.key == Key::Char('k') {
-        if let Some(re) = search.pattern.as_ref() {
-            add_next_match(sels, &bytes, re, false);
-        }
+        add_next_smart(sels, &bytes, search, false);
         return false;
     }
 
@@ -725,7 +722,15 @@ pub fn handle_insert(
             }
         }
         Key::Char(c) => {
-            if k.mods.contains(Mods::CTRL) || k.mods.contains(Mods::ALT) {
+            if k.mods.contains(Mods::ALT) {
+                return;
+            }
+            if k.mods.contains(Mods::CTRL) {
+                // Emacs-readline-style bindings in insert mode.
+                match c {
+                    'w' => delete_word_backward_multi(buffer, sels),
+                    _ => {}
+                }
                 return;
             }
             if c == 'j' && k.mods.is_empty() {
@@ -756,6 +761,35 @@ fn insert_text_multi(buffer: &mut Buffer, sels: &mut Selections, text: &[u8]) {
         buffer.insert(sel.head, text);
         sel.head += text.len();
         shift += n;
+    }
+}
+
+/// Delete from the previous word start to each selection's head. The
+/// "previous word start" follows the same rule as the `b` motion: skip any
+/// whitespace immediately before the head, then walk back through one
+/// run of word/non-word characters.
+fn delete_word_backward_multi(buffer: &mut Buffer, sels: &mut Selections) {
+    let indices = sels.indices_by_position();
+    let mut shift: i64 = 0;
+    for &idx in &indices {
+        let now = collect_bytes(buffer);
+        let sel = &mut sels.list[idx];
+        sel.anchor = (sel.anchor as i64 + shift).max(0) as usize;
+        sel.head = (sel.head as i64 + shift).max(0) as usize;
+        if sel.head == 0 {
+            continue;
+        }
+        let new_head = motion_word_backward(&now, sel.head);
+        if new_head >= sel.head {
+            continue;
+        }
+        let len = sel.head - new_head;
+        buffer.delete(new_head, len);
+        sel.head = new_head;
+        if sel.anchor > sel.head {
+            sel.anchor = sel.anchor.saturating_sub(len);
+        }
+        shift -= len as i64;
     }
 }
 
@@ -957,6 +991,38 @@ fn compile_search_regex(pat: &str) -> Result<regex::bytes::Regex, regex::Error> 
     regex::bytes::RegexBuilder::new(pat)
         .multi_line(true)
         .build()
+}
+
+/// `Ctrl+J`/`Ctrl+K` handler: figure out what to search for, then add the
+/// next match as a new selection. Prefers the primary's extended-selection
+/// content (as a literal pattern); falls back to the last committed search
+/// pattern. The chosen pattern is promoted to `search.pattern` so n/N
+/// continue with the same thing.
+fn add_next_smart(
+    sels: &mut Selections,
+    bytes: &[u8],
+    search: &mut SearchState,
+    forward: bool,
+) {
+    let primary = *sels.primary();
+    let extended = primary.anchor != primary.head;
+    if extended {
+        let min = primary.min();
+        let last = next_char_or_end(bytes, primary.max());
+        let sel_bytes = &bytes[min..last];
+        let pat_str = match std::str::from_utf8(sel_bytes) {
+            Ok(s) => regex::escape(s),
+            Err(_) => return,
+        };
+        let re = match compile_search_regex(&pat_str) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        add_next_match(sels, bytes, &re, forward);
+        search.pattern = Some(re);
+    } else if let Some(re) = search.pattern.as_ref() {
+        add_next_match(sels, bytes, re, forward);
+    }
 }
 
 /// Find the next match (in `forward` direction) relative to the primary

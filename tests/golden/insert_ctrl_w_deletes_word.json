@@ -1,0 +1,7 @@
+{
+  "name": "Ctrl+W in insert mode deletes the previous word",
+  "initial": "<a>bc",
+  "keys": "i foo bar\u001b[119;5u\u001b[27u",
+  "expected": "< foo >abc",
+  "expected_mode": "normal"
+}

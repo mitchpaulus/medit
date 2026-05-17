@@ -1,0 +1,6 @@
+{
+  "name": "Ctrl+J uses the current extended selection as the pattern (no prior search)",
+  "initial": "<f>oo bar foo baz",
+  "keys": "w\u001b[106;5u",
+  "expected": "foo bar <foo> baz"
+}
