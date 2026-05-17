@@ -1,0 +1,7 @@
+{
+  "name": "C-e in insert mode moves cursor past end of line content (lands on newline)",
+  "initial": "<a>bc\ndef",
+  "keys": "i\u001b[101;5u\u001b[27u",
+  "expected": "abc<\n>def",
+  "expected_mode": "normal"
+}

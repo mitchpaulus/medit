@@ -1,0 +1,7 @@
+{
+  "name": "M-b moves cursor to previous word in insert mode",
+  "initial": "foo bar <b>az",
+  "keys": "i\u001bb\u001b[27u",
+  "expected": "foo <b>ar baz",
+  "expected_mode": "normal"
+}

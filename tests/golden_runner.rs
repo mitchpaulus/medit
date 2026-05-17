@@ -94,7 +94,14 @@ fn run_test_file(path: &Path) -> Result<(), String> {
                 );
             }
             Mode::Insert => {
-                handle_insert(&mut buffer, &mut sels, &mut mode, &mut pending_j, k);
+                handle_insert(
+                    &mut buffer,
+                    &mut sels,
+                    &mut mode,
+                    &mut pending_j,
+                    &mut registers,
+                    k,
+                );
             }
             Mode::Ex => {
                 let _quit = handle_ex(

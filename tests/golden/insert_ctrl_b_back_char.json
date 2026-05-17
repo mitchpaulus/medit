@@ -1,0 +1,7 @@
+{
+  "name": "C-b moves cursor back one char in insert mode",
+  "initial": "abc<d>ef",
+  "keys": "i\u001b[98;5u\u001b[27u",
+  "expected": "ab<c>def",
+  "expected_mode": "normal"
+}

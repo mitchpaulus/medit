@@ -1,0 +1,7 @@
+{
+  "name": "C-f moves cursor forward one char in insert mode",
+  "initial": "<a>bcdef",
+  "keys": "i\u001b[102;5u\u001b[27u",
+  "expected": "a<b>cdef",
+  "expected_mode": "normal"
+}

@@ -681,6 +681,7 @@ pub fn handle_insert(
     sels: &mut Selections,
     mode: &mut Mode,
     pending_j: &mut bool,
+    registers: &mut Registers,
     k: KeyEvent,
 ) {
     if *pending_j {
@@ -723,12 +724,50 @@ pub fn handle_insert(
         }
         Key::Char(c) => {
             if k.mods.contains(Mods::ALT) {
+                // Emacs-readline meta bindings.
+                match c {
+                    'b' => {
+                        let bytes = collect_bytes(buffer);
+                        move_in_insert(&bytes, sels, |b, s| {
+                            s.head = motion_word_backward(b, s.head);
+                        });
+                    }
+                    'f' => {
+                        let bytes = collect_bytes(buffer);
+                        move_in_insert(&bytes, sels, |b, s| {
+                            // motion_word_forward lands on the last char of
+                            // the word (Kakoune semantics); emacs M-f lands
+                            // one past, so we bump by next_char_or_end.
+                            let end = motion_word_forward(b, s.head);
+                            s.head = next_char_or_end(b, end);
+                        });
+                    }
+                    _ => {}
+                }
                 return;
             }
             if k.mods.contains(Mods::CTRL) {
-                // Emacs-readline-style bindings in insert mode.
+                // Emacs-readline ctrl bindings.
                 match c {
+                    'a' => {
+                        let bytes = collect_bytes(buffer);
+                        move_in_insert(&bytes, sels, |b, s| s.head = line_start(b, s.head));
+                    }
+                    'e' => {
+                        let bytes = collect_bytes(buffer);
+                        move_in_insert(&bytes, sels, |b, s| s.head = line_end(b, s.head));
+                    }
+                    'b' => {
+                        let bytes = collect_bytes(buffer);
+                        move_in_insert(&bytes, sels, |b, s| s.head = prev_char(b, s.head));
+                    }
+                    'f' => {
+                        let bytes = collect_bytes(buffer);
+                        move_in_insert(&bytes, sels, |b, s| s.head = next_char_or_end(b, s.head));
+                    }
                     'w' => delete_word_backward_multi(buffer, sels),
+                    'k' => kill_to_line_end_multi(buffer, sels, registers),
+                    'u' => kill_to_line_start_multi(buffer, sels, registers),
                     _ => {}
                 }
                 return;
@@ -761,6 +800,89 @@ fn insert_text_multi(buffer: &mut Buffer, sels: &mut Selections, text: &[u8]) {
         buffer.insert(sel.head, text);
         sel.head += text.len();
         shift += n;
+    }
+}
+
+/// Cursor-moving helper for insert-mode keybindings. Computes the new head
+/// for each selection via `update`, then collapses the selection so the
+/// cursor sits at that position with anchor matching.
+fn move_in_insert<F>(bytes: &[u8], sels: &mut Selections, mut update: F)
+where
+    F: FnMut(&[u8], &mut Selection),
+{
+    for sel in sels.iter_mut() {
+        update(bytes, sel);
+        sel.anchor = sel.head;
+        sel.desired_col = display_col(bytes, line_start(bytes, sel.head), sel.head);
+    }
+}
+
+/// `C-k` in insert mode: kill from each head to that line's end. If the
+/// head is already at the line break, deletes the break itself (joining
+/// with the next line), matching emacs's kill-line behavior. The primary
+/// selection's killed content is stashed in the default register.
+fn kill_to_line_end_multi(buffer: &mut Buffer, sels: &mut Selections, registers: &mut Registers) {
+    let initial = collect_bytes(buffer);
+    let primary = *sels.primary();
+    let p_end = {
+        let le = line_end(&initial, primary.head);
+        if le == primary.head && primary.head < initial.len() && initial[primary.head] == b'\n' {
+            primary.head + 1
+        } else {
+            le
+        }
+    };
+    if p_end > primary.head {
+        registers.default = initial[primary.head..p_end].to_vec();
+    }
+
+    let indices = sels.indices_by_position();
+    let mut shift: i64 = 0;
+    for &idx in &indices {
+        let now = collect_bytes(buffer);
+        let sel = &mut sels.list[idx];
+        sel.anchor = (sel.anchor as i64 + shift).max(0) as usize;
+        sel.head = (sel.head as i64 + shift).max(0) as usize;
+        let le = line_end(&now, sel.head);
+        let target = if le == sel.head && sel.head < now.len() && now[sel.head] == b'\n' {
+            sel.head + 1
+        } else {
+            le
+        };
+        let len = target.saturating_sub(sel.head);
+        if len > 0 {
+            buffer.delete(sel.head, len);
+            shift -= len as i64;
+        }
+        sel.anchor = sel.head;
+    }
+}
+
+/// `C-u` in insert mode: kill from each line's start to the head. The
+/// primary selection's killed content is stashed in the default register.
+fn kill_to_line_start_multi(buffer: &mut Buffer, sels: &mut Selections, registers: &mut Registers) {
+    let initial = collect_bytes(buffer);
+    let primary = *sels.primary();
+    let p_ls = line_start(&initial, primary.head);
+    if primary.head > p_ls {
+        registers.default = initial[p_ls..primary.head].to_vec();
+    }
+
+    let indices = sels.indices_by_position();
+    let mut shift: i64 = 0;
+    for &idx in &indices {
+        let now = collect_bytes(buffer);
+        let sel = &mut sels.list[idx];
+        sel.anchor = (sel.anchor as i64 + shift).max(0) as usize;
+        sel.head = (sel.head as i64 + shift).max(0) as usize;
+        let ls = line_start(&now, sel.head);
+        let len = sel.head.saturating_sub(ls);
+        if len > 0 {
+            buffer.delete(ls, len);
+            sel.head = ls;
+            shift -= len as i64;
+        }
+        sel.anchor = sel.head;
     }
 }
 

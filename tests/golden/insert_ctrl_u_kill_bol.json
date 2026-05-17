@@ -1,0 +1,7 @@
+{
+  "name": "C-u kills from line start to cursor; cursor stays at new line start",
+  "initial": "abc<d>ef",
+  "keys": "i\u001b[117;5u\u001b[27u",
+  "expected": "<d>ef",
+  "expected_mode": "normal"
+}

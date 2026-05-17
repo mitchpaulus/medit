@@ -1,0 +1,7 @@
+{
+  "name": "C-k kills from cursor to end of line",
+  "initial": "<a>bc\ndef",
+  "keys": "i\u001b[107;5u\u001b[27u",
+  "expected": "<\n>def",
+  "expected_mode": "normal"
+}

@@ -136,7 +136,14 @@ fn main() -> io::Result<()> {
                     }
                 }
                 Mode::Insert => {
-                    handle_insert(&mut buffer, &mut sels, &mut mode, &mut pending_j, k);
+                    handle_insert(
+                        &mut buffer,
+                        &mut sels,
+                        &mut mode,
+                        &mut pending_j,
+                        &mut registers,
+                        k,
+                    );
                 }
                 Mode::Ex => {
                     if handle_ex(

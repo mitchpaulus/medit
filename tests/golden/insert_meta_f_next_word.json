@@ -1,0 +1,7 @@
+{
+  "name": "M-f moves cursor past end of next word in insert mode",
+  "initial": "<f>oo bar baz",
+  "keys": "i\u001bf\u001b[27u",
+  "expected": "foo< >bar baz",
+  "expected_mode": "normal"
+}

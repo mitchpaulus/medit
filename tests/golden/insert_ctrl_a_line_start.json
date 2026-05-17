@@ -1,0 +1,7 @@
+{
+  "name": "C-a in insert mode moves cursor to line start",
+  "initial": "abc<d>ef",
+  "keys": "i\u001b[97;5u\u001b[27u",
+  "expected": "<a>bcdef",
+  "expected_mode": "normal"
+}
