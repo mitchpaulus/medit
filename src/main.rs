@@ -15,6 +15,22 @@ use term::{RawMode, Screen};
 const SEL_BG: &str = "\x1b[48;5;24m";
 const MATCH_BG: &str = "\x1b[48;5;94m";
 const RESET_BG: &str = "\x1b[49m";
+const LINENO_FG: &str = "\x1b[38;5;240m";
+const RESET_FG: &str = "\x1b[39m";
+
+/// Draw a right-aligned line number in the left gutter at `row`. The gutter
+/// is `gutter` columns wide: digits plus one trailing space.
+fn draw_lineno(screen: &mut Screen, row: u16, lineno: usize, gutter: u16) {
+    let digits = gutter.saturating_sub(1) as usize;
+    let text = format!(
+        "{}{:>width$} {}",
+        LINENO_FG,
+        lineno,
+        RESET_FG,
+        width = digits
+    );
+    screen.write_at(row, 1, &text);
+}
 
 fn main() -> io::Result<()> {
     let path: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
@@ -236,6 +252,18 @@ fn render(
     let head = primary.head;
     let start_byte = byte_at_line(&bytes, top_line);
 
+    // Gutter sizing: enough digits for the largest line number in the file,
+    // plus one space of padding. Bail out (no gutter) if the terminal is too
+    // narrow to fit anything else.
+    let total_lines = line_index(&bytes, bytes.len()) + 1;
+    let line_digits = total_lines.to_string().len() as u16;
+    let gutter: u16 = if cols > line_digits + 2 {
+        line_digits + 1
+    } else {
+        0
+    };
+    let content_cols = cols.saturating_sub(gutter);
+
     // Selection ranges (all selections, primary first). Render highlights
     // every selection; the primary's head also receives the terminal cursor.
     let sel_ranges: Vec<(usize, usize)> = sels
@@ -261,15 +289,19 @@ fn render(
     };
 
     let mut row: u16 = 1;
-    let mut col: u16 = 1;
+    let mut col: u16 = 1; // 1-indexed within the content area (after gutter)
     let mut cur_row: u16 = 1;
-    let mut cur_col: u16 = 1;
+    let mut cur_col: u16 = 1; // also content-area-relative; gutter added at end_frame
     let mut i = start_byte;
+    let mut current_lineno = top_line + 1;
+    if gutter > 0 && row <= viewport_rows {
+        draw_lineno(screen, row, current_lineno, gutter);
+    }
 
     loop {
         if i == head && row <= viewport_rows {
             cur_row = row;
-            cur_col = col.max(1).min(cols.max(1));
+            cur_col = col.max(1).min(content_cols.max(1));
         }
         if i >= bytes.len() || row > viewport_rows {
             break;
@@ -298,6 +330,10 @@ fn render(
             b'\n' => {
                 row = row.saturating_add(1);
                 col = 1;
+                current_lineno += 1;
+                if gutter > 0 && row <= viewport_rows {
+                    draw_lineno(screen, row, current_lineno, gutter);
+                }
                 i += 1;
             }
             b'\r' => {
@@ -306,10 +342,10 @@ fn render(
             b'\t' => {
                 let advance = 4 - ((col as usize - 1) % 4);
                 if let Some(bgc) = bg {
-                    if col <= cols {
+                    if col <= content_cols {
                         let spaces = " ".repeat(advance);
                         let s = format!("{}{}{}", bgc, spaces, RESET_BG);
-                        screen.write_at(row, col, &s);
+                        screen.write_at(row, col + gutter, &s);
                     }
                 }
                 col = col.saturating_add(advance as u16);
@@ -318,11 +354,15 @@ fn render(
             c if c < 0x20 => {
                 let letter = (c + 0x40) as char;
                 let body = format!("^{}", letter);
-                if col <= cols {
+                if col <= content_cols {
                     if let Some(bgc) = bg {
-                        screen.write_at(row, col, &format!("{}{}{}", bgc, body, RESET_BG));
+                        screen.write_at(
+                            row,
+                            col + gutter,
+                            &format!("{}{}{}", bgc, body, RESET_BG),
+                        );
                     } else {
-                        screen.write_at(row, col, &body);
+                        screen.write_at(row, col + gutter, &body);
                     }
                 }
                 col = col.saturating_add(2);
@@ -332,11 +372,11 @@ fn render(
                 let n = utf8_len(b);
                 let end = (i + n).min(bytes.len());
                 let s = std::str::from_utf8(&bytes[i..end]).unwrap_or("?");
-                if col <= cols {
+                if col <= content_cols {
                     if let Some(bgc) = bg {
-                        screen.write_at(row, col, &format!("{}{}{}", bgc, s, RESET_BG));
+                        screen.write_at(row, col + gutter, &format!("{}{}{}", bgc, s, RESET_BG));
                     } else {
-                        screen.write_at(row, col, s);
+                        screen.write_at(row, col + gutter, s);
                     }
                 }
                 col = col.saturating_add(1);
@@ -368,6 +408,10 @@ fn render(
     let cols_usize = cols as usize;
     let is_prompt = matches!(mode, Mode::Ex | Mode::Search);
 
+    // `cur_col` above is content-area-relative; viewport cursors need the
+    // gutter offset to land in the right screen column. Prompts position
+    // the cursor on the status line and don't get the offset.
+    let viewport_cur_col = cur_col.saturating_add(gutter);
     let (status, final_cur_row, final_cur_col) = if is_prompt {
         let (prefix, input) = if mode == Mode::Ex {
             (":", ex_input)
@@ -378,13 +422,13 @@ fn render(
         let col_pos = (prompt.chars().count() as u16).saturating_add(1).max(1);
         (prompt, screen.rows, col_pos)
     } else if !ex_message.is_empty() {
-        (format!(" {} ", ex_message), cur_row, cur_col)
+        (format!(" {} ", ex_message), cur_row, viewport_cur_col)
     } else {
         let s = format!(
             " [{}] {} · ln {} col {} · {}sel {}b · last:{} raw:{} ",
             mode_str, path_str, abs_line, cur_col, multi_label, primary_size, key_str, bytes_str
         );
-        (s, cur_row, cur_col)
+        (s, cur_row, viewport_cur_col)
     };
 
     let mut padded: String = status.chars().take(cols_usize).collect();
