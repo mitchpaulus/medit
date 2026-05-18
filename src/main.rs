@@ -275,6 +275,7 @@ fn main() -> io::Result<()> {
     let mut pending_j = false;
     let mut pending_g = false;
     let mut pending_z = false;
+    let mut pending_find: Option<medit::core::FindOp> = None;
     let mut pending_object: Option<ObjectKind> = None;
     let mut pending_lsp_action: Option<LspAction> = None;
     let mut pending_ex_action: Option<ExAction> = None;
@@ -385,6 +386,7 @@ fn main() -> io::Result<()> {
                         &mut pending_g,
                         &mut pending_z,
                         &mut pending_object,
+                        &mut pending_find,
                         &mut search_state,
                         &mut pending_lsp_action,
                         top_line,

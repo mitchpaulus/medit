@@ -1,0 +1,6 @@
+{
+  "name": "f<char> does not cross newlines",
+  "initial": "<a>bc\nxyz",
+  "keys": "fz",
+  "expected": "<a>bc\nxyz"
+}

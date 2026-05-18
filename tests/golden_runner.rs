@@ -66,6 +66,7 @@ fn run_test_file(path: &Path) -> Result<(), String> {
     let mut pending_j = false;
     let mut pending_g = false;
     let mut pending_z = false;
+    let mut pending_find: Option<medit::core::FindOp> = None;
     let mut pending_object: Option<ObjectKind> = None;
     let mut pending_lsp_action: Option<LspAction> = None;
     let mut pending_ex_action: Option<ExAction> = None;
@@ -103,6 +104,7 @@ fn run_test_file(path: &Path) -> Result<(), String> {
                     &mut pending_g,
                     &mut pending_z,
                     &mut pending_object,
+                    &mut pending_find,
                     &mut search_state,
                     &mut pending_lsp_action,
                     &mut top_line,

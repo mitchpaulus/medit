@@ -1,0 +1,6 @@
+{
+  "name": "f<char> jumps head to next occurrence on current line",
+  "initial": "<h>ello world",
+  "keys": "fo",
+  "expected": "hell<o> world"
+}

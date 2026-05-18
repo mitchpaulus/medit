@@ -209,6 +209,17 @@ pub enum ObjectKind {
     Around,
 }
 
+/// `f` / `F` / `t` / `T` line-bounded char search variants.
+/// - `To` lands the head on the matched char (`f`, `F`).
+/// - `Till` lands one char shy of the match (`t`, `T`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindOp {
+    ForwardTo,
+    BackwardTo,
+    ForwardTill,
+    BackwardTill,
+}
+
 /// Out-of-band action requested by the modal layer that the main loop has
 /// to dispatch (because it needs resources the handler doesn't have, e.g.
 /// the LSP client). Cleared after handling.
@@ -449,6 +460,7 @@ pub fn handle_normal(
     pending_g: &mut bool,
     pending_z: &mut bool,
     pending_object: &mut Option<ObjectKind>,
+    pending_find: &mut Option<FindOp>,
     search: &mut SearchState,
     lsp_action: &mut Option<LspAction>,
     top_line: &mut usize,
@@ -464,6 +476,22 @@ pub fn handle_normal(
     if let Some(kind) = pending_object.take() {
         if k.mods.is_empty() {
             apply_object_for_all(sels, bytes, kind, k.key);
+        }
+        return false;
+    }
+
+    // Consume the char argument for a pending `f`/`F`/`t`/`T`. Search
+    // within the current line of each selection; selections whose line
+    // has no match are left in place. Collapses the selection (Vim-style
+    // move).
+    if let Some(op) = pending_find.take() {
+        if let Key::Char(c) = k.key {
+            for sel in sels.iter_mut() {
+                if let Some(off) = find_char_on_line(bytes, sel.head, c, op) {
+                    sel.head = off;
+                    sel.anchor = off;
+                }
+            }
         }
         return false;
     }
@@ -521,6 +549,24 @@ pub fn handle_normal(
     if k.mods.is_empty() && k.key == Key::Char('z') {
         *pending_z = true;
         return false;
+    }
+
+    // `f<c>` / `F<c>` / `t<c>` / `T<c>`: line-bounded char search.
+    // `f`/`F` land on the char; `t`/`T` land one position shy. Sets a
+    // pending-find flag that consumes the very next keystroke as the
+    // char argument.
+    if k.mods.is_empty() {
+        let op = match k.key {
+            Key::Char('f') => Some(FindOp::ForwardTo),
+            Key::Char('F') => Some(FindOp::BackwardTo),
+            Key::Char('t') => Some(FindOp::ForwardTill),
+            Key::Char('T') => Some(FindOp::BackwardTill),
+            _ => None,
+        };
+        if let Some(op) = op {
+            *pending_find = Some(op);
+            return false;
+        }
     }
 
     // Ctrl+D / Ctrl+U: move down/up 10 lines (per-cursor).
@@ -2015,6 +2061,52 @@ pub fn line_start(bytes: &[u8], offset: usize) -> usize {
         }
     }
     0
+}
+
+/// Search for `target` within the current line per `op`. The search
+/// excludes `from` itself so repeating advances. `Till` variants land
+/// the head one char away from the matched byte. Returns `None` if no
+/// match on the current line.
+pub fn find_char_on_line(
+    bytes: &[u8],
+    from: usize,
+    target: char,
+    op: FindOp,
+) -> Option<usize> {
+    if !target.is_ascii() {
+        // Restrict to ASCII for now — multi-byte char matching needs a
+        // proper codepoint walk; not worth it until someone asks.
+        return None;
+    }
+    let needle = target as u8;
+    let ls = line_start(bytes, from);
+    let le = line_end(bytes, from);
+    let (match_pos, till) = match op {
+        FindOp::ForwardTo | FindOp::ForwardTill => {
+            let start = from.saturating_add(1).min(le);
+            let pos = bytes
+                .get(start..le)
+                .and_then(|s| s.iter().position(|&b| b == needle))
+                .map(|p| start + p)?;
+            (pos, matches!(op, FindOp::ForwardTill))
+        }
+        FindOp::BackwardTo | FindOp::BackwardTill => {
+            let end = from.min(le);
+            let pos = bytes
+                .get(ls..end)
+                .and_then(|s| s.iter().rposition(|&b| b == needle))
+                .map(|p| ls + p)?;
+            (pos, matches!(op, FindOp::BackwardTill))
+        }
+    };
+    if !till {
+        return Some(match_pos);
+    }
+    match op {
+        FindOp::ForwardTill => Some(prev_char(bytes, match_pos)),
+        FindOp::BackwardTill => Some(next_char(bytes, match_pos)),
+        _ => unreachable!(),
+    }
 }
 
 pub fn line_end(bytes: &[u8], offset: usize) -> usize {

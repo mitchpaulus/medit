@@ -1,0 +1,6 @@
+{
+  "name": "T<char> jumps head to position just after previous occurrence",
+  "initial": "hello wor<l>d",
+  "keys": "Te",
+  "expected": "he<l>lo world"
+}
