@@ -226,6 +226,16 @@ pub enum FindOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LspAction {
     GotoDefinition,
+    NextDiagnostic,
+    PrevDiagnostic,
+}
+
+/// `]` and `[` prefixes for jump-list-style navigation. Consume a follow-up
+/// key (`d` for diagnostics, future: `e`/`q`/...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BracketDir {
+    Next,
+    Prev,
 }
 
 /// Actions requested from Ex mode that touch the buffer registry (which
@@ -461,6 +471,7 @@ pub fn handle_normal(
     pending_z: &mut bool,
     pending_object: &mut Option<ObjectKind>,
     pending_find: &mut Option<FindOp>,
+    pending_bracket: &mut Option<BracketDir>,
     search: &mut SearchState,
     lsp_action: &mut Option<LspAction>,
     top_line: &mut usize,
@@ -477,6 +488,28 @@ pub fn handle_normal(
         if k.mods.is_empty() {
             apply_object_for_all(sels, bytes, kind, k.key);
         }
+        return false;
+    }
+
+    // Consume the follow-up key for a pending `]` / `[` prefix.
+    if let Some(dir) = pending_bracket.take() {
+        if k.mods.is_empty() {
+            if let Key::Char('d') = k.key {
+                *lsp_action = Some(match dir {
+                    BracketDir::Next => LspAction::NextDiagnostic,
+                    BracketDir::Prev => LspAction::PrevDiagnostic,
+                });
+            }
+        }
+        return false;
+    }
+
+    if k.mods.is_empty() && k.key == Key::Char(']') {
+        *pending_bracket = Some(BracketDir::Next);
+        return false;
+    }
+    if k.mods.is_empty() && k.key == Key::Char('[') {
+        *pending_bracket = Some(BracketDir::Prev);
         return false;
     }
 

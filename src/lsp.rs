@@ -12,6 +12,7 @@
 //! - The main thread drains the channel synchronously when it needs a
 //!   response, discarding unrelated notifications in the meantime.
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -44,6 +45,29 @@ pub struct LspClient {
     stdin: ChildStdin,
     next_id: u64,
     rx: mpsc::Receiver<Message>,
+    /// Latest published diagnostics per document URI. Replaced wholesale
+    /// every time the server sends `textDocument/publishDiagnostics` for
+    /// that URI (LSP semantics: an empty array clears).
+    diagnostics: HashMap<String, Vec<Diagnostic>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    Information,
+    Hint,
+}
+
+#[derive(Debug, Clone)]
+pub struct Diagnostic {
+    pub start_line: u32,
+    pub start_character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    pub source: Option<String>,
 }
 
 /// Result of `textDocument/definition`. Always reduced to a single location
@@ -81,6 +105,7 @@ impl LspClient {
             stdin,
             next_id: 1,
             rx,
+            diagnostics: HashMap::new(),
         };
 
         let init_params = json!({
@@ -91,7 +116,8 @@ impl LspClient {
                 "general": { "positionEncodings": ["utf-8"] },
                 "textDocument": {
                     "definition": { "linkSupport": true },
-                    "synchronization": { "didSave": false }
+                    "synchronization": { "didSave": false },
+                    "publishDiagnostics": { "relatedInformation": false }
                 }
             },
             "clientInfo": { "name": "medit", "version": "0.1.0" }
@@ -126,10 +152,11 @@ impl LspClient {
         write_message(&mut self.stdin, &msg)
     }
 
-    /// Block until the response to `id` arrives, discarding any unrelated
-    /// notifications received along the way. Returns the inner result or an
-    /// IO error if the server times out or disconnects.
-    fn recv_response(&self, id: u64, timeout: Duration) -> io::Result<Value> {
+    /// Block until the response to `id` arrives, processing any unrelated
+    /// notifications received along the way (so diagnostics published
+    /// between requests aren't lost). Returns the inner result or an IO
+    /// error if the server times out or disconnects.
+    fn recv_response(&mut self, id: u64, timeout: Duration) -> io::Result<Value> {
         let deadline = Instant::now() + timeout;
         loop {
             let now = Instant::now();
@@ -143,7 +170,10 @@ impl LspClient {
                         io::Error::new(io::ErrorKind::Other, format!("LSP error: {}", e.message))
                     });
                 }
-                Ok(_) => continue,
+                Ok(Message::Notification { method, params }) => {
+                    self.handle_notification(&method, &params);
+                }
+                Ok(Message::Response { .. }) => continue,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "LSP timeout"));
                 }
@@ -152,6 +182,47 @@ impl LspClient {
                 }
             }
         }
+    }
+
+    /// Drain any pending notifications from the reader thread without
+    /// blocking. Updates the diagnostics cache as `publishDiagnostics`
+    /// notifications arrive. Stray responses (e.g. a stale definition
+    /// result) are dropped on the floor.
+    pub fn poll(&mut self) {
+        while let Ok(msg) = self.rx.try_recv() {
+            if let Message::Notification { method, params } = msg {
+                self.handle_notification(&method, &params);
+            }
+        }
+    }
+
+    fn handle_notification(&mut self, method: &str, params: &Value) {
+        if method == "textDocument/publishDiagnostics" {
+            if let Some((uri, diags)) = parse_publish_diagnostics(params) {
+                self.diagnostics.insert(uri, diags);
+            }
+        }
+    }
+
+    /// Latest diagnostics published for `uri`, sorted by start position.
+    pub fn diagnostics_for(&self, uri: &str) -> &[Diagnostic] {
+        self.diagnostics
+            .get(uri)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Send `textDocument/didChange` with full-text sync. Simple and
+    /// gopls-fast — re-runs the diagnostics pass against the new text.
+    /// `version` should monotonically increase per URI.
+    pub fn did_change(&mut self, uri: &str, version: u64, text: &str) -> io::Result<()> {
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [ { "text": text } ],
+            }),
+        )
     }
 
     pub fn did_open(&mut self, uri: &str, language_id: &str, text: &str) -> io::Result<()> {
@@ -201,6 +272,45 @@ impl Drop for LspClient {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+fn parse_publish_diagnostics(params: &Value) -> Option<(String, Vec<Diagnostic>)> {
+    let uri = params.get("uri")?.as_str()?.to_string();
+    let arr = params.get("diagnostics")?.as_array()?;
+    let mut out: Vec<Diagnostic> = arr.iter().filter_map(parse_diagnostic).collect();
+    out.sort_by_key(|d| (d.start_line, d.start_character));
+    Some((uri, out))
+}
+
+fn parse_diagnostic(v: &Value) -> Option<Diagnostic> {
+    let range = v.get("range")?;
+    let start = range.get("start")?;
+    let end = range.get("end")?;
+    let severity = match v.get("severity").and_then(|s| s.as_u64()) {
+        Some(1) => DiagnosticSeverity::Error,
+        Some(2) => DiagnosticSeverity::Warning,
+        Some(3) => DiagnosticSeverity::Information,
+        Some(4) => DiagnosticSeverity::Hint,
+        // LSP says missing severity is client-defined; gopls always sets
+        // it. Default to Error so anomalies stay visible.
+        _ => DiagnosticSeverity::Error,
+    };
+    Some(Diagnostic {
+        start_line: start.get("line")?.as_u64()? as u32,
+        start_character: start.get("character")?.as_u64()? as u32,
+        end_line: end.get("line")?.as_u64()? as u32,
+        end_character: end.get("character")?.as_u64()? as u32,
+        severity,
+        message: v
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string(),
+        source: v
+            .get("source")
+            .and_then(|s| s.as_str())
+            .map(String::from),
+    })
 }
 
 fn parse_definition_result(v: &Value) -> Option<DefinitionLocation> {

@@ -21,6 +21,24 @@ const SEL_BG: &str = "\x1b[48;5;24m";
 const MATCH_BG: &str = "\x1b[48;5;94m";
 const LINENO_FG: &str = "\x1b[38;5;240m";
 
+// Diagnostic underlines: curly underline (`4:3`) with severity-tinted
+// underline color (`58:5:N`). Terminals that don't support curly fall
+// back to a straight underline.
+const DIAG_UL_ERROR: &str = "\x1b[4:3;58:5:9m";
+const DIAG_UL_WARN: &str = "\x1b[4:3;58:5:11m";
+const DIAG_UL_INFO: &str = "\x1b[4:3;58:5:14m";
+const DIAG_UL_HINT: &str = "\x1b[4:3;58:5:8m";
+
+fn diag_ul_for(sev: medit::lsp::DiagnosticSeverity) -> &'static str {
+    use medit::lsp::DiagnosticSeverity::*;
+    match sev {
+        Error => DIAG_UL_ERROR,
+        Warning => DIAG_UL_WARN,
+        Information => DIAG_UL_INFO,
+        Hint => DIAG_UL_HINT,
+    }
+}
+
 /// Per-buffer editor state. The main loop holds a `Vec<EditorBuffer>` and a
 /// `current` index; switching buffers means moving the index.
 struct EditorBuffer {
@@ -45,6 +63,10 @@ struct EditorBuffer {
     /// `byte_at_line_cached` index in O(1).
     line_starts: Vec<usize>,
     cached_version: Option<u64>,
+    /// Last `buffer.version()` we sent to the LSP server (via didOpen or
+    /// didChange). When the buffer moves past this and we're not in
+    /// insert mode, fire a didChange to resync.
+    lsp_synced_version: Option<u64>,
 }
 
 impl EditorBuffer {
@@ -61,6 +83,7 @@ impl EditorBuffer {
             cached_bytes: Vec::new(),
             line_starts: vec![0],
             cached_version: None,
+            lsp_synced_version: None,
         }
     }
 
@@ -145,22 +168,28 @@ fn reparse_and_highlight(eb: &mut EditorBuffer, hl: &Highlighter) {
 /// to `(new_fg, new_bg)`. Returns an empty string if no change is needed.
 /// Emits only the channels that changed (and uses minimal-form resets for
 /// single-channel transitions to default).
-/// Write the minimal SGR transition from (cur_fg, cur_bg) to (new_fg, new_bg)
-/// directly into `out`. No-op when state matches. Hot path — must not
-/// allocate.
+/// Write the minimal SGR transition from (cur_*) to (new_*) directly
+/// into `out`. No-op when state matches. Hot path — must not allocate.
+///
+/// `ul` is a full SGR string like `"\x1b[4;58:5:9m"` (curly underline,
+/// red): it enables underline + sets underline color. The "off" form
+/// is `\x1b[24;59m`.
 fn append_style_transition(
     out: &mut Vec<u8>,
     cur_fg: Option<&str>,
     cur_bg: Option<&str>,
+    cur_ul: Option<&str>,
     new_fg: Option<&str>,
     new_bg: Option<&str>,
+    new_ul: Option<&str>,
 ) {
-    if cur_fg == new_fg && cur_bg == new_bg {
+    if cur_fg == new_fg && cur_bg == new_bg && cur_ul == new_ul {
         return;
     }
     let fg_to_default = cur_fg.is_some() && new_fg.is_none();
     let bg_to_default = cur_bg.is_some() && new_bg.is_none();
-    if fg_to_default && bg_to_default {
+    let ul_to_default = cur_ul.is_some() && new_ul.is_none();
+    if fg_to_default && bg_to_default && ul_to_default {
         out.extend_from_slice(b"\x1b[0m");
         return;
     }
@@ -170,6 +199,9 @@ fn append_style_transition(
     if bg_to_default {
         out.extend_from_slice(b"\x1b[49m");
     }
+    if ul_to_default {
+        out.extend_from_slice(b"\x1b[24;59m");
+    }
     if new_fg != cur_fg {
         if let Some(f) = new_fg {
             out.extend_from_slice(f.as_bytes());
@@ -178,6 +210,11 @@ fn append_style_transition(
     if new_bg != cur_bg {
         if let Some(b) = new_bg {
             out.extend_from_slice(b.as_bytes());
+        }
+    }
+    if new_ul != cur_ul {
+        if let Some(u) = new_ul {
+            out.extend_from_slice(u.as_bytes());
         }
     }
 }
@@ -222,22 +259,151 @@ fn emit_styled_cell(
     cursor_at: &mut Option<(u16, u16)>,
     style_fg: &mut Option<&'static str>,
     style_bg: &mut Option<&'static str>,
+    style_ul: &mut Option<&'static str>,
     row: u16,
     col: u16,
     width: u16,
     new_fg: Option<&'static str>,
     new_bg: Option<&'static str>,
+    new_ul: Option<&'static str>,
     body: &[u8],
 ) {
     let back = screen.back_mut();
     if *cursor_at != Some((row, col)) {
         append_cursor_pos(back, row, col);
     }
-    append_style_transition(back, *style_fg, *style_bg, new_fg, new_bg);
+    append_style_transition(
+        back, *style_fg, *style_bg, *style_ul, new_fg, new_bg, new_ul,
+    );
     back.extend_from_slice(body);
     *cursor_at = Some((row, col + width));
     *style_fg = new_fg;
     *style_bg = new_bg;
+    *style_ul = new_ul;
+}
+
+/// Render a bordered popup containing `d.message` at a position adjacent
+/// to the cursor. Box-drawing chars are emitted as UTF-8 directly. The
+/// popup overlays buffer cells — it's drawn after the main pass, so it
+/// "wins" any conflicting cell. Severity tints the border.
+fn draw_diag_popup(
+    screen: &mut Screen,
+    d: &medit::lsp::Diagnostic,
+    cur_row: u16,
+    cur_col: u16,
+    gutter: u16,
+    cols: u16,
+    viewport_rows: u16,
+) {
+    // Wrap the message into lines of at most `max_text` chars. Word-wrap
+    // on spaces when possible, hard-break otherwise.
+    let max_text: usize = (cols as usize).saturating_sub(6).max(20).min(60);
+    let mut lines: Vec<String> = Vec::new();
+    for raw_line in d.message.lines() {
+        let mut remaining = raw_line.trim_end();
+        if remaining.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        while remaining.chars().count() > max_text {
+            let take = remaining
+                .char_indices()
+                .take(max_text)
+                .last()
+                .map(|(idx, ch)| idx + ch.len_utf8())
+                .unwrap_or(remaining.len());
+            // Try to break at a space within the window.
+            let head_slice = &remaining[..take];
+            let split = head_slice.rfind(' ').map(|p| p + 1).unwrap_or(take);
+            lines.push(remaining[..split].trim_end().to_string());
+            remaining = remaining[split..].trim_start();
+            if remaining.is_empty() {
+                break;
+            }
+        }
+        if !remaining.is_empty() {
+            lines.push(remaining.to_string());
+        }
+    }
+    if lines.is_empty() {
+        return;
+    }
+    // Cap to ~6 lines so the popup can't dominate the viewport.
+    let max_rows: usize = 6;
+    if lines.len() > max_rows {
+        lines.truncate(max_rows);
+        if let Some(last) = lines.last_mut() {
+            if last.chars().count() > max_text.saturating_sub(1) {
+                last.truncate(last.char_indices().nth(max_text.saturating_sub(1)).map(|(i,_)| i).unwrap_or(last.len()));
+            }
+            last.push('…');
+        }
+    }
+    let width_text = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let inner_w = width_text + 2; // 1-char padding either side
+    let box_w = inner_w as u16 + 2; // +2 for vertical borders
+    let box_h = lines.len() as u16 + 2; // +2 for horizontal borders
+
+    // Anchor: prefer one row below the cursor; flip above if no room.
+    // Horizontally: align to the cursor's column, but clamp inside the
+    // viewport.
+    let mut top: u16 = cur_row.saturating_add(1);
+    if top + box_h - 1 > viewport_rows {
+        top = cur_row.saturating_sub(box_h);
+        if top == 0 {
+            // Cursor near top with no room above; force it below and let
+            // it clip into the status row rather than disappear.
+            top = 1;
+        }
+    }
+    let anchor_col = cur_col.saturating_add(gutter);
+    let mut left: u16 = anchor_col.saturating_sub(1).max(1);
+    if left + box_w - 1 > cols {
+        left = cols.saturating_sub(box_w - 1).max(1);
+    }
+
+    let border = diag_border_fg_for(d.severity);
+    // Top border.
+    let mut top_line = String::with_capacity(box_w as usize * 3);
+    top_line.push_str(border);
+    top_line.push('┌');
+    for _ in 0..inner_w { top_line.push('─'); }
+    top_line.push('┐');
+    top_line.push_str("\x1b[0m");
+    screen.write_at(top, left, &top_line);
+
+    for (i, line) in lines.iter().enumerate() {
+        let pad = inner_w - 1 - line.chars().count();
+        let mut row_str = String::with_capacity(box_w as usize * 3);
+        row_str.push_str(border);
+        row_str.push('│');
+        row_str.push_str("\x1b[0m");
+        row_str.push(' ');
+        row_str.push_str(line);
+        for _ in 0..pad { row_str.push(' '); }
+        row_str.push_str(border);
+        row_str.push('│');
+        row_str.push_str("\x1b[0m");
+        screen.write_at(top + 1 + i as u16, left, &row_str);
+    }
+
+    let mut bot_line = String::with_capacity(box_w as usize * 3);
+    bot_line.push_str(border);
+    bot_line.push('└');
+    for _ in 0..inner_w { bot_line.push('─'); }
+    bot_line.push('┘');
+    bot_line.push_str("\x1b[0m");
+    screen.write_at(top + box_h - 1, left, &bot_line);
+}
+
+fn diag_border_fg_for(sev: medit::lsp::DiagnosticSeverity) -> &'static str {
+    use medit::lsp::DiagnosticSeverity::*;
+    match sev {
+        Error => "\x1b[38;5;9m",
+        Warning => "\x1b[38;5;11m",
+        Information => "\x1b[38;5;14m",
+        Hint => "\x1b[38;5;8m",
+    }
 }
 
 fn draw_lineno(screen: &mut Screen, row: u16, lineno: usize, gutter: u16) {
@@ -276,6 +442,7 @@ fn main() -> io::Result<()> {
     let mut pending_g = false;
     let mut pending_z = false;
     let mut pending_find: Option<medit::core::FindOp> = None;
+    let mut pending_bracket: Option<medit::core::BracketDir> = None;
     let mut pending_object: Option<ObjectKind> = None;
     let mut pending_lsp_action: Option<LspAction> = None;
     let mut pending_ex_action: Option<ExAction> = None;
@@ -288,7 +455,7 @@ fn main() -> io::Result<()> {
     // (initial buffer or via `:e`). One client serves all buffers.
     let mut lsp_client: Option<LspClient> = None;
     if let Some(p) = buffers[0].path.clone() {
-        maybe_start_lsp_and_open(&mut lsp_client, &p, &buffers[0].buffer);
+        maybe_start_lsp_and_open(&mut lsp_client, &p, &mut buffers[0]);
     }
 
     let _raw = RawMode::enable()?;
@@ -309,6 +476,7 @@ fn main() -> io::Result<()> {
         &ex_message,
         last_key.as_ref(),
         &last_bytes,
+        lsp_client.as_ref(),
     )?;
 
     let stdin = io::stdin();
@@ -337,6 +505,7 @@ fn main() -> io::Result<()> {
                 &ex_message,
                 last_key.as_ref(),
                 &last_bytes,
+                lsp_client.as_ref(),
             )?;
         }
         let n = match handle.read(&mut io_buf) {
@@ -387,6 +556,7 @@ fn main() -> io::Result<()> {
                         &mut pending_z,
                         &mut pending_object,
                         &mut pending_find,
+                        &mut pending_bracket,
                         &mut search_state,
                         &mut pending_lsp_action,
                         top_line,
@@ -453,7 +623,7 @@ fn main() -> io::Result<()> {
                                 maybe_start_lsp_and_open(
                                     &mut lsp_client,
                                     &p,
-                                    &buffers[current].buffer,
+                                    &mut buffers[current],
                                 );
                             }
                         }
@@ -477,6 +647,18 @@ fn main() -> io::Result<()> {
             }
         }
         let handle_ns = trace::toc(handle_start);
+        // After the input burst settles, if we're not actively typing in
+        // insert mode and the buffer has moved past what the LSP server
+        // last saw, push a didChange. Fires on Esc/`jf` out of insert
+        // mode and after any normal-mode mutation.
+        if mode != Mode::Insert {
+            sync_lsp_if_dirty(&mut buffers[current], lsp_client.as_mut());
+        }
+        // Drain anything the LSP reader thread has parked since the last
+        // wake (diagnostics, etc.) so they're visible in this frame.
+        if let Some(client) = lsp_client.as_mut() {
+            client.poll();
+        }
         let render_start = trace::tic();
         {
             let viewport_rows = screen.rows.saturating_sub(1) as usize;
@@ -496,6 +678,7 @@ fn main() -> io::Result<()> {
             &ex_message,
             last_key.as_ref(),
             &last_bytes,
+            lsp_client.as_ref(),
         )?;
         let render_ns = trace::toc(render_start);
         let total_ns = trace::toc(frame_start);
@@ -509,6 +692,39 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+/// If the current buffer has been mutated since the last LSP sync,
+/// send a full-text `didChange`. Called from the main loop on every
+/// transition out of insert mode (and after every normal-mode op),
+/// keyed off `buffer.version()`.
+fn sync_lsp_if_dirty(eb: &mut EditorBuffer, client: Option<&mut LspClient>) {
+    let client = match client {
+        Some(c) => c,
+        None => return,
+    };
+    let path = match eb.path.as_ref() {
+        Some(p) => p,
+        None => return,
+    };
+    let cur_ver = eb.buffer.version();
+    if eb.lsp_synced_version == Some(cur_ver) {
+        return;
+    }
+    if eb.lsp_synced_version.is_none() {
+        // We never sent didOpen for this buffer (no recognized language
+        // or LSP wasn't running yet). Don't fire didChange in that case
+        // — gopls would reject an unknown URI.
+        return;
+    }
+    let uri = match lsp::path_to_uri(path) {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+    let text = String::from_utf8_lossy(&collect_bytes(&eb.buffer)).into_owned();
+    if client.did_change(&uri, cur_ver, &text).is_ok() {
+        eb.lsp_synced_version = Some(cur_ver);
+    }
+}
+
 /// Spawn an LSP server for `path` (if it's a recognized language) and send
 /// didOpen for its current buffer content. No-op if a server is already
 /// running, or if the language isn't recognized, or if spawn fails. Adds
@@ -516,7 +732,7 @@ fn main() -> io::Result<()> {
 fn maybe_start_lsp_and_open(
     lsp_client: &mut Option<LspClient>,
     path: &Path,
-    buffer: &Buffer,
+    eb: &mut EditorBuffer,
 ) {
     let lang_id = match path.extension().and_then(|e| e.to_str()) {
         Some("go") => "go",
@@ -534,8 +750,10 @@ fn maybe_start_lsp_and_open(
         }
     }
     if let (Some(client), Ok(uri)) = (lsp_client.as_mut(), lsp::path_to_uri(path)) {
-        let text = String::from_utf8_lossy(&collect_bytes(buffer)).into_owned();
-        let _ = client.did_open(&uri, lang_id, &text);
+        let text = String::from_utf8_lossy(&collect_bytes(&eb.buffer)).into_owned();
+        if client.did_open(&uri, lang_id, &text).is_ok() {
+            eb.lsp_synced_version = Some(eb.buffer.version());
+        }
     }
 }
 
@@ -625,6 +843,49 @@ fn dispatch_lsp(
             p.head = new_head;
             p.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
         }
+        LspAction::NextDiagnostic | LspAction::PrevDiagnostic => {
+            let next = matches!(action, LspAction::NextDiagnostic);
+            let diags = client.diagnostics_for(&cur_uri);
+            if diags.is_empty() {
+                *ex_message = "no diagnostics".to_string();
+                return;
+            }
+            let cur = &mut buffers[*current];
+            let bytes = collect_bytes(&cur.buffer);
+            let head = cur.sels.primary().head;
+            let cur_line = line_index(&bytes, head) as u32;
+            let line_start_byte = byte_at_line(&bytes, cur_line as usize);
+            let cur_char = head.saturating_sub(line_start_byte) as u32;
+            let target = if next {
+                diags
+                    .iter()
+                    .find(|d| {
+                        (d.start_line, d.start_character) > (cur_line, cur_char)
+                    })
+                    .or_else(|| diags.first())
+            } else {
+                diags
+                    .iter()
+                    .rev()
+                    .find(|d| {
+                        (d.start_line, d.start_character) < (cur_line, cur_char)
+                    })
+                    .or_else(|| diags.last())
+            };
+            let d = match target {
+                Some(d) => d,
+                None => return,
+            };
+            let target_line_start = byte_at_line(&bytes, d.start_line as usize);
+            let target_byte =
+                target_line_start.saturating_add(d.start_character as usize);
+            let new_head = snap_to_char_or_last(&bytes, target_byte);
+            cur.sels.reduce_to_primary();
+            let p = cur.sels.primary_mut();
+            p.anchor = new_head;
+            p.head = new_head;
+            p.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+        }
     }
 }
 
@@ -671,7 +932,10 @@ fn open_or_switch_to(
             if let Ok(uri) = lsp::path_to_uri(path) {
                 let text =
                     String::from_utf8_lossy(&collect_bytes(&buffers[*current].buffer)).into_owned();
-                let _ = client.did_open(&uri, lang_id, &text);
+                if client.did_open(&uri, lang_id, &text).is_ok() {
+                    buffers[*current].lsp_synced_version =
+                        Some(buffers[*current].buffer.version());
+                }
             }
         }
     }
@@ -773,6 +1037,7 @@ fn render_all(
     ex_message: &str,
     last_key: Option<&KeyEvent>,
     last_bytes: &[u8],
+    lsp_client: Option<&LspClient>,
 ) -> io::Result<()> {
     let cur = &buffers[current];
     let buffer_count = buffers.len();
@@ -780,6 +1045,13 @@ fn render_all(
         format!("[{}/{}] {}", current + 1, buffer_count, cur.display_name())
     } else {
         cur.display_name()
+    };
+    let diagnostics: &[medit::lsp::Diagnostic] = match (lsp_client, cur.path.as_ref()) {
+        (Some(c), Some(p)) => match lsp::path_to_uri(p) {
+            Ok(uri) => c.diagnostics_for(&uri),
+            Err(_) => &[],
+        },
+        _ => &[],
     };
     render(
         screen,
@@ -796,6 +1068,7 @@ fn render_all(
         ex_message,
         last_key,
         last_bytes,
+        diagnostics,
     )
 }
 
@@ -815,6 +1088,7 @@ fn render(
     ex_message: &str,
     last_key: Option<&KeyEvent>,
     last_bytes: &[u8],
+    diagnostics: &[medit::lsp::Diagnostic],
 ) -> io::Result<()> {
     screen.begin_frame();
     let cols = screen.cols;
@@ -855,6 +1129,33 @@ fn render(
     let in_preview =
         |i: usize| -> bool { preview_matches.iter().any(|&(s, e)| i >= s && i < e) };
 
+    // Pre-resolve diagnostic line/character → byte ranges using the
+    // line-starts cache. LSP empty-range diagnostics (start == end) get
+    // widened to one byte so they're still visible.
+    let diag_ranges: Vec<(usize, usize, medit::lsp::DiagnosticSeverity, usize)> = diagnostics
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, d)| {
+            let sl = *line_starts.get(d.start_line as usize)?;
+            let el = line_starts
+                .get(d.end_line as usize)
+                .copied()
+                .unwrap_or(bytes.len());
+            let start = (sl + d.start_character as usize).min(bytes.len());
+            let mut end = (el + d.end_character as usize).min(bytes.len());
+            if end <= start {
+                end = (start + 1).min(bytes.len());
+            }
+            Some((start, end, d.severity, idx))
+        })
+        .collect();
+    let diag_ul = |i: usize| -> Option<&'static str> {
+        diag_ranges
+            .iter()
+            .find(|&&(s, e, _, _)| i >= s && i < e)
+            .map(|&(_, _, sev, _)| diag_ul_for(sev))
+    };
+
     let mut row: u16 = 1;
     let mut col: u16 = 1;
     let mut cur_row: u16 = 1;
@@ -871,6 +1172,7 @@ fn render(
     //   cell, row change without a line-number, etc.).
     let mut style_fg: Option<&'static str> = None;
     let mut style_bg: Option<&'static str> = None;
+    let mut style_ul: Option<&'static str> = None;
     let mut cursor_at: Option<(u16, u16)> = None;
     if gutter > 0 && row <= viewport_rows {
         draw_lineno(screen, row, current_lineno, gutter);
@@ -907,6 +1209,7 @@ fn render(
         } else {
             Some(theme::fg_for_scope(scope))
         };
+        let ul_seq: Option<&'static str> = diag_ul(i);
         match b {
             b'\n' => {
                 row = row.saturating_add(1);
@@ -917,6 +1220,7 @@ fn render(
                     cursor_at = Some((row, gutter + 1));
                     style_fg = None;
                     style_bg = None;
+                    style_ul = None;
                 } else {
                     cursor_at = None;
                 }
@@ -927,21 +1231,23 @@ fn render(
             }
             b'\t' => {
                 let advance = 4 - ((col as usize - 1) % 4);
-                if bg.is_some() && col <= content_cols {
-                    // Tabs only need a visible body when there's a bg to
-                    // paint; otherwise we just advance the column counter
-                    // and let the next emit position past the gap.
+                if (bg.is_some() || ul_seq.is_some()) && col <= content_cols {
+                    // Tabs only need a visible body when there's something
+                    // to paint (selection bg, search highlight, or a
+                    // diagnostic underline); otherwise we just advance.
                     const SPACES: &[u8; 4] = b"    ";
                     emit_styled_cell(
                         screen,
                         &mut cursor_at,
                         &mut style_fg,
                         &mut style_bg,
+                        &mut style_ul,
                         row,
                         col + gutter,
                         advance as u16,
                         fg_seq,
                         bg,
+                        ul_seq,
                         &SPACES[..advance],
                     );
                 } else {
@@ -959,11 +1265,13 @@ fn render(
                         &mut cursor_at,
                         &mut style_fg,
                         &mut style_bg,
+                        &mut style_ul,
                         row,
                         col + gutter,
                         2,
                         fg_seq,
                         bg,
+                        ul_seq,
                         &body,
                     );
                 } else {
@@ -982,11 +1290,13 @@ fn render(
                         &mut cursor_at,
                         &mut style_fg,
                         &mut style_bg,
+                        &mut style_ul,
                         row,
                         col + gutter,
                         1,
                         fg_seq,
                         bg,
+                        ul_seq,
                         glyph,
                     );
                 } else {
@@ -999,8 +1309,19 @@ fn render(
     }
 
     // End of buffer rendering — reset SGR so the status bar starts clean.
-    if style_fg.is_some() || style_bg.is_some() {
+    if style_fg.is_some() || style_bg.is_some() || style_ul.is_some() {
         screen.append_raw("\x1b[0m");
+    }
+
+    // Diagnostic popup: if the cursor sits inside a diagnostic range,
+    // render a bordered box anchored just below (or above) the cursor's
+    // line with the diagnostic's message.
+    let hovered_diag = diag_ranges
+        .iter()
+        .find(|&&(s, e, _, _)| head >= s && head < e)
+        .map(|&(_, _, _, idx)| &diagnostics[idx]);
+    if let Some(d) = hovered_diag {
+        draw_diag_popup(screen, d, cur_row, cur_col, gutter, cols, viewport_rows);
     }
 
     let primary_size = sel_max.saturating_sub(sel_min) + if bytes.is_empty() { 0 } else { 1 };
