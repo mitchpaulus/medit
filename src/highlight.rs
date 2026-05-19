@@ -59,6 +59,7 @@ impl Highlighter {
             langs: HashMap::new(),
         };
         h.register("go", unsafe { tree_sitter_go() }, include_str!("../grammars/go/queries/highlights.scm"));
+        h.register("mshell", unsafe { tree_sitter_mshell() }, include_str!("../grammars/mshell/queries/highlights.scm"));
         h
     }
 
@@ -90,6 +91,7 @@ impl Highlighter {
         let ext = path.extension()?.to_str()?;
         Some(match ext {
             "go" => "go",
+            "msh" | "mshell" => "mshell",
             _ => return None,
         })
     }
@@ -149,6 +151,7 @@ impl Default for Highlighter {
 // Language. We declare them here.
 unsafe extern "C" {
     fn tree_sitter_go() -> Language;
+    fn tree_sitter_mshell() -> Language;
 }
 
 #[cfg(test)]
@@ -170,5 +173,15 @@ mod tests {
             .find(|s| s.start == func_pos && s.end == func_pos + 4)
             .expect("highlight span for `func` not found");
         assert_eq!(span.scope, ScopeId::Keyword);
+    }
+
+    #[test]
+    fn mshell_parses_and_highlights_a_comment() {
+        let h = Highlighter::new();
+        let mut parser = h.parser_for("mshell").expect("mshell parser");
+        let src = b"# a comment\n";
+        let tree = parser.parse(src.as_slice(), None).expect("parse");
+        let spans = h.highlight("mshell", &tree, src);
+        assert!(spans.iter().any(|s| s.scope == ScopeId::Comment));
     }
 }

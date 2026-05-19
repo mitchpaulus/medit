@@ -21,6 +21,8 @@ pub enum ScopeId {
     Operator,
     Punctuation,
     Variable,
+    VariableStore,
+    VariableRetrieve,
     Attribute,
     Tag,
 }
@@ -53,6 +55,8 @@ fn exact_scope(name: &str) -> Option<ScopeId> {
         "comment" => ScopeId::Comment,
         "operator" => ScopeId::Operator,
         "punctuation" => ScopeId::Punctuation,
+        "variable.store" => ScopeId::VariableStore,
+        "variable.retrieve" => ScopeId::VariableRetrieve,
         "variable" | "parameter" => ScopeId::Variable,
         "attribute" | "label" => ScopeId::Attribute,
         "tag" => ScopeId::Tag,
@@ -76,6 +80,8 @@ pub fn fg_for_scope(scope: ScopeId) -> &'static str {
         ScopeId::Operator => "\x1b[38;5;188m",    // light gray
         ScopeId::Punctuation => "\x1b[38;5;188m",
         ScopeId::Variable => "\x1b[39m",
+        ScopeId::VariableStore => "\x1b[38;5;174m",    // dusty rose — writes
+        ScopeId::VariableRetrieve => "\x1b[38;5;152m", // pale aqua — reads
         ScopeId::Attribute => "\x1b[38;5;179m",   // olive
         ScopeId::Tag => "\x1b[38;5;75m",          // soft blue
     }

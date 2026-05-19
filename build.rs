@@ -12,7 +12,7 @@ use std::path::Path;
 /// (directory name under grammars/, c-symbol name).
 /// The c-symbol is the language function name exported by parser.c —
 /// usually matches the dir, with `-` translated to `_`.
-const LANGUAGES: &[(&str, &str)] = &[("go", "go")];
+const LANGUAGES: &[(&str, &str)] = &[("go", "go"), ("mshell", "mshell")];
 
 fn main() {
     println!("cargo:rerun-if-changed=grammars");
