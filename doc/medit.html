@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>medit &mdash; keybindings</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 780px; margin: 2em auto; padding: 0 1em; color: #222; line-height: 1.4; }
+  h1 { border-bottom: 1px solid #ccc; padding-bottom: 0.2em; }
+  h2 { margin-top: 1.8em; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 1em; }
+  th, td { text-align: left; padding: 4px 10px; border-bottom: 1px solid #eee; vertical-align: top; }
+  th { background: #f5f5f5; }
+  kbd { font-family: ui-monospace, Consolas, monospace; background: #f0f0f0; border: 1px solid #ccc; border-radius: 3px; padding: 0 4px; font-size: 0.9em; }
+  td:first-child { white-space: nowrap; }
+  .note { color: #666; font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>medit</h1>
+<p>A small modal text editor. Vim-like motions, Kakoune-like selection-first
+editing, multi-cursor.</p>
+
+<h2>Modes</h2>
+<table>
+<tr><th>Mode</th><th>Enter from Normal</th><th>Exit</th></tr>
+<tr><td>Normal</td><td>(default)</td><td>&mdash;</td></tr>
+<tr><td>Insert</td><td><kbd>i</kbd> <kbd>a</kbd> <kbd>I</kbd> <kbd>A</kbd> <kbd>o</kbd> <kbd>O</kbd> <kbd>c</kbd></td><td><kbd>Esc</kbd> or <kbd>jf</kbd></td></tr>
+<tr><td>Ex</td><td><kbd>:</kbd></td><td><kbd>Enter</kbd> / <kbd>Esc</kbd></td></tr>
+<tr><td>Search</td><td><kbd>/</kbd> or <kbd>s</kbd></td><td><kbd>Enter</kbd> / <kbd>Esc</kbd></td></tr>
+</table>
+
+<h2>Normal mode &mdash; motion</h2>
+<table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><kbd>h</kbd> <kbd>j</kbd> <kbd>k</kbd> <kbd>l</kbd></td><td>Left / down / up / right</td></tr>
+<tr><td><kbd>H</kbd> <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd></td><td>Same, extending the selection</td></tr>
+<tr><td>Arrows, <kbd>Home</kbd>, <kbd>End</kbd></td><td>Move; with <kbd>Shift</kbd> extends</td></tr>
+<tr><td><kbd>w</kbd> / <kbd>b</kbd> / <kbd>e</kbd></td><td>Next word start / prev word start / word end</td></tr>
+<tr><td><kbd>W</kbd> / <kbd>B</kbd> / <kbd>E</kbd></td><td>Same, extending</td></tr>
+<tr><td><kbd>{</kbd> / <kbd>}</kbd></td><td>Previous / next paragraph</td></tr>
+<tr><td><kbd>gg</kbd></td><td>Top of file</td></tr>
+<tr><td><kbd>G</kbd></td><td>Last non-empty line</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>d</kbd> / <kbd>Ctrl</kbd>+<kbd>u</kbd></td><td>Down / up 10 lines</td></tr>
+<tr><td><kbd>f</kbd><i>x</i> / <kbd>F</kbd><i>x</i></td><td>Jump forward / backward to char <i>x</i> on this line</td></tr>
+<tr><td><kbd>t</kbd><i>x</i> / <kbd>T</kbd><i>x</i></td><td>Same, but stop one short of <i>x</i></td></tr>
+<tr><td><kbd>zz</kbd></td><td>Center current line in viewport</td></tr>
+</table>
+
+<h2>Normal mode &mdash; edit</h2>
+<table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><kbd>i</kbd> / <kbd>a</kbd></td><td>Insert before / after selection</td></tr>
+<tr><td><kbd>I</kbd> / <kbd>A</kbd></td><td>Insert at line start / line end</td></tr>
+<tr><td><kbd>o</kbd> / <kbd>O</kbd></td><td>Open line below / above</td></tr>
+<tr><td><kbd>d</kbd></td><td>Delete selection (into register)</td></tr>
+<tr><td><kbd>c</kbd></td><td>Change selection (delete + enter Insert)</td></tr>
+<tr><td><kbd>y</kbd></td><td>Yank primary selection</td></tr>
+<tr><td><kbd>p</kbd> / <kbd>P</kbd></td><td>Paste after / before</td></tr>
+<tr><td><kbd>u</kbd> / <kbd>U</kbd></td><td>Undo / redo</td></tr>
+<tr><td><kbd>q</kbd></td><td>Quit</td></tr>
+</table>
+
+<h2>Normal mode &mdash; selections &amp; multi-cursor</h2>
+<table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><kbd>;</kbd></td><td>Collapse selection (anchor = head)</td></tr>
+<tr><td><kbd>,</kbd></td><td>Reduce to primary selection</td></tr>
+<tr><td><kbd>&lt;</kbd> / <kbd>&gt;</kbd></td><td>Rotate primary backward / forward</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>j</kbd> / <kbd>Ctrl</kbd>+<kbd>k</kbd></td><td>Add next / previous occurrence as a new cursor</td></tr>
+<tr><td><kbd>Alt</kbd>+<kbd>i</kbd> <i>obj</i></td><td>Select inner text object (see below)</td></tr>
+<tr><td><kbd>Alt</kbd>+<kbd>a</kbd> <i>obj</i></td><td>Select around text object</td></tr>
+</table>
+
+<h3>Text objects (after <kbd>Alt</kbd>+<kbd>i</kbd> / <kbd>Alt</kbd>+<kbd>a</kbd>)</h3>
+<table>
+<tr><th>Key</th><th>Object</th></tr>
+<tr><td><kbd>w</kbd></td><td>Word</td></tr>
+<tr><td><kbd>p</kbd></td><td>Paragraph</td></tr>
+<tr><td><kbd>"</kbd> <kbd>'</kbd> <kbd>`</kbd></td><td>Quoted string</td></tr>
+<tr><td><kbd>(</kbd> <kbd>)</kbd></td><td>Parentheses</td></tr>
+<tr><td><kbd>{</kbd> <kbd>}</kbd></td><td>Braces</td></tr>
+<tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>Brackets</td></tr>
+</table>
+
+<h2>Search</h2>
+<table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><kbd>/</kbd></td><td>Search forward (regex); <kbd>Enter</kbd> jumps to first match</td></tr>
+<tr><td><kbd>s</kbd></td><td>Select-within: turn matches inside selection into separate cursors</td></tr>
+<tr><td><kbd>n</kbd> / <kbd>N</kbd></td><td>Next / previous match of last search</td></tr>
+</table>
+
+<h2>LSP</h2>
+<table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><kbd>gd</kbd></td><td>Go to definition</td></tr>
+<tr><td><kbd>]d</kbd> / <kbd>[d</kbd></td><td>Next / previous diagnostic</td></tr>
+</table>
+<p class="note">LSP starts on demand the first time you open a Go file.</p>
+
+<h2>Insert mode</h2>
+<table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><kbd>Esc</kbd> or <kbd>jf</kbd></td><td>Return to Normal mode</td></tr>
+<tr><td>Arrows, <kbd>Home</kbd>, <kbd>End</kbd></td><td>Move cursor</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>a</kbd> / <kbd>Ctrl</kbd>+<kbd>e</kbd></td><td>Line start / line end (emacs-style)</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>b</kbd> / <kbd>Ctrl</kbd>+<kbd>f</kbd></td><td>Char back / forward</td></tr>
+<tr><td><kbd>Alt</kbd>+<kbd>b</kbd> / <kbd>Alt</kbd>+<kbd>f</kbd></td><td>Word back / forward</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>w</kbd></td><td>Delete word backward</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>k</kbd></td><td>Kill to line end</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>u</kbd></td><td>Kill to line start</td></tr>
+</table>
+
+<h2>Ex commands (<kbd>:</kbd>)</h2>
+<table>
+<tr><th>Command</th><th>Action</th></tr>
+<tr><td><code>:w</code></td><td>Write current buffer</td></tr>
+<tr><td><code>:q</code></td><td>Quit</td></tr>
+<tr><td><code>:wq</code></td><td>Write and quit</td></tr>
+<tr><td><code>:e &lt;path&gt;</code></td><td>Open file (switches to it if already open)</td></tr>
+<tr><td><code>:bn</code> / <code>:bnext</code></td><td>Next buffer</td></tr>
+<tr><td><code>:bp</code> / <code>:bprev</code> / <code>:bprevious</code></td><td>Previous buffer</td></tr>
+<tr><td><code>:ls</code> / <code>:buffers</code></td><td>List open buffers</td></tr>
+</table>
+
+<h2>Global</h2>
+<table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>c</kbd></td><td>Quit</td></tr>
+</table>
+
+</body>
+</html>
