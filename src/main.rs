@@ -419,9 +419,32 @@ fn draw_lineno(screen: &mut Screen, row: u16, lineno: usize, gutter: u16) {
     screen.write_at(row, 1, &text);
 }
 
+fn print_help() {
+    println!(
+        "medit \u{2014} a small modal text editor
+
+USAGE:
+    medit [FILE]
+    medit -h | --help
+
+ARGS:
+    FILE    Optional path to open. If the file doesn't exist, starts with an
+            empty buffer; `:w` will create it on save.
+
+Keybindings and Ex commands are documented in doc/medit.html."
+    );
+}
+
 fn main() -> io::Result<()> {
     trace::init_from_env();
-    let initial_path: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
+    let arg1 = std::env::args().nth(1);
+    if let Some(a) = arg1.as_deref()
+        && (a == "-h" || a == "--help")
+    {
+        print_help();
+        return Ok(());
+    }
+    let initial_path: Option<PathBuf> = arg1.map(PathBuf::from);
     let initial_buffer = match initial_path.as_ref() {
         Some(p) if p.exists() => Buffer::open(p)?,
         _ => Buffer::empty(),
