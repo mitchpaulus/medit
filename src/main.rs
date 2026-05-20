@@ -808,15 +808,6 @@ fn sync_lsp_if_dirty(eb: &mut EditorBuffer, clients: &mut HashMap<&'static str, 
     }
 }
 
-/// Server command for a given LSP language id: `(program, args)`.
-fn lsp_command_for_lang(lang: &str) -> Option<(&'static str, &'static [&'static str])> {
-    match lang {
-        "go" => Some(("gopls", &[])),
-        "mshell" => Some(("msh", &["lsp"])),
-        _ => None,
-    }
-}
-
 /// Spawn an LSP server for `path` (if it's a recognized language) and send
 /// didOpen for its current buffer content. No-op if the language isn't
 /// recognized or if spawn fails. A separate server is spawned per language
@@ -831,7 +822,7 @@ fn maybe_start_lsp_and_open(
         None => return,
     };
     if !lsp_clients.contains_key(lang_id) {
-        let (program, args) = match lsp_command_for_lang(lang_id) {
+        let (program, args) = match Highlighter::lsp_command_for_lang(lang_id) {
             Some(c) => c,
             None => return,
         };

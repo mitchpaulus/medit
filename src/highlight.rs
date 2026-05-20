@@ -3,6 +3,12 @@
 //! a `highlights.scm` query that maps tree nodes to capture names, and
 //! a mapping from those capture names to ANSI fg colors via `theme.rs`.
 //!
+//! Adding a language: drop one entry in the `LANGS` table at the bottom
+//! of this file — name, extern fn, query strings, and the aliases users
+//! might write (extensions, shebangs, fence names) plus an optional LSP
+//! command. All resolution functions (`language_for_path`, shebang,
+//! injection, LSP) walk this same table.
+//!
 //! Public surface:
 //! - `Highlighter`: holds all known languages' Parser + Query.
 //! - `HighlightSpan`: a (byte range, scope) the renderer can consume.
@@ -14,6 +20,29 @@ use std::collections::HashMap;
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
 use crate::theme::{self, ScopeId};
+
+/// Static declaration for one supported language. Single source of truth
+/// for every "is this language?" lookup the editor performs.
+pub struct LangSpec {
+    /// Canonical id used everywhere internally (lookup key, file-type tag,
+    /// LSP key). Always lowercase.
+    pub name: &'static str,
+    /// `tree_sitter_<lang>()` entry point compiled in via `build.rs`.
+    pub language: unsafe extern "C" fn() -> Language,
+    /// Highlight query (S-expression tree-sitter query).
+    pub highlights: &'static str,
+    /// Optional language-injections query. Currently only djot ships one.
+    pub injections: Option<&'static str>,
+    /// File extensions (no leading `.`) that resolve to this language.
+    pub extensions: &'static [&'static str],
+    /// Shebang interpreter basenames (e.g. `"msh"`, `"python3"`).
+    pub shebangs: &'static [&'static str],
+    /// Fenced-code-block info strings that route a code block to this
+    /// language (e.g. `"go"`, `"rs"`/`"rust"`). Matched case-insensitively.
+    pub fence_names: &'static [&'static str],
+    /// LSP server command + args, when one exists.
+    pub lsp: Option<(&'static str, &'static [&'static str])>,
+}
 
 /// A highlighted byte range. Spans are produced by the query engine,
 /// sorted by `start`, and may overlap; `flatten_to_byte_scopes` resolves
@@ -64,41 +93,18 @@ impl Highlighter {
         let mut h = Self {
             langs: HashMap::new(),
         };
-        h.register(
-            "go",
-            unsafe { tree_sitter_go() },
-            include_str!("../grammars/go/queries/highlights.scm"),
-            None,
-        );
-        h.register(
-            "mshell",
-            unsafe { tree_sitter_mshell() },
-            include_str!("../grammars/mshell/queries/highlights.scm"),
-            None,
-        );
-        // Djot doubles as the markdown grammar for now — close enough that
-        // reading other-people's markdown stays useful. Split if it starts
-        // mis-parsing common constructs.
-        h.register(
-            "djot",
-            unsafe { tree_sitter_djot() },
-            include_str!("../grammars/djot/queries/highlights.scm"),
-            Some(include_str!("../grammars/djot/queries/injections.scm")),
-        );
+        for spec in LANGS {
+            h.register(spec);
+        }
         h
     }
 
-    fn register(
-        &mut self,
-        name: &'static str,
-        language: Language,
-        highlights: &str,
-        injections: Option<&str>,
-    ) {
-        let query = match Query::new(&language, highlights) {
+    fn register(&mut self, spec: &LangSpec) {
+        let language = unsafe { (spec.language)() };
+        let query = match Query::new(&language, spec.highlights) {
             Ok(q) => q,
             Err(e) => {
-                eprintln!("highlight: failed to compile {} query: {}", name, e);
+                eprintln!("highlight: failed to compile {} query: {}", spec.name, e);
                 return;
             }
         };
@@ -108,7 +114,7 @@ impl Highlighter {
             .map(|n| theme::scope_for_capture(n))
             .collect();
         let (injections_query, injections_lang_idx, injections_content_idx) =
-            if let Some(src) = injections {
+            if let Some(src) = spec.injections {
                 match Query::new(&language, src) {
                     Ok(q) => {
                         let lang_idx = q.capture_index_for_name("injection.language");
@@ -116,7 +122,10 @@ impl Highlighter {
                         (Some(q), lang_idx, content_idx)
                     }
                     Err(e) => {
-                        eprintln!("highlight: failed to compile {} injections: {}", name, e);
+                        eprintln!(
+                            "highlight: failed to compile {} injections: {}",
+                            spec.name, e
+                        );
                         (None, None, None)
                     }
                 }
@@ -124,7 +133,7 @@ impl Highlighter {
                 (None, None, None)
             };
         self.langs.insert(
-            name,
+            spec.name,
             LangSupport {
                 language,
                 query,
@@ -142,23 +151,19 @@ impl Highlighter {
     /// block falls back to the parent grammar's default rendering.
     fn lang_id_for_injection(&self, name: &str) -> Option<&'static str> {
         let n = name.trim().to_ascii_lowercase();
-        Some(match n.as_str() {
-            "go" => "go",
-            "msh" | "mshell" => "mshell",
-            "djot" | "markdown" | "md" => "djot",
-            _ => return None,
-        })
+        LANGS
+            .iter()
+            .find(|s| s.fence_names.iter().any(|f| f.eq_ignore_ascii_case(&n)))
+            .map(|s| s.name)
     }
 
     /// Map a file extension to a registered language id.
     pub fn language_for_path(path: &std::path::Path) -> Option<&'static str> {
         let ext = path.extension()?.to_str()?;
-        Some(match ext {
-            "go" => "go",
-            "msh" | "mshell" => "mshell",
-            "dj" | "djot" | "md" | "markdown" => "djot",
-            _ => return None,
-        })
+        LANGS
+            .iter()
+            .find(|s| s.extensions.iter().any(|e| *e == ext))
+            .map(|s| s.name)
     }
 
     /// Map a file's shebang line to a registered language id.
@@ -176,10 +181,18 @@ impl Highlighter {
         } else {
             basename
         };
-        Some(match interp {
-            "msh" | "mshell" => "mshell",
-            _ => return None,
-        })
+        LANGS
+            .iter()
+            .find(|s| s.shebangs.iter().any(|sb| *sb == interp))
+            .map(|s| s.name)
+    }
+
+    /// LSP server command (program + args) for a language id, if one is
+    /// registered. Walks the `LANGS` table.
+    pub fn lsp_command_for_lang(
+        lang: &str,
+    ) -> Option<(&'static str, &'static [&'static str])> {
+        LANGS.iter().find(|s| s.name == lang).and_then(|s| s.lsp)
     }
 
     /// Build a parser configured for `lang_id`. Returns `None` if the
@@ -322,12 +335,52 @@ impl Default for Highlighter {
 // === Vendored language entry points ===
 //
 // Each parser.c exports a `tree_sitter_<lang>()` function returning a
-// Language. We declare them here.
+// Language. Declared here, referenced from the `LANGS` table below.
 unsafe extern "C" {
     fn tree_sitter_go() -> Language;
     fn tree_sitter_mshell() -> Language;
     fn tree_sitter_djot() -> Language;
 }
+
+/// Single source of truth for every language the editor knows. To add a
+/// new language: vendor its grammar under `grammars/<name>/`, add an
+/// entry to `build.rs::LANGUAGES`, declare its `tree_sitter_<name>` fn
+/// above, and append one `LangSpec` block here. No other edits required.
+static LANGS: &[LangSpec] = &[
+    LangSpec {
+        name: "go",
+        language: tree_sitter_go,
+        highlights: include_str!("../grammars/go/queries/highlights.scm"),
+        injections: None,
+        extensions: &["go"],
+        shebangs: &[],
+        fence_names: &["go"],
+        lsp: Some(("gopls", &[])),
+    },
+    LangSpec {
+        name: "mshell",
+        language: tree_sitter_mshell,
+        highlights: include_str!("../grammars/mshell/queries/highlights.scm"),
+        injections: None,
+        extensions: &["msh", "mshell"],
+        shebangs: &["msh", "mshell"],
+        fence_names: &["msh", "mshell"],
+        lsp: Some(("msh", &["lsp"])),
+    },
+    // Djot doubles as the markdown grammar — close enough that reading
+    // other-people's markdown stays useful. Split if it starts mis-parsing
+    // common constructs.
+    LangSpec {
+        name: "djot",
+        language: tree_sitter_djot,
+        highlights: include_str!("../grammars/djot/queries/highlights.scm"),
+        injections: Some(include_str!("../grammars/djot/queries/injections.scm")),
+        extensions: &["dj", "djot", "md", "markdown"],
+        shebangs: &[],
+        fence_names: &["djot", "markdown", "md"],
+        lsp: None,
+    },
+];
 
 #[cfg(test)]
 mod tests {
