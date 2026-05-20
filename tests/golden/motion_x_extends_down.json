@@ -1,0 +1,7 @@
+{
+  "name": "second x extends the line selection one line down",
+  "initial": "abc\nd<e>f\nghi\njkl\n",
+  "keys": "xx",
+  "expected": "abc\n<def\nghi\n>jkl\n",
+  "expected_mode": "normal"
+}

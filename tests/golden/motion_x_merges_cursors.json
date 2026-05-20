@@ -1,0 +1,7 @@
+{
+  "name": "x merges multi-cursors that expand to the same line",
+  "initial": "<f>oo foo\nbar\n",
+  "keys": "w\u001b[106;5ux",
+  "expected": "<foo foo\n>bar\n",
+  "expected_mode": "normal"
+}

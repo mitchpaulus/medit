@@ -1,0 +1,7 @@
+{
+  "name": "x expands a multi-line selection to cover full lines at both ends",
+  "initial": "abc\nd<ef\ngh>i\njkl\n",
+  "keys": "x",
+  "expected": "abc\n<def\nghi\n>jkl\n",
+  "expected_mode": "normal"
+}

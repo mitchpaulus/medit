@@ -1,0 +1,7 @@
+{
+  "name": "x selects the full current line including its trailing newline",
+  "initial": "abc\nd<e>f\nghi\n",
+  "keys": "x",
+  "expected": "abc\n<def\n>ghi\n",
+  "expected_mode": "normal"
+}

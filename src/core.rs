@@ -639,6 +639,18 @@ pub fn handle_normal(
         return false;
     }
 
+    // `x`: Kakoune-style line selection. Each selection expands to cover the
+    // full lines it touches (anchor at start of first line, head on the
+    // terminating newline of the last). Repeated `x` extends one line down.
+    // Cursors that end up overlapping after expansion are merged.
+    if k.mods.is_empty() && k.key == Key::Char('x') {
+        for sel in sels.iter_mut() {
+            extend_to_line(bytes, sel);
+        }
+        merge_overlapping_selections(sels, bytes);
+        return false;
+    }
+
     if k.mods.is_empty() && k.key == Key::Char('q') {
         return true;
     }
@@ -1822,6 +1834,94 @@ fn line_is_blank(bytes: &[u8], line: usize) -> bool {
 
 /// Move a selection up or down by `delta` lines, preserving `desired_col`.
 /// Positive delta moves down, negative moves up. Clamps at buffer edges.
+/// Byte position that marks "the end" of `line` for selection purposes:
+/// the trailing '\n' if there is one, otherwise the start of the last
+/// character in the buffer. Returns 0 for an empty buffer.
+fn line_end_position(bytes: &[u8], line: usize) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let ls = byte_at_line(bytes, line);
+    let le = line_end(bytes, ls);
+    if le < bytes.len() {
+        le
+    } else {
+        snap_to_char_or_last(bytes, bytes.len())
+    }
+}
+
+/// Expand a selection to cover every line it currently touches, in
+/// Kakoune-`x` style: anchor at the start of the first line, head on the
+/// terminating newline of the last (or the last char if the line has no
+/// trailing newline). If the selection is already a tight cover of those
+/// lines, extend one more line downward.
+fn extend_to_line(bytes: &[u8], sel: &mut Selection) {
+    if bytes.is_empty() {
+        return;
+    }
+    let start_line = line_index(bytes, sel.min());
+    let mut end_line = line_index(bytes, sel.max());
+
+    let new_anchor = byte_at_line(bytes, start_line);
+    let cur_end = line_end_position(bytes, end_line);
+
+    if sel.anchor == new_anchor && sel.head == cur_end {
+        let next_ls = byte_at_line(bytes, end_line + 1);
+        if next_ls < bytes.len() {
+            end_line += 1;
+        }
+    }
+
+    let new_head = line_end_position(bytes, end_line);
+    sel.anchor = new_anchor;
+    sel.head = new_head;
+    sel.desired_col = display_col(bytes, line_start(bytes, new_head), new_head);
+}
+
+/// Merge selections whose byte ranges overlap, preserving forward
+/// orientation. The merged selection inherits "primary" status if any of
+/// its constituents were primary.
+fn merge_overlapping_selections(sels: &mut Selections, bytes: &[u8]) {
+    let n = sels.len();
+    if n <= 1 {
+        return;
+    }
+    let snapshot: Vec<Selection> = sels.iter().copied().collect();
+    let primary_idx = sels.primary_index();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| snapshot[i].min());
+
+    let mut new_list: Vec<Selection> = Vec::new();
+    let mut new_primary: usize = 0;
+
+    for &i in &order {
+        let cur = snapshot[i];
+        let merged = match new_list.last_mut() {
+            Some(prev) if cur.min() <= prev.max() => {
+                let new_min = prev.min().min(cur.min());
+                let new_max = prev.max().max(cur.max());
+                prev.anchor = new_min;
+                prev.head = new_max;
+                prev.desired_col =
+                    display_col(bytes, line_start(bytes, new_max), new_max);
+                if i == primary_idx {
+                    new_primary = new_list.len() - 1;
+                }
+                true
+            }
+            _ => false,
+        };
+        if !merged {
+            if i == primary_idx {
+                new_primary = new_list.len();
+            }
+            new_list.push(cur);
+        }
+    }
+
+    sels.replace(new_list, new_primary);
+}
+
 pub fn move_line_relative(bytes: &[u8], sel: &mut Selection, delta: i64) {
     if bytes.is_empty() {
         return;
