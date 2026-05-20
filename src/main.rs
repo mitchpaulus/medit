@@ -550,7 +550,11 @@ fn main() -> io::Result<()> {
         let handle_start = trace::tic();
         last_bytes = io_buf[..n].to_vec();
         parser.feed(&io_buf[..n]);
-        while let Some(event) = parser.next_event() {
+        // After consuming all complete events from this read burst, fall back
+        // to `flush()` so a lone trailing ESC byte (Esc key in non-kitty
+        // terminals) resolves to `Key::Esc` instead of waiting indefinitely
+        // for a follow-up byte that never arrives.
+        while let Some(event) = parser.next_event().or_else(|| parser.flush()) {
             let Event::Key(k) = event;
             last_key = Some(k);
             if k.mods.contains(Mods::CTRL) && k.key == Key::Char('c') {
