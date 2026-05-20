@@ -47,6 +47,12 @@ struct LangSupport {
     query: Query,
     /// Capture index → scope. Index into `query.capture_names()`.
     capture_scopes: Vec<ScopeId>,
+    /// Optional injections query. Captures `@injection.content` and
+    /// `@injection.language` on subranges that should be highlighted with
+    /// another grammar (e.g. fenced code blocks in djot/markdown).
+    injections_query: Option<Query>,
+    injections_lang_idx: Option<u32>,
+    injections_content_idx: Option<u32>,
 }
 
 pub struct Highlighter {
@@ -58,16 +64,37 @@ impl Highlighter {
         let mut h = Self {
             langs: HashMap::new(),
         };
-        h.register("go", unsafe { tree_sitter_go() }, include_str!("../grammars/go/queries/highlights.scm"));
-        h.register("mshell", unsafe { tree_sitter_mshell() }, include_str!("../grammars/mshell/queries/highlights.scm"));
+        h.register(
+            "go",
+            unsafe { tree_sitter_go() },
+            include_str!("../grammars/go/queries/highlights.scm"),
+            None,
+        );
+        h.register(
+            "mshell",
+            unsafe { tree_sitter_mshell() },
+            include_str!("../grammars/mshell/queries/highlights.scm"),
+            None,
+        );
         // Djot doubles as the markdown grammar for now — close enough that
         // reading other-people's markdown stays useful. Split if it starts
         // mis-parsing common constructs.
-        h.register("djot", unsafe { tree_sitter_djot() }, include_str!("../grammars/djot/queries/highlights.scm"));
+        h.register(
+            "djot",
+            unsafe { tree_sitter_djot() },
+            include_str!("../grammars/djot/queries/highlights.scm"),
+            Some(include_str!("../grammars/djot/queries/injections.scm")),
+        );
         h
     }
 
-    fn register(&mut self, name: &'static str, language: Language, highlights: &str) {
+    fn register(
+        &mut self,
+        name: &'static str,
+        language: Language,
+        highlights: &str,
+        injections: Option<&str>,
+    ) {
         let query = match Query::new(&language, highlights) {
             Ok(q) => q,
             Err(e) => {
@@ -80,14 +107,47 @@ impl Highlighter {
             .iter()
             .map(|n| theme::scope_for_capture(n))
             .collect();
+        let (injections_query, injections_lang_idx, injections_content_idx) =
+            if let Some(src) = injections {
+                match Query::new(&language, src) {
+                    Ok(q) => {
+                        let lang_idx = q.capture_index_for_name("injection.language");
+                        let content_idx = q.capture_index_for_name("injection.content");
+                        (Some(q), lang_idx, content_idx)
+                    }
+                    Err(e) => {
+                        eprintln!("highlight: failed to compile {} injections: {}", name, e);
+                        (None, None, None)
+                    }
+                }
+            } else {
+                (None, None, None)
+            };
         self.langs.insert(
             name,
             LangSupport {
                 language,
                 query,
                 capture_scopes,
+                injections_query,
+                injections_lang_idx,
+                injections_content_idx,
             },
         );
+    }
+
+    /// Map an injection-language string (the text in a fenced code block's
+    /// info line, like `go` / `msh` / `markdown`) to a registered grammar.
+    /// Case-insensitive; returns `None` for unsupported languages so the
+    /// block falls back to the parent grammar's default rendering.
+    fn lang_id_for_injection(&self, name: &str) -> Option<&'static str> {
+        let n = name.trim().to_ascii_lowercase();
+        Some(match n.as_str() {
+            "go" => "go",
+            "msh" | "mshell" => "mshell",
+            "djot" | "markdown" | "md" => "djot",
+            _ => return None,
+        })
     }
 
     /// Map a file extension to a registered language id.
@@ -135,13 +195,33 @@ impl Highlighter {
 
     /// Run the highlight query against `tree` over `bytes`, producing a
     /// sorted span list. Captures are resolved to scopes via the theme.
+    /// If `lang_id`'s grammar ships an injections query (e.g. djot for
+    /// fenced code blocks), each injection content range is parsed with
+    /// the embedded language and its spans are merged in.
     pub fn highlight(&self, lang_id: &str, tree: &Tree, bytes: &[u8]) -> Vec<HighlightSpan> {
+        let mut spans: Vec<HighlightSpan> = Vec::new();
+        self.collect_spans(lang_id, tree, bytes, 0, &mut spans);
+        spans.sort_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
+        spans
+    }
+
+    /// Append highlight spans for `bytes` parsed by `lang_id`, offsetting
+    /// each span by `byte_offset` so they're expressed in the parent
+    /// buffer's coordinates. Recurses into language injections.
+    fn collect_spans(
+        &self,
+        lang_id: &str,
+        tree: &Tree,
+        bytes: &[u8],
+        byte_offset: usize,
+        out: &mut Vec<HighlightSpan>,
+    ) {
         let support = match self.langs.get(lang_id) {
             Some(s) => s,
-            None => return Vec::new(),
+            None => return,
         };
+
         let mut cursor = QueryCursor::new();
-        let mut spans: Vec<HighlightSpan> = Vec::new();
         let mut matches = cursor.matches(&support.query, tree.root_node(), bytes);
         while let Some(m) = matches.next() {
             for cap in m.captures {
@@ -159,16 +239,77 @@ impl Highlighter {
                 }
                 let range = cap.node.byte_range();
                 if range.start < range.end {
-                    spans.push(HighlightSpan {
-                        start: range.start,
-                        end: range.end,
+                    out.push(HighlightSpan {
+                        start: range.start + byte_offset,
+                        end: range.end + byte_offset,
                         scope,
                     });
                 }
             }
         }
-        spans.sort_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
-        spans
+
+        // Language injections: for each `@injection.language` + `@injection.content`
+        // pair, recursively highlight the content with the embedded grammar.
+        let inj_query = match support.injections_query.as_ref() {
+            Some(q) => q,
+            None => return,
+        };
+        let (lang_idx, content_idx) =
+            match (support.injections_lang_idx, support.injections_content_idx) {
+                (Some(l), Some(c)) => (l, c),
+                _ => return,
+            };
+        let mut inj_cursor = QueryCursor::new();
+        let mut inj_matches = inj_cursor.matches(inj_query, tree.root_node(), bytes);
+        while let Some(m) = inj_matches.next() {
+            let mut inj_lang: Option<&'static str> = None;
+            let mut content_range: Option<(usize, usize)> = None;
+            for cap in m.captures {
+                if cap.index == lang_idx {
+                    let r = cap.node.byte_range();
+                    if let Ok(name) = std::str::from_utf8(&bytes[r.start..r.end]) {
+                        inj_lang = self.lang_id_for_injection(name);
+                    }
+                } else if cap.index == content_idx {
+                    let r = cap.node.byte_range();
+                    content_range = Some((r.start, r.end));
+                }
+            }
+            if let (Some(inj_lang), Some((cs, ce))) = (inj_lang, content_range) {
+                if ce <= cs {
+                    continue;
+                }
+                // Skip the trivial recursive case: a djot block embedded in
+                // a djot file. We'd re-highlight the same content with the
+                // same scopes; the parent pass already covers it.
+                if inj_lang == lang_id {
+                    continue;
+                }
+                let inj_support = match self.langs.get(inj_lang) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let mut parser = Parser::new();
+                if parser.set_language(&inj_support.language).is_err() {
+                    continue;
+                }
+                let slice = &bytes[cs..ce];
+                let inj_tree = match parser.parse(slice, None) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                // Punch a Default-scope hole over the injection content so
+                // the parent's broad `markup.raw.block` (green) doesn't
+                // bleed through bytes the injected grammar didn't paint.
+                // Specific injection spans get layered on top below.
+                out.push(HighlightSpan {
+                    start: byte_offset + cs,
+                    end: byte_offset + ce,
+                    scope: ScopeId::Default,
+                });
+                self.collect_spans(inj_lang, &inj_tree, slice, byte_offset + cs, out);
+            }
+        }
     }
 }
 
@@ -278,6 +419,95 @@ mod tests {
             fresh.root_node().to_sexp(),
             "incremental and fresh parses diverged"
         );
+    }
+
+    #[test]
+    fn djot_injects_go_into_fenced_code_block() {
+        let h = Highlighter::new();
+        let mut parser = h.parser_for("djot").expect("djot parser");
+        let src = b"# Title\n\n```go\nfunc f() {}\n```\n";
+        let tree = parser.parse(src.as_slice(), None).expect("parse");
+        let spans = h.highlight("djot", &tree, src);
+        // The `func` keyword inside the fenced block should be highlighted
+        // by the go grammar — that means a Keyword span must land on the
+        // `func` byte range inside the code block.
+        let func_pos = src
+            .windows(4)
+            .position(|w| w == b"func")
+            .expect("find func");
+        let hit = spans
+            .iter()
+            .find(|s| s.start == func_pos && s.end == func_pos + 4 && s.scope == ScopeId::Keyword);
+        assert!(
+            hit.is_some(),
+            "expected an injected Keyword span for `func` at byte {}; got {:?}",
+            func_pos,
+            spans
+                .iter()
+                .filter(|s| s.start >= func_pos && s.end <= func_pos + 4)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn known_language_fence_does_not_paint_unknown_tokens_green() {
+        // In a ```go``` fence, bytes the go grammar doesn't capture (e.g.
+        // the whitespace between `var` and `x`) should land on Default —
+        // not the djot parent's `markup.raw.block` (String/green).
+        let h = Highlighter::new();
+        let mut parser = h.parser_for("djot").expect("djot parser");
+        let src = b"```go\nvar x int\n```\n";
+        let tree = parser.parse(src.as_slice(), None).expect("parse");
+        let spans = h.highlight("djot", &tree, src);
+        let scopes = flatten_to_byte_scopes(&spans, src.len());
+        // The space byte right after `var` is captured by neither grammar.
+        let var_pos = src
+            .windows(3)
+            .position(|w| w == b"var")
+            .expect("find var");
+        let space_pos = var_pos + 3;
+        assert_eq!(src[space_pos], b' ');
+        assert_eq!(
+            scopes[space_pos],
+            ScopeId::Default,
+            "uncolored whitespace inside a known-language fence should be Default, got {:?}",
+            scopes[space_pos]
+        );
+        // The opening fence bytes themselves should still carry the parent
+        // grammar's styling (Punctuation for the ``` markers).
+        assert_eq!(scopes[0], ScopeId::Punctuation);
+    }
+
+    #[test]
+    fn unknown_language_fence_keeps_parent_block_color() {
+        // A fence with an unknown language should *not* punch the hole —
+        // its body stays styled by the parent grammar's `markup.raw.block`.
+        let h = Highlighter::new();
+        let mut parser = h.parser_for("djot").expect("djot parser");
+        let src = b"```rust\nfn x() {}\n```\n";
+        let tree = parser.parse(src.as_slice(), None).expect("parse");
+        let spans = h.highlight("djot", &tree, src);
+        let scopes = flatten_to_byte_scopes(&spans, src.len());
+        let x_pos = src.iter().position(|&b| b == b'x').expect("find x");
+        assert_eq!(scopes[x_pos], ScopeId::String);
+    }
+
+    #[test]
+    fn djot_injects_mshell_into_fenced_code_block() {
+        let h = Highlighter::new();
+        let mut parser = h.parser_for("djot").expect("djot parser");
+        let src = b"```msh\n# a comment\n```\n";
+        let tree = parser.parse(src.as_slice(), None).expect("parse");
+        let spans = h.highlight("djot", &tree, src);
+        // mshell's `# a comment` must produce a Comment span inside.
+        let comment_pos = src
+            .windows(11)
+            .position(|w| w == b"# a comment")
+            .expect("find comment");
+        let hit = spans
+            .iter()
+            .find(|s| s.start == comment_pos && s.scope == ScopeId::Comment);
+        assert!(hit.is_some(), "expected Comment span from mshell injection");
     }
 
     #[test]
