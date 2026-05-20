@@ -1,0 +1,7 @@
+{
+  "name": "first `*` press expands a collapsed cursor to cover the word it sits on",
+  "initial": "<f>oo bar foo baz",
+  "keys": "*",
+  "expected": "<foo> bar foo baz",
+  "expected_mode": "normal"
+}

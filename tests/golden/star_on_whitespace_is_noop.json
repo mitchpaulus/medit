@@ -1,0 +1,7 @@
+{
+  "name": "`*` pressed on a non-word byte (whitespace) is a no-op — the cursor stays put and no pattern is armed",
+  "initial": "foo< >bar",
+  "keys": "*",
+  "expected": "foo< >bar",
+  "expected_mode": "normal"
+}

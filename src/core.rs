@@ -726,6 +726,36 @@ pub fn handle_normal(
         return false;
     }
 
+    // `*` toggles between word-grab and add-next. If the primary
+    // selection is collapsed, expand it to the word under the cursor and
+    // arm `search.pattern` with that word so `n`/`N` step through
+    // matches. If the primary is already extended, treat the next press
+    // as add-next (same as Ctrl+J): the current selection's bytes become
+    // the literal pattern and the next occurrence joins as a new cursor.
+    // Useful on terminals where Ctrl+J collides with Enter (no kitty
+    // protocol).
+    if k.mods.is_empty() && k.key == Key::Char('*') {
+        let primary = *sels.primary();
+        let extended = primary.anchor != primary.head;
+        if extended {
+            add_next_smart(sels, bytes, search, true);
+        } else if let Some((s, e)) = word_object(bytes, primary.head, ObjectKind::Inner) {
+            if e > s {
+                let sel = sels.primary_mut();
+                sel.anchor = s;
+                sel.head = snap_to_char_or_last(bytes, e - 1).max(s);
+                sel.desired_col = display_col(bytes, line_start(bytes, sel.head), sel.head);
+                if let Ok(word_str) = std::str::from_utf8(&bytes[s..e]) {
+                    let pat_str = regex::escape(word_str);
+                    if let Ok(re) = compile_search_regex(&pat_str) {
+                        search.pattern = Some(re);
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     // Multi-cursor management.
     if k.mods.is_empty() && k.key == Key::Char(',') {
         sels.reduce_to_primary();

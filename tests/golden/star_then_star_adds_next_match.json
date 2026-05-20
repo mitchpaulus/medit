@@ -1,0 +1,7 @@
+{
+  "name": "second `*` adds the next occurrence of the word as a new cursor (the new one becomes primary, so the marker moves to it)",
+  "initial": "<f>oo bar foo baz",
+  "keys": "**",
+  "expected": "foo bar <foo> baz",
+  "expected_mode": "normal"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "after `*` selects a word, `n` jumps to the next occurrence (proves the search pattern was armed)",
+  "initial": "<f>oo bar foo baz",
+  "keys": "*n",
+  "expected": "foo bar <foo> baz",
+  "expected_mode": "normal"
+}
