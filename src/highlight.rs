@@ -96,6 +96,27 @@ impl Highlighter {
         })
     }
 
+    /// Map a file's shebang line to a registered language id.
+    /// Handles `#!/path/to/interp` and `#!/path/to/env [flags] interp`
+    /// (where `env` skips `-flag` args and `VAR=VALUE` assignments).
+    pub fn language_for_shebang(content: &[u8]) -> Option<&'static str> {
+        let line = content.split(|&b| b == b'\n').next()?;
+        let rest = line.strip_prefix(b"#!")?;
+        let s = std::str::from_utf8(rest).ok()?;
+        let mut parts = s.split_whitespace();
+        let prog = parts.next()?;
+        let basename = prog.rsplit('/').next().unwrap_or(prog);
+        let interp = if basename == "env" {
+            parts.find(|p| !p.starts_with('-') && !p.contains('='))?
+        } else {
+            basename
+        };
+        Some(match interp {
+            "msh" | "mshell" => "mshell",
+            _ => return None,
+        })
+    }
+
     /// Build a parser configured for `lang_id`. Returns `None` if the
     /// language isn't registered.
     pub fn parser_for(&self, lang_id: &str) -> Option<Parser> {
@@ -173,6 +194,19 @@ mod tests {
             .find(|s| s.start == func_pos && s.end == func_pos + 4)
             .expect("highlight span for `func` not found");
         assert_eq!(span.scope, ScopeId::Keyword);
+    }
+
+    #[test]
+    fn shebang_detection_handles_direct_and_env() {
+        assert_eq!(Highlighter::language_for_shebang(b"#!/usr/bin/msh\n"), Some("mshell"));
+        assert_eq!(Highlighter::language_for_shebang(b"#!/usr/local/bin/mshell\n"), Some("mshell"));
+        assert_eq!(Highlighter::language_for_shebang(b"#!/usr/bin/env msh\n"), Some("mshell"));
+        assert_eq!(Highlighter::language_for_shebang(b"#!/usr/bin/env mshell\n"), Some("mshell"));
+        assert_eq!(Highlighter::language_for_shebang(b"#!/usr/bin/env -S msh\n"), Some("mshell"));
+        assert_eq!(Highlighter::language_for_shebang(b"#!/usr/bin/env FOO=bar msh\n"), Some("mshell"));
+        assert_eq!(Highlighter::language_for_shebang(b"#!/bin/bash\n"), None);
+        assert_eq!(Highlighter::language_for_shebang(b"hello world\n"), None);
+        assert_eq!(Highlighter::language_for_shebang(b""), None);
     }
 
     #[test]

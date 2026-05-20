@@ -1,5 +1,6 @@
 mod term;
 
+use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -71,7 +72,10 @@ struct EditorBuffer {
 
 impl EditorBuffer {
     fn new(buffer: Buffer, path: Option<PathBuf>) -> Self {
-        let lang_id = path.as_deref().and_then(Highlighter::language_for_path);
+        let lang_id = path
+            .as_deref()
+            .and_then(Highlighter::language_for_path)
+            .or_else(|| Highlighter::language_for_shebang(&collect_bytes(&buffer)));
         Self {
             buffer,
             sels: Selections::new(),
@@ -474,11 +478,12 @@ fn main() -> io::Result<()> {
     let mut last_key: Option<KeyEvent> = None;
     let mut last_bytes: Vec<u8> = Vec::new();
 
-    // LSP. We spawn a server on demand the first time we open a Go file
-    // (initial buffer or via `:e`). One client serves all buffers.
-    let mut lsp_client: Option<LspClient> = None;
+    // LSP. We spawn one server per language, on demand, the first time we
+    // open a file of that language (initial buffer or via `:e`). All
+    // buffers of a given language share the same client.
+    let mut lsp_clients: HashMap<&'static str, LspClient> = HashMap::new();
     if let Some(p) = buffers[0].path.clone() {
-        maybe_start_lsp_and_open(&mut lsp_client, &p, &mut buffers[0]);
+        maybe_start_lsp_and_open(&mut lsp_clients, &p, &mut buffers[0]);
     }
 
     let _raw = RawMode::enable()?;
@@ -499,7 +504,7 @@ fn main() -> io::Result<()> {
         &ex_message,
         last_key.as_ref(),
         &last_bytes,
-        lsp_client.as_ref(),
+        &lsp_clients,
     )?;
 
     let stdin = io::stdin();
@@ -528,7 +533,7 @@ fn main() -> io::Result<()> {
                 &ex_message,
                 last_key.as_ref(),
                 &last_bytes,
-                lsp_client.as_ref(),
+                &lsp_clients,
             )?;
         }
         let n = match handle.read(&mut io_buf) {
@@ -599,7 +604,7 @@ fn main() -> io::Result<()> {
                     if let Some(action) = pending_lsp_action.take() {
                         dispatch_lsp(
                             action,
-                            lsp_client.as_mut(),
+                            &mut lsp_clients,
                             &mut buffers,
                             &mut current,
                             &highlighter,
@@ -634,22 +639,10 @@ fn main() -> io::Result<()> {
                             action,
                             &mut buffers,
                             &mut current,
-                            lsp_client.as_mut(),
+                            &mut lsp_clients,
                             &highlighter,
                             &mut ex_message,
                         );
-                        // If LSP needs to be started lazily for a newly-
-                        // opened file:
-                        if lsp_client.is_none() {
-                            let p_opt = buffers[current].path.clone();
-                            if let Some(p) = p_opt {
-                                maybe_start_lsp_and_open(
-                                    &mut lsp_client,
-                                    &p,
-                                    &mut buffers[current],
-                                );
-                            }
-                        }
                     }
                     if quit {
                         return Ok(());
@@ -675,11 +668,11 @@ fn main() -> io::Result<()> {
         // last saw, push a didChange. Fires on Esc/`jf` out of insert
         // mode and after any normal-mode mutation.
         if mode != Mode::Insert {
-            sync_lsp_if_dirty(&mut buffers[current], lsp_client.as_mut());
+            sync_lsp_if_dirty(&mut buffers[current], &mut lsp_clients);
         }
-        // Drain anything the LSP reader thread has parked since the last
+        // Drain anything each LSP reader thread has parked since the last
         // wake (diagnostics, etc.) so they're visible in this frame.
-        if let Some(client) = lsp_client.as_mut() {
+        for client in lsp_clients.values_mut() {
             client.poll();
         }
         let render_start = trace::tic();
@@ -701,7 +694,7 @@ fn main() -> io::Result<()> {
             &ex_message,
             last_key.as_ref(),
             &last_bytes,
-            lsp_client.as_ref(),
+            &lsp_clients,
         )?;
         let render_ns = trace::toc(render_start);
         let total_ns = trace::toc(frame_start);
@@ -718,14 +711,19 @@ fn main() -> io::Result<()> {
 /// If the current buffer has been mutated since the last LSP sync,
 /// send a full-text `didChange`. Called from the main loop on every
 /// transition out of insert mode (and after every normal-mode op),
-/// keyed off `buffer.version()`.
-fn sync_lsp_if_dirty(eb: &mut EditorBuffer, client: Option<&mut LspClient>) {
-    let client = match client {
-        Some(c) => c,
-        None => return,
-    };
+/// keyed off `buffer.version()`. Looks up the right server by the
+/// buffer's language.
+fn sync_lsp_if_dirty(eb: &mut EditorBuffer, clients: &mut HashMap<&'static str, LspClient>) {
     let path = match eb.path.as_ref() {
         Some(p) => p,
+        None => return,
+    };
+    let lang = match eb.lang_id {
+        Some(l) => l,
+        None => return,
+    };
+    let client = match clients.get_mut(lang) {
+        Some(c) => c,
         None => return,
     };
     let cur_ver = eb.buffer.version();
@@ -733,9 +731,8 @@ fn sync_lsp_if_dirty(eb: &mut EditorBuffer, client: Option<&mut LspClient>) {
         return;
     }
     if eb.lsp_synced_version.is_none() {
-        // We never sent didOpen for this buffer (no recognized language
-        // or LSP wasn't running yet). Don't fire didChange in that case
-        // — gopls would reject an unknown URI.
+        // We never sent didOpen for this buffer. Don't fire didChange —
+        // the server would reject an unknown URI.
         return;
     }
     let uri = match lsp::path_to_uri(path) {
@@ -748,31 +745,46 @@ fn sync_lsp_if_dirty(eb: &mut EditorBuffer, client: Option<&mut LspClient>) {
     }
 }
 
+/// Server command for a given LSP language id: `(program, args)`.
+fn lsp_command_for_lang(lang: &str) -> Option<(&'static str, &'static [&'static str])> {
+    match lang {
+        "go" => Some(("gopls", &[])),
+        "mshell" => Some(("msh", &["lsp"])),
+        _ => None,
+    }
+}
+
 /// Spawn an LSP server for `path` (if it's a recognized language) and send
-/// didOpen for its current buffer content. No-op if a server is already
-/// running, or if the language isn't recognized, or if spawn fails. Adds
-/// new files to an existing server when called repeatedly.
+/// didOpen for its current buffer content. No-op if the language isn't
+/// recognized or if spawn fails. A separate server is spawned per language
+/// the first time a file of that language is opened.
 fn maybe_start_lsp_and_open(
-    lsp_client: &mut Option<LspClient>,
+    lsp_clients: &mut HashMap<&'static str, LspClient>,
     path: &Path,
     eb: &mut EditorBuffer,
 ) {
-    let lang_id = match path.extension().and_then(|e| e.to_str()) {
-        Some("go") => "go",
-        _ => return,
+    let lang_id = match eb.lang_id {
+        Some(l) => l,
+        None => return,
     };
-    if lsp_client.is_none() {
+    if !lsp_clients.contains_key(lang_id) {
+        let (program, args) = match lsp_command_for_lang(lang_id) {
+            Some(c) => c,
+            None => return,
+        };
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let root_uri = match lsp::path_to_uri(&cwd) {
             Ok(u) => u,
             Err(_) => return,
         };
-        match LspClient::spawn("gopls", &root_uri) {
-            Ok(c) => *lsp_client = Some(c),
+        match LspClient::spawn(program, args, &root_uri) {
+            Ok(c) => {
+                lsp_clients.insert(lang_id, c);
+            }
             Err(_) => return,
         }
     }
-    if let (Some(client), Ok(uri)) = (lsp_client.as_mut(), lsp::path_to_uri(path)) {
+    if let (Some(client), Ok(uri)) = (lsp_clients.get_mut(lang_id), lsp::path_to_uri(path)) {
         let text = String::from_utf8_lossy(&collect_bytes(&eb.buffer)).into_owned();
         if client.did_open(&uri, lang_id, &text).is_ok() {
             eb.lsp_synced_version = Some(eb.buffer.version());
@@ -787,14 +799,14 @@ fn maybe_start_lsp_and_open(
 ///   jump the cursor there.
 fn dispatch_lsp(
     action: LspAction,
-    client: Option<&mut LspClient>,
+    clients: &mut HashMap<&'static str, LspClient>,
     buffers: &mut Vec<EditorBuffer>,
     current: &mut usize,
     highlighter: &Highlighter,
     ex_message: &mut String,
 ) {
-    let client = match client {
-        Some(c) => c,
+    let lang = match buffers[*current].lang_id {
+        Some(l) => l,
         None => {
             *ex_message = "no LSP server for this file".to_string();
             return;
@@ -822,15 +834,24 @@ fn dispatch_lsp(
                 let character = head.saturating_sub(line_start_byte) as u32;
                 (line, character)
             };
-            let loc = match client.definition(&cur_uri, line, character) {
-                Ok(Some(loc)) => loc,
-                Ok(None) => {
-                    *ex_message = "no definition found".to_string();
-                    return;
-                }
-                Err(e) => {
-                    *ex_message = format!("LSP error: {}", e);
-                    return;
+            let loc = {
+                let client = match clients.get_mut(lang) {
+                    Some(c) => c,
+                    None => {
+                        *ex_message = "no LSP server for this file".to_string();
+                        return;
+                    }
+                };
+                match client.definition(&cur_uri, line, character) {
+                    Ok(Some(loc)) => loc,
+                    Ok(None) => {
+                        *ex_message = "no definition found".to_string();
+                        return;
+                    }
+                    Err(e) => {
+                        *ex_message = format!("LSP error: {}", e);
+                        return;
+                    }
                 }
             };
             // If the definition is in another file, open it (or switch to
@@ -847,7 +868,7 @@ fn dispatch_lsp(
                     buffers,
                     current,
                     &target_path,
-                    Some(client),
+                    clients,
                     highlighter,
                     ex_message,
                 ) {
@@ -867,6 +888,13 @@ fn dispatch_lsp(
             p.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
         }
         LspAction::NextDiagnostic | LspAction::PrevDiagnostic => {
+            let client = match clients.get_mut(lang) {
+                Some(c) => c,
+                None => {
+                    *ex_message = "no LSP server for this file".to_string();
+                    return;
+                }
+            };
             let next = matches!(action, LspAction::NextDiagnostic);
             let diags = client.diagnostics_for(&cur_uri);
             if diags.is_empty() {
@@ -920,7 +948,7 @@ fn open_or_switch_to(
     buffers: &mut Vec<EditorBuffer>,
     current: &mut usize,
     path: &Path,
-    lsp_client: Option<&mut LspClient>,
+    lsp_clients: &mut HashMap<&'static str, LspClient>,
     highlighter: &Highlighter,
     ex_message: &mut String,
 ) -> bool {
@@ -946,22 +974,9 @@ fn open_or_switch_to(
     reparse_and_highlight(&mut eb, highlighter);
     buffers.push(eb);
     *current = buffers.len() - 1;
-    if let Some(client) = lsp_client {
-        let lang_id = match path.extension().and_then(|e| e.to_str()) {
-            Some("go") => Some("go"),
-            _ => None,
-        };
-        if let Some(lang_id) = lang_id {
-            if let Ok(uri) = lsp::path_to_uri(path) {
-                let text =
-                    String::from_utf8_lossy(&collect_bytes(&buffers[*current].buffer)).into_owned();
-                if client.did_open(&uri, lang_id, &text).is_ok() {
-                    buffers[*current].lsp_synced_version =
-                        Some(buffers[*current].buffer.version());
-                }
-            }
-        }
-    }
+    // Spawn the appropriate LSP server lazily (no-op if already running
+    // for that language) and send didOpen for the new file.
+    maybe_start_lsp_and_open(lsp_clients, path, &mut buffers[*current]);
     true
 }
 
@@ -971,13 +986,13 @@ fn dispatch_ex_action(
     action: ExAction,
     buffers: &mut Vec<EditorBuffer>,
     current: &mut usize,
-    lsp_client: Option<&mut LspClient>,
+    lsp_clients: &mut HashMap<&'static str, LspClient>,
     highlighter: &Highlighter,
     ex_message: &mut String,
 ) {
     match action {
         ExAction::OpenFile(path) => {
-            open_or_switch_to(buffers, current, &path, lsp_client, highlighter, ex_message);
+            open_or_switch_to(buffers, current, &path, lsp_clients, highlighter, ex_message);
         }
         ExAction::NextBuffer => {
             if buffers.len() > 1 {
@@ -1060,7 +1075,7 @@ fn render_all(
     ex_message: &str,
     last_key: Option<&KeyEvent>,
     last_bytes: &[u8],
-    lsp_client: Option<&LspClient>,
+    lsp_clients: &HashMap<&'static str, LspClient>,
 ) -> io::Result<()> {
     let cur = &buffers[current];
     let buffer_count = buffers.len();
@@ -1069,9 +1084,12 @@ fn render_all(
     } else {
         cur.display_name()
     };
-    let diagnostics: &[medit::lsp::Diagnostic] = match (lsp_client, cur.path.as_ref()) {
-        (Some(c), Some(p)) => match lsp::path_to_uri(p) {
-            Ok(uri) => c.diagnostics_for(&uri),
+    let diagnostics: &[medit::lsp::Diagnostic] = match (cur.lang_id, cur.path.as_ref()) {
+        (Some(lang), Some(p)) => match lsp::path_to_uri(p) {
+            Ok(uri) => lsp_clients
+                .get(lang)
+                .map(|c| c.diagnostics_for(&uri))
+                .unwrap_or(&[]),
             Err(_) => &[],
         },
         _ => &[],

@@ -80,10 +80,12 @@ pub struct DefinitionLocation {
 }
 
 impl LspClient {
-    /// Spawn `cmd` and complete the LSP `initialize`/`initialized`
-    /// handshake. `root_uri` is the `file://` URI of the workspace root.
-    pub fn spawn(cmd: &str, root_uri: &str) -> io::Result<Self> {
-        let mut child = Command::new(cmd)
+    /// Spawn `program` with `args` and complete the LSP
+    /// `initialize`/`initialized` handshake. `root_uri` is the `file://`
+    /// URI of the workspace root.
+    pub fn spawn(program: &str, args: &[&str], root_uri: &str) -> io::Result<Self> {
+        let mut child = Command::new(program)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
