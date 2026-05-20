@@ -247,6 +247,18 @@ pub enum ExAction {
     NextBuffer,
     PrevBuffer,
     ListBuffers,
+    /// `:w` — write the current buffer to its associated path.
+    Save,
+    /// `:w!` — write, ignoring any external-change conflict.
+    ForceSave,
+    /// `:wq` — save, then quit.
+    SaveAndQuit,
+    /// `:q` — quit, refusing if any buffer is dirty (caller prompts).
+    Quit,
+    /// `:q!` — force quit, discarding unsaved changes.
+    ForceQuit,
+    /// `:e!` — reload the current buffer from disk, discarding edits.
+    Reload,
 }
 
 /// Compute the byte range `[start, end)` of a text object containing
@@ -1516,8 +1528,8 @@ pub fn handle_ex(
 }
 
 pub fn execute_ex(
-    buffer: &Buffer,
-    path: Option<&std::path::Path>,
+    _buffer: &Buffer,
+    _path: Option<&std::path::Path>,
     cmd: &str,
     message: &mut String,
     action: &mut Option<ExAction>,
@@ -1534,36 +1546,30 @@ pub fn execute_ex(
     }
     match cmd {
         "" => false,
-        "w" => match path {
-            Some(p) => match save_buffer(buffer, p) {
-                Ok(()) => {
-                    *message = format!("\"{}\" written", p.display());
-                    false
-                }
-                Err(e) => {
-                    *message = format!("write failed: {}", e);
-                    false
-                }
-            },
-            None => {
-                *message = "no file name (use :w <path>)".to_string();
-                false
-            }
-        },
-        "q" => true,
-        "wq" => match path {
-            Some(p) => match save_buffer(buffer, p) {
-                Ok(()) => true,
-                Err(e) => {
-                    *message = format!("write failed: {}", e);
-                    false
-                }
-            },
-            None => {
-                *message = "no file name (use :w <path>)".to_string();
-                false
-            }
-        },
+        "w" => {
+            *action = Some(ExAction::Save);
+            false
+        }
+        "w!" => {
+            *action = Some(ExAction::ForceSave);
+            false
+        }
+        "q" => {
+            *action = Some(ExAction::Quit);
+            false
+        }
+        "q!" => {
+            *action = Some(ExAction::ForceQuit);
+            false
+        }
+        "wq" => {
+            *action = Some(ExAction::SaveAndQuit);
+            false
+        }
+        "e!" => {
+            *action = Some(ExAction::Reload);
+            false
+        }
         "bn" | "bnext" => {
             *action = Some(ExAction::NextBuffer);
             false

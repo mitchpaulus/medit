@@ -59,7 +59,7 @@ editing, multi-cursor.</p>
 <tr><td><kbd>y</kbd></td><td>Yank primary selection</td></tr>
 <tr><td><kbd>p</kbd> / <kbd>P</kbd></td><td>Paste after / before</td></tr>
 <tr><td><kbd>u</kbd> / <kbd>U</kbd></td><td>Undo / redo</td></tr>
-<tr><td><kbd>q</kbd></td><td>Quit</td></tr>
+<tr><td><kbd>q</kbd></td><td>Close active buffer (prompts if unsaved); exits the editor when the last buffer closes</td></tr>
 </table>
 
 <h2>Normal mode &mdash; selections &amp; multi-cursor</h2>
@@ -116,19 +116,36 @@ editing, multi-cursor.</p>
 <h2>Ex commands (<kbd>:</kbd>)</h2>
 <table>
 <tr><th>Command</th><th>Action</th></tr>
-<tr><td><code>:w</code></td><td>Write current buffer</td></tr>
-<tr><td><code>:q</code></td><td>Quit</td></tr>
-<tr><td><code>:wq</code></td><td>Write and quit</td></tr>
+<tr><td><code>:w</code></td><td>Write current buffer (refuses if file changed on disk)</td></tr>
+<tr><td><code>:w!</code></td><td>Force write, overwriting external changes</td></tr>
+<tr><td><code>:q</code></td><td>Close active buffer (prompts if unsaved); exits the editor when the last buffer is closed</td></tr>
+<tr><td><code>:q!</code></td><td>Force close active buffer, discarding unsaved changes</td></tr>
+<tr><td><code>:wq</code></td><td>Write active buffer and close it</td></tr>
 <tr><td><code>:e &lt;path&gt;</code></td><td>Open file (switches to it if already open)</td></tr>
+<tr><td><code>:e!</code></td><td>Reload current buffer from disk, discarding in-memory edits</td></tr>
 <tr><td><code>:bn</code> / <code>:bnext</code></td><td>Next buffer</td></tr>
 <tr><td><code>:bp</code> / <code>:bprev</code> / <code>:bprevious</code></td><td>Previous buffer</td></tr>
 <tr><td><code>:ls</code> / <code>:buffers</code></td><td>List open buffers</td></tr>
 </table>
+<p class="note">Dirty buffers show <code>[+]</code> in the status line.
+<kbd>q</kbd> in normal mode and <code>:q</code> close the <em>active</em>
+buffer (prompting if it's unsaved); the editor exits when the last buffer
+is closed. <kbd>Ctrl</kbd>+<kbd>c</kbd> exits the whole editor; if any
+buffer is unsaved you're prompted — <kbd>y</kbd> saves all and quits,
+<kbd>n</kbd> discards and quits, anything else cancels.</p>
+<p class="note">Files are watched for external changes via inotify
+(Linux), ReadDirectoryChangesW (Windows), or FSEvents (macOS). If a
+buffer is <strong>clean</strong> and the file changes on disk, medit
+auto-reloads silently. If the buffer is <strong>dirty</strong>, you'll
+see <code>[disk!]</code> next to the filename and a hint; resolve with
+<code>:e!</code> to take the disk version (losing your edits) or
+<code>:w!</code> to overwrite the disk version (losing the external
+edits).</p>
 
 <h2>Global</h2>
 <table>
 <tr><th>Key</th><th>Action</th></tr>
-<tr><td><kbd>Ctrl</kbd>+<kbd>c</kbd></td><td>Quit</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>c</kbd></td><td>Exit editor (prompts if any buffer is unsaved)</td></tr>
 </table>
 
 </body>

@@ -9,7 +9,7 @@ use medit::core::{
     ExAction, LspAction, Mode, ObjectKind, Registers, SearchState, Selections, all_matches,
     byte_at_line, byte_at_line_cached, collect_bytes, display_col, handle_ex, handle_insert,
     handle_normal, handle_search, line_index, line_index_cached, line_start, next_char_or_end,
-    snap_to_char_or_last, utf8_len,
+    save_buffer, snap_to_char_or_last, utf8_len,
 };
 use medit::highlight::{Highlighter, flatten_to_byte_scopes};
 use medit::indent::Indenter;
@@ -17,6 +17,7 @@ use medit::input::{Event, Key, KeyEvent, Mods, Parser};
 use medit::lsp::{self, LspClient};
 use medit::theme::{self, ScopeId};
 use medit::trace;
+use medit::watch::{DiskMeta, FileWatcher};
 use term::{RawMode, Screen};
 
 const SEL_BG: &str = "\x1b[48;5;24m";
@@ -73,6 +74,21 @@ struct EditorBuffer {
     /// didChange). When the buffer moves past this and we're not in
     /// insert mode, fire a didChange to resync.
     lsp_synced_version: Option<u64>,
+    /// `buffer.version()` at the moment we last wrote this buffer to disk
+    /// (or `Some(0)` for a freshly-loaded file, since it matches disk).
+    /// `None` for a never-saved scratch buffer with no path. Drives the
+    /// dirty check that protects quit paths.
+    saved_version: Option<u64>,
+    /// Stat snapshot of the file on disk at the moment we last read from
+    /// or wrote to it. `None` when there's no backing file (yet). Drives
+    /// the external-change detector — both on save (conflict check) and
+    /// in the watcher path (whether a notify event actually changed
+    /// anything relative to what we last saw).
+    disk_meta: Option<DiskMeta>,
+    /// Set by the watcher path when the file changed on disk and we
+    /// couldn't auto-reload (because the buffer was dirty). Surfaces in
+    /// the status bar so the user knows there's a conflict to resolve.
+    external_change_pending: bool,
 }
 
 impl EditorBuffer {
@@ -81,6 +97,8 @@ impl EditorBuffer {
             .as_deref()
             .and_then(Highlighter::language_for_path)
             .or_else(|| Highlighter::language_for_shebang(&collect_bytes(&buffer)));
+        let saved_version = if path.is_some() { Some(0) } else { None };
+        let disk_meta = path.as_deref().and_then(|p| DiskMeta::read(p).ok());
         Self {
             buffer,
             sels: Selections::new(),
@@ -94,6 +112,19 @@ impl EditorBuffer {
             cached_version: None,
             highlight_version: None,
             lsp_synced_version: None,
+            // A file-backed buffer matches disk on load; a scratch buffer
+            // without a path has nothing to compare against until saved.
+            saved_version,
+            disk_meta,
+            external_change_pending: false,
+        }
+    }
+
+    /// True when there are unsaved changes worth prompting about.
+    fn is_dirty(&self) -> bool {
+        match self.saved_version {
+            Some(v) => v != self.buffer.version(),
+            None => self.buffer.version() != 0,
         }
     }
 
@@ -334,6 +365,107 @@ fn emit_styled_cell(
 /// to the cursor. Box-drawing chars are emitted as UTF-8 directly. The
 /// popup overlays buffer cells — it's drawn after the main pass, so it
 /// "wins" any conflicting cell. Severity tints the border.
+/// Render a modal prompt centered on the screen: bold title row, body
+/// lines below, then dim choice hints. Box-drawing chars; the SGR
+/// sequences are reset after each cell so the surrounding view doesn't
+/// inherit them.
+fn draw_prompt(screen: &mut Screen, prompt: &Prompt, rows: u16, cols: u16) {
+    const BORDER: &str = "\x1b[38;5;110m";
+    const BOLD: &str = "\x1b[1m";
+    const DIM: &str = "\x1b[38;5;243m";
+    const RESET: &str = "\x1b[0m";
+
+    // Build the lines that go inside the box. Choices share one row
+    // (joined by `  ·  `) when they fit.
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(prompt.title.clone());
+    lines.push(String::new());
+    for b in &prompt.body {
+        lines.push(b.clone());
+    }
+    if !prompt.choices.is_empty() {
+        lines.push(String::new());
+        let mut choice_line = String::new();
+        for (i, (key, desc)) in prompt.choices.iter().enumerate() {
+            if i > 0 {
+                choice_line.push_str("  ·  ");
+            }
+            choice_line.push_str(&format!("[{}] {}", key, desc));
+        }
+        lines.push(choice_line);
+    }
+
+    let max_text = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let inner_w = max_text + 4; // 2-char padding either side
+    let box_w = inner_w as u16 + 2; // +2 for vertical borders
+    let box_h = lines.len() as u16 + 2; // +2 for horizontal borders
+
+    if box_w >= cols || box_h >= rows {
+        // Pathological tiny window — skip rather than wrap-mangle.
+        return;
+    }
+    let top = (rows.saturating_sub(box_h)) / 2;
+    let left = (cols.saturating_sub(box_w)) / 2;
+
+    let mut top_line = String::with_capacity(box_w as usize * 4);
+    top_line.push_str(BORDER);
+    top_line.push('╭');
+    for _ in 0..inner_w {
+        top_line.push('─');
+    }
+    top_line.push('╮');
+    top_line.push_str(RESET);
+    screen.write_at(top, left, &top_line);
+
+    for (i, line) in lines.iter().enumerate() {
+        let visible_len = line.chars().count();
+        let pad_total = inner_w.saturating_sub(visible_len);
+        // Center each line inside the box.
+        let pad_left = pad_total / 2;
+        let pad_right = pad_total - pad_left;
+
+        let mut row_str = String::with_capacity(box_w as usize * 4);
+        row_str.push_str(BORDER);
+        row_str.push('│');
+        row_str.push_str(RESET);
+        for _ in 0..pad_left {
+            row_str.push(' ');
+        }
+        // Style by row: title (first non-empty) bold, choices (last
+        // non-empty) dim, body neutral.
+        let is_title = i == 0;
+        let is_choices = i + 1 == lines.len() && !prompt.choices.is_empty();
+        if is_title {
+            row_str.push_str(BOLD);
+            row_str.push_str(line);
+            row_str.push_str(RESET);
+        } else if is_choices {
+            row_str.push_str(DIM);
+            row_str.push_str(line);
+            row_str.push_str(RESET);
+        } else {
+            row_str.push_str(line);
+        }
+        for _ in 0..pad_right {
+            row_str.push(' ');
+        }
+        row_str.push_str(BORDER);
+        row_str.push('│');
+        row_str.push_str(RESET);
+        screen.write_at(top + 1 + i as u16, left, &row_str);
+    }
+
+    let mut bot_line = String::with_capacity(box_w as usize * 4);
+    bot_line.push_str(BORDER);
+    bot_line.push('╰');
+    for _ in 0..inner_w {
+        bot_line.push('─');
+    }
+    bot_line.push('╯');
+    bot_line.push_str(RESET);
+    screen.write_at(top + box_h - 1, left, &bot_line);
+}
+
 fn draw_diag_popup(
     screen: &mut Screen,
     d: &medit::lsp::Diagnostic,
@@ -506,6 +638,16 @@ fn main() -> io::Result<()> {
     };
     let mut current: usize = 0;
 
+    // Filesystem watcher for open files. Best-effort: if construction
+    // fails (e.g. on a platform we don't support yet) we proceed without
+    // it and rely on the save-time conflict check alone.
+    let mut watcher: Option<FileWatcher> = FileWatcher::new().ok();
+    if let Some(w) = watcher.as_mut() {
+        if let Some(p) = buffers[0].path.as_deref() {
+            let _ = w.watch(p);
+        }
+    }
+
     let mut mode = Mode::Normal;
     let mut registers = Registers::default();
     let mut ex_input = String::new();
@@ -522,6 +664,10 @@ fn main() -> io::Result<()> {
     let mut search_state = SearchState::default();
     let mut last_key: Option<KeyEvent> = None;
     let mut last_bytes: Vec<u8> = Vec::new();
+    // Active modal prompt, if any. When `Some`, the next keypress is
+    // consumed by `handle_prompt` instead of being routed to the active
+    // mode, and the prompt box overlays the editor view.
+    let mut prompt: Option<Prompt> = None;
 
     // LSP. We spawn one server per language, on demand, the first time we
     // open a file of that language (initial buffer or via `:e`). All
@@ -550,6 +696,7 @@ fn main() -> io::Result<()> {
         last_key.as_ref(),
         &last_bytes,
         &lsp_clients,
+        prompt.as_ref(),
     )?;
 
     let stdin = io::stdin();
@@ -579,6 +726,7 @@ fn main() -> io::Result<()> {
                 last_key.as_ref(),
                 &last_bytes,
                 &lsp_clients,
+                prompt.as_ref(),
             )?;
         }
         let n = match handle.read(&mut io_buf) {
@@ -600,8 +748,30 @@ fn main() -> io::Result<()> {
         while let Some(event) = parser.next_event().or_else(|| parser.flush()) {
             let Event::Key(k) = event;
             last_key = Some(k);
+            // Intercept any active prompt: the next keypress is consumed
+            // by `handle_prompt` regardless of which mode we were in
+            // when the prompt went up.
+            if let Some(p) = prompt.take() {
+                match handle_prompt(
+                    &p,
+                    k,
+                    &mut buffers,
+                    &mut current,
+                    &highlighter,
+                    &mut ex_message,
+                ) {
+                    PromptOutcome::Quit => return Ok(()),
+                    PromptOutcome::Dismiss => continue,
+                }
+            }
             if k.mods.contains(Mods::CTRL) && k.key == Key::Char('c') {
-                return Ok(());
+                match attempt_quit(&buffers) {
+                    QuitOutcome::Quit => return Ok(()),
+                    QuitOutcome::Prompt => {
+                        prompt = Some(build_quit_prompt(&buffers));
+                        continue;
+                    }
+                }
             }
             if mode == Mode::Normal {
                 ex_message.clear();
@@ -642,7 +812,18 @@ fn main() -> io::Result<()> {
                         line_starts,
                         k,
                     ) {
-                        return Ok(());
+                        // Normal-mode `q` closes the active buffer. Clean
+                        // buffers close immediately; dirty buffers raise a
+                        // close-confirm prompt. Closing the last buffer
+                        // exits the editor.
+                        match attempt_close_current(&mut buffers, &mut current) {
+                            CloseOutcome::Closed => continue,
+                            CloseOutcome::QuitEditor => return Ok(()),
+                            CloseOutcome::Prompt => {
+                                prompt = Some(build_close_buffer_prompt(&buffers, current));
+                                continue;
+                            }
+                        }
                     }
                     if mode == Mode::Ex {
                         ex_input.clear();
@@ -657,6 +838,7 @@ fn main() -> io::Result<()> {
                             &mut buffers,
                             &mut current,
                             &highlighter,
+                            watcher.as_mut(),
                             &mut ex_message,
                         );
                     }
@@ -685,7 +867,7 @@ fn main() -> io::Result<()> {
                 }
                 Mode::Ex => {
                     let path_owned = buffers[current].path.clone();
-                    let quit = handle_ex(
+                    let _ = handle_ex(
                         &buffers[current].buffer,
                         &mut mode,
                         &mut ex_input,
@@ -695,17 +877,19 @@ fn main() -> io::Result<()> {
                         k,
                     );
                     if let Some(action) = pending_ex_action.take() {
-                        dispatch_ex_action(
+                        match dispatch_ex_action(
                             action,
                             &mut buffers,
                             &mut current,
                             &mut lsp_clients,
                             &highlighter,
+                            watcher.as_mut(),
+                            &mut prompt,
                             &mut ex_message,
-                        );
-                    }
-                    if quit {
-                        return Ok(());
+                        ) {
+                            AfterAction::Continue => {}
+                            AfterAction::Quit => return Ok(()),
+                        }
                     }
                 }
                 Mode::Search => {
@@ -735,6 +919,12 @@ fn main() -> io::Result<()> {
         for client in lsp_clients.values_mut() {
             client.poll();
         }
+        // Drain the filesystem watcher: clean buffers auto-reload from
+        // disk, dirty buffers get marked with a pending conflict and
+        // raise a Conflict prompt.
+        if let Some(w) = watcher.as_ref() {
+            apply_watcher_events(w, &mut buffers, &highlighter, &mut prompt, &mut ex_message);
+        }
         let render_start = trace::tic();
         {
             let viewport_rows = screen.rows.saturating_sub(1) as usize;
@@ -758,6 +948,7 @@ fn main() -> io::Result<()> {
             last_key.as_ref(),
             &last_bytes,
             &lsp_clients,
+            prompt.as_ref(),
         )?;
         let render_ns = trace::toc(render_start);
         let total_ns = trace::toc(frame_start);
@@ -857,6 +1048,7 @@ fn dispatch_lsp(
     buffers: &mut Vec<EditorBuffer>,
     current: &mut usize,
     highlighter: &Highlighter,
+    watcher: Option<&mut FileWatcher>,
     ex_message: &mut String,
 ) {
     let lang = match buffers[*current].lang_id {
@@ -924,6 +1116,7 @@ fn dispatch_lsp(
                     &target_path,
                     clients,
                     highlighter,
+                    watcher,
                     ex_message,
                 ) {
                     return;
@@ -998,12 +1191,377 @@ fn dispatch_lsp(
 /// open, runs the syntax highlighter and notifies the LSP server via
 /// `didOpen` if applicable. Returns `false` and sets `ex_message` on
 /// failure (e.g. can't read the file).
+/// Modal-overlay prompt rendered as a bold, centered box on top of the
+/// editor view. Used for blocking decisions the user has to resolve
+/// before continuing (unsaved-changes confirm, disk-conflict resolution).
+/// The next keystroke is consumed by the prompt and routed via
+/// `handle_prompt` based on `kind`.
+struct Prompt {
+    title: String,
+    body: Vec<String>,
+    /// Pairs of `(key-hint, description)` shown beneath the body.
+    choices: Vec<(&'static str, &'static str)>,
+    kind: PromptKind,
+}
+
+/// What domain the prompt is for, controlling how a keypress resolves.
+enum PromptKind {
+    /// `Ctrl+C` with at least one dirty buffer anywhere. `y` saves all
+    /// and quits, `n` discards and quits, anything else cancels.
+    QuitConfirm,
+    /// `q` / `:q` / `:wq` on a buffer with unsaved edits. `y` saves and
+    /// closes the buffer, `n` discards and closes, anything else cancels.
+    /// If the closed buffer was the last open, the editor exits.
+    CloseBufferConfirm { buffer_index: usize },
+    /// External change detected on a buffer with unsaved edits. `r`
+    /// reloads from disk (losing edits), `o` overwrites disk (losing
+    /// external edits), anything else cancels.
+    Conflict { buffer_index: usize },
+}
+
+/// Result of handling one keypress while a prompt is active.
+enum PromptOutcome {
+    /// Resolve the prompt and continue editing.
+    Dismiss,
+    /// Exit the editor.
+    Quit,
+}
+
+/// Outcome of a quit request — either the editor can exit cleanly, or
+/// there are unsaved buffers and the caller should raise a confirm prompt.
+enum QuitOutcome {
+    Quit,
+    Prompt,
+}
+
+/// Build the QuitConfirm prompt with a dirty-buffer count and the standard
+/// y/n/cancel hints.
+fn build_quit_prompt(buffers: &[EditorBuffer]) -> Prompt {
+    let n_dirty = buffers.iter().filter(|b| b.is_dirty()).count();
+    let names: Vec<String> = buffers
+        .iter()
+        .filter(|b| b.is_dirty())
+        .take(4)
+        .map(|b| b.display_name())
+        .collect();
+    let mut body = vec![format!("{} buffer(s) have unsaved changes:", n_dirty)];
+    for n in &names {
+        body.push(format!("  • {}", n));
+    }
+    if n_dirty > names.len() {
+        body.push(format!("  • … and {} more", n_dirty - names.len()));
+    }
+    Prompt {
+        title: "Unsaved changes".to_string(),
+        body,
+        choices: vec![
+            ("y", "save all & quit"),
+            ("n", "discard & quit"),
+            ("any other", "cancel"),
+        ],
+        kind: PromptKind::QuitConfirm,
+    }
+}
+
+/// Build the close-buffer confirm prompt for `buffer_index`.
+fn build_close_buffer_prompt(buffers: &[EditorBuffer], buffer_index: usize) -> Prompt {
+    let name = buffers
+        .get(buffer_index)
+        .map(|b| b.display_name())
+        .unwrap_or_else(|| "?".to_string());
+    Prompt {
+        title: "Close buffer with unsaved changes".to_string(),
+        body: vec![format!("\"{}\" has unsaved edits.", name)],
+        choices: vec![
+            ("y", "save & close"),
+            ("n", "discard & close"),
+            ("any other", "cancel"),
+        ],
+        kind: PromptKind::CloseBufferConfirm { buffer_index },
+    }
+}
+
+/// Build the disk-conflict prompt for `buffer_index` (assumed to be a
+/// buffer with both unsaved edits and an externally-modified file on disk).
+fn build_conflict_prompt(buffers: &[EditorBuffer], buffer_index: usize) -> Prompt {
+    let name = buffers
+        .get(buffer_index)
+        .map(|b| b.display_name())
+        .unwrap_or_else(|| "?".to_string());
+    Prompt {
+        title: "File changed on disk".to_string(),
+        body: vec![
+            format!("\"{}\" was modified externally", name),
+            "while you also have unsaved edits.".to_string(),
+        ],
+        choices: vec![
+            ("r", "reload from disk (lose your edits)"),
+            ("o", "overwrite disk (lose external edits)"),
+            ("any other", "cancel"),
+        ],
+        kind: PromptKind::Conflict { buffer_index },
+    }
+}
+
+/// Decide what to do when something requests a full-editor quit (e.g.
+/// `Ctrl+C`). Caller raises the prompt itself; this just reports whether
+/// one's needed.
+fn attempt_quit(buffers: &[EditorBuffer]) -> QuitOutcome {
+    if buffers.iter().any(|b| b.is_dirty()) {
+        QuitOutcome::Prompt
+    } else {
+        QuitOutcome::Quit
+    }
+}
+
+/// Outcome of an attempt to close the current buffer.
+enum CloseOutcome {
+    /// Buffer is clean and was removed. Caller should check if `buffers`
+    /// is now empty and exit if so.
+    Closed,
+    /// Buffer was the last one and is clean — exit the editor entirely.
+    QuitEditor,
+    /// Buffer is dirty; caller raises a CloseBufferConfirm prompt.
+    Prompt,
+}
+
+/// Try to close `buffers[current]`. Clean buffers close immediately;
+/// dirty buffers ask the caller to raise a confirm prompt. If closing
+/// the last remaining buffer, this asks the caller to exit the editor.
+fn attempt_close_current(buffers: &mut Vec<EditorBuffer>, current: &mut usize) -> CloseOutcome {
+    let idx = *current;
+    let dirty = buffers.get(idx).map(|b| b.is_dirty()).unwrap_or(false);
+    if dirty {
+        return CloseOutcome::Prompt;
+    }
+    let was_last = buffers.len() <= 1;
+    close_buffer_at(buffers, current, idx);
+    if was_last {
+        CloseOutcome::QuitEditor
+    } else {
+        CloseOutcome::Closed
+    }
+}
+
+/// Remove `buffers[idx]` and adjust `current` so it still points at a
+/// valid buffer (the one to the left, if any). No-op when `idx` is out
+/// of range.
+fn close_buffer_at(buffers: &mut Vec<EditorBuffer>, current: &mut usize, idx: usize) {
+    if idx >= buffers.len() {
+        return;
+    }
+    buffers.remove(idx);
+    if buffers.is_empty() {
+        *current = 0;
+    } else if *current >= buffers.len() {
+        *current = buffers.len() - 1;
+    } else if *current > idx {
+        *current -= 1;
+    }
+}
+
+/// Route a keystroke into the active prompt. Returns whether to dismiss
+/// the prompt (and continue) or exit the editor. Side effects (writes,
+/// reloads, status messages) happen here per `prompt.kind`.
+fn handle_prompt(
+    prompt: &Prompt,
+    k: KeyEvent,
+    buffers: &mut Vec<EditorBuffer>,
+    current: &mut usize,
+    highlighter: &Highlighter,
+    ex_message: &mut String,
+) -> PromptOutcome {
+    match prompt.kind {
+        PromptKind::QuitConfirm => match k.key {
+            Key::Char('y') | Key::Char('Y') => {
+                for eb in buffers.iter_mut() {
+                    if !eb.is_dirty() {
+                        continue;
+                    }
+                    let path = match eb.path.clone() {
+                        Some(p) => p,
+                        None => {
+                            *ex_message = format!(
+                                "\"{}\" has no path — use :w <path> first",
+                                eb.display_name()
+                            );
+                            return PromptOutcome::Dismiss;
+                        }
+                    };
+                    if let (Some(prev), Ok(now)) = (eb.disk_meta, DiskMeta::read(&path)) {
+                        if prev != now {
+                            *ex_message = format!(
+                                "\"{}\" changed on disk — resolve with :w! or :e!",
+                                path.display()
+                            );
+                            eb.external_change_pending = true;
+                            return PromptOutcome::Dismiss;
+                        }
+                    }
+                    if let Err(e) = save_buffer(&eb.buffer, &path) {
+                        *ex_message = format!("write {} failed: {}", path.display(), e);
+                        return PromptOutcome::Dismiss;
+                    }
+                    eb.saved_version = Some(eb.buffer.version());
+                    eb.disk_meta = DiskMeta::read(&path).ok();
+                    eb.external_change_pending = false;
+                }
+                PromptOutcome::Quit
+            }
+            Key::Char('n') | Key::Char('N') => PromptOutcome::Quit,
+            _ => {
+                *ex_message = "quit cancelled".to_string();
+                PromptOutcome::Dismiss
+            }
+        },
+        PromptKind::CloseBufferConfirm { buffer_index } => match k.key {
+            Key::Char('y') | Key::Char('Y') => {
+                let eb = match buffers.get_mut(buffer_index) {
+                    Some(b) => b,
+                    None => return PromptOutcome::Dismiss,
+                };
+                if !save_current(eb, false, ex_message) {
+                    return PromptOutcome::Dismiss;
+                }
+                let was_last = buffers.len() <= 1;
+                close_buffer_at(buffers, current, buffer_index);
+                if was_last {
+                    PromptOutcome::Quit
+                } else {
+                    PromptOutcome::Dismiss
+                }
+            }
+            Key::Char('n') | Key::Char('N') => {
+                let was_last = buffers.len() <= 1;
+                close_buffer_at(buffers, current, buffer_index);
+                if was_last {
+                    PromptOutcome::Quit
+                } else {
+                    PromptOutcome::Dismiss
+                }
+            }
+            _ => {
+                *ex_message = "close cancelled".to_string();
+                PromptOutcome::Dismiss
+            }
+        },
+        PromptKind::Conflict { buffer_index } => match k.key {
+            Key::Char('r') | Key::Char('R') => {
+                let eb = match buffers.get_mut(buffer_index) {
+                    Some(b) => b,
+                    None => return PromptOutcome::Dismiss,
+                };
+                reload_from_disk(eb, highlighter, ex_message);
+                PromptOutcome::Dismiss
+            }
+            Key::Char('o') | Key::Char('O') => {
+                let eb = match buffers.get_mut(buffer_index) {
+                    Some(b) => b,
+                    None => return PromptOutcome::Dismiss,
+                };
+                save_current(eb, true, ex_message);
+                PromptOutcome::Dismiss
+            }
+            _ => {
+                *ex_message = "conflict deferred — use :e! or :w! when ready".to_string();
+                PromptOutcome::Dismiss
+            }
+        },
+    }
+}
+
+/// Save `eb` to its current path. Updates `saved_version` and
+/// `disk_meta` on success. Returns `false` (and sets `ex_message`) if
+/// the buffer has no path, the write fails, or — unless `force` is
+/// `true` — the on-disk file has been modified externally since we
+/// last read or wrote it.
+fn save_current(eb: &mut EditorBuffer, force: bool, ex_message: &mut String) -> bool {
+    let path = match eb.path.clone() {
+        Some(p) => p,
+        None => {
+            *ex_message = "no file name (use :w <path>)".to_string();
+            return false;
+        }
+    };
+    if !force {
+        if let (Some(prev), Ok(now)) = (eb.disk_meta, DiskMeta::read(&path)) {
+            if prev != now {
+                *ex_message = format!(
+                    "\"{}\" changed on disk — :w! overwrites, :e! reloads",
+                    path.display()
+                );
+                eb.external_change_pending = true;
+                return false;
+            }
+        }
+    }
+    match save_buffer(&eb.buffer, &path) {
+        Ok(()) => {
+            eb.saved_version = Some(eb.buffer.version());
+            eb.disk_meta = DiskMeta::read(&path).ok();
+            eb.external_change_pending = false;
+            *ex_message = format!("\"{}\" written", path.display());
+            true
+        }
+        Err(e) => {
+            *ex_message = format!("write failed: {}", e);
+            false
+        }
+    }
+}
+
+/// Reload the buffer from its backing file, discarding in-memory edits
+/// and undo history. Resets all derived caches (tree, scopes, line
+/// index) and clamps the cursor into the new buffer. No-op for a
+/// scratch buffer with no path.
+fn reload_from_disk(
+    eb: &mut EditorBuffer,
+    highlighter: &Highlighter,
+    ex_message: &mut String,
+) -> bool {
+    let path = match eb.path.clone() {
+        Some(p) => p,
+        None => {
+            *ex_message = "no file to reload".to_string();
+            return false;
+        }
+    };
+    let new_buffer = match Buffer::open(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            *ex_message = format!("reload failed: {}", e);
+            return false;
+        }
+    };
+    eb.buffer = new_buffer;
+    eb.tree = None;
+    eb.cached_version = None;
+    eb.highlight_version = None;
+    eb.lsp_synced_version = None;
+    eb.saved_version = Some(0);
+    eb.disk_meta = DiskMeta::read(&path).ok();
+    eb.external_change_pending = false;
+    // Clamp cursor into the reloaded buffer.
+    let new_len = eb.buffer.len();
+    eb.sels.reduce_to_primary();
+    {
+        let primary = eb.sels.primary_mut();
+        primary.head = primary.head.min(new_len);
+        primary.anchor = primary.anchor.min(new_len);
+    }
+    eb.top_line = 0;
+    refresh_bytes_cache(eb);
+    reparse_and_highlight(eb, highlighter);
+    true
+}
+
 fn open_or_switch_to(
     buffers: &mut Vec<EditorBuffer>,
     current: &mut usize,
     path: &Path,
     lsp_clients: &mut HashMap<&'static str, LspClient>,
     highlighter: &Highlighter,
+    watcher: Option<&mut FileWatcher>,
     ex_message: &mut String,
 ) -> bool {
     if let Some(idx) = buffers
@@ -1031,32 +1589,122 @@ fn open_or_switch_to(
     // Spawn the appropriate LSP server lazily (no-op if already running
     // for that language) and send didOpen for the new file.
     maybe_start_lsp_and_open(lsp_clients, path, &mut buffers[*current]);
+    if let Some(w) = watcher {
+        let _ = w.watch(path);
+    }
     true
 }
 
-/// Handle a buffer-list-level Ex action. Loads/switches/lists buffers and
-/// notifies the LSP server about newly opened files.
+/// Drain `notify` events and decide what to do per buffer. For each
+/// affected buffer:
+/// - If the on-disk file actually matches our last-seen stat, ignore
+///   (notify is noisy: chmod, touch with no content change, etc.).
+/// - If the buffer has no in-memory changes, auto-reload from disk.
+/// - Otherwise mark a pending external change and raise a Conflict
+///   prompt unless one's already up (avoid stomping an existing prompt).
+fn apply_watcher_events(
+    watcher: &FileWatcher,
+    buffers: &mut [EditorBuffer],
+    highlighter: &Highlighter,
+    prompt: &mut Option<Prompt>,
+    ex_message: &mut String,
+) {
+    let changed = watcher.poll();
+    if changed.is_empty() {
+        return;
+    }
+    let mut conflict_index: Option<usize> = None;
+    for path in &changed {
+        // notify reports parent-directory events with the full file path;
+        // match against each buffer's stored path. Canonicalize both sides
+        // so symlinks / `./` prefixes don't mask a hit.
+        let target = path.canonicalize().unwrap_or_else(|_| path.clone());
+        for (idx, eb) in buffers.iter_mut().enumerate() {
+            let eb_path = match eb.path.clone() {
+                Some(p) => p,
+                None => continue,
+            };
+            let eb_canon = eb_path.canonicalize().unwrap_or_else(|_| eb_path.clone());
+            if eb_canon != target {
+                continue;
+            }
+            // Restat: skip events that don't actually move (mtime, size).
+            let now = match DiskMeta::read(&eb_path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if Some(now) == eb.disk_meta {
+                continue;
+            }
+            if eb.is_dirty() {
+                eb.external_change_pending = true;
+                if conflict_index.is_none() {
+                    conflict_index = Some(idx);
+                }
+            } else {
+                let mut tmp_msg = String::new();
+                if reload_from_disk(eb, highlighter, &mut tmp_msg) {
+                    *ex_message = format!("\"{}\" auto-reloaded from disk", eb_path.display());
+                } else {
+                    *ex_message = tmp_msg;
+                }
+            }
+        }
+    }
+    // Raise the conflict prompt last, only if nothing else is already
+    // queued — we don't want to stomp on a quit-confirm in progress.
+    if prompt.is_none() {
+        if let Some(idx) = conflict_index {
+            *prompt = Some(build_conflict_prompt(buffers, idx));
+        }
+    }
+}
+
+/// What the main loop should do after handling an `ExAction`. Quit
+/// commands can ask the loop to exit. Prompts are raised directly via
+/// the `prompt` out-param.
+enum AfterAction {
+    Continue,
+    Quit,
+}
+
+/// Handle a buffer-list-level Ex action. Loads/switches/lists buffers,
+/// runs saves, raises prompts for dirty closes, and signals quit-related
+/// transitions back to the main loop.
 fn dispatch_ex_action(
     action: ExAction,
     buffers: &mut Vec<EditorBuffer>,
     current: &mut usize,
     lsp_clients: &mut HashMap<&'static str, LspClient>,
     highlighter: &Highlighter,
+    watcher: Option<&mut FileWatcher>,
+    prompt: &mut Option<Prompt>,
     ex_message: &mut String,
-) {
+) -> AfterAction {
     match action {
         ExAction::OpenFile(path) => {
-            open_or_switch_to(buffers, current, &path, lsp_clients, highlighter, ex_message);
+            open_or_switch_to(
+                buffers,
+                current,
+                &path,
+                lsp_clients,
+                highlighter,
+                watcher,
+                ex_message,
+            );
+            AfterAction::Continue
         }
         ExAction::NextBuffer => {
             if buffers.len() > 1 {
                 *current = (*current + 1) % buffers.len();
             }
+            AfterAction::Continue
         }
         ExAction::PrevBuffer => {
             if buffers.len() > 1 {
                 *current = (*current + buffers.len() - 1) % buffers.len();
             }
+            AfterAction::Continue
         }
         ExAction::ListBuffers => {
             let parts: Vec<String> = buffers
@@ -1068,6 +1716,50 @@ fn dispatch_ex_action(
                 })
                 .collect();
             *ex_message = parts.join("  ");
+            AfterAction::Continue
+        }
+        ExAction::Save => {
+            save_current(&mut buffers[*current], false, ex_message);
+            AfterAction::Continue
+        }
+        ExAction::ForceSave => {
+            save_current(&mut buffers[*current], true, ex_message);
+            AfterAction::Continue
+        }
+        ExAction::SaveAndQuit => {
+            if !save_current(&mut buffers[*current], false, ex_message) {
+                return AfterAction::Continue;
+            }
+            // After saving, the active buffer is clean — close it. If
+            // that was the last buffer, exit the editor.
+            match attempt_close_current(buffers, current) {
+                CloseOutcome::Closed => AfterAction::Continue,
+                CloseOutcome::QuitEditor => AfterAction::Quit,
+                // Shouldn't happen: we just saved, so buffer is clean.
+                CloseOutcome::Prompt => AfterAction::Continue,
+            }
+        }
+        ExAction::Quit => match attempt_close_current(buffers, current) {
+            CloseOutcome::Closed => AfterAction::Continue,
+            CloseOutcome::QuitEditor => AfterAction::Quit,
+            CloseOutcome::Prompt => {
+                *prompt = Some(build_close_buffer_prompt(buffers, *current));
+                AfterAction::Continue
+            }
+        },
+        ExAction::ForceQuit => {
+            let was_last = buffers.len() <= 1;
+            let idx = *current;
+            close_buffer_at(buffers, current, idx);
+            if was_last {
+                AfterAction::Quit
+            } else {
+                AfterAction::Continue
+            }
+        }
+        ExAction::Reload => {
+            reload_from_disk(&mut buffers[*current], highlighter, ex_message);
+            AfterAction::Continue
         }
     }
 }
@@ -1130,13 +1822,32 @@ fn render_all(
     last_key: Option<&KeyEvent>,
     last_bytes: &[u8],
     lsp_clients: &HashMap<&'static str, LspClient>,
+    prompt: Option<&Prompt>,
 ) -> io::Result<()> {
     let cur = &buffers[current];
     let buffer_count = buffers.len();
-    let buffer_label = if buffer_count > 1 {
-        format!("[{}/{}] {}", current + 1, buffer_count, cur.display_name())
+    let dirty_marker = if cur.is_dirty() { " [+]" } else { "" };
+    let conflict_marker = if cur.external_change_pending {
+        " [disk!]"
     } else {
-        cur.display_name()
+        ""
+    };
+    let buffer_label = if buffer_count > 1 {
+        format!(
+            "[{}/{}] {}{}{}",
+            current + 1,
+            buffer_count,
+            cur.display_name(),
+            dirty_marker,
+            conflict_marker,
+        )
+    } else {
+        format!(
+            "{}{}{}",
+            cur.display_name(),
+            dirty_marker,
+            conflict_marker
+        )
     };
     let diagnostics: &[medit::lsp::Diagnostic] = match (cur.lang_id, cur.path.as_ref()) {
         (Some(lang), Some(p)) => match lsp::path_to_uri(p) {
@@ -1164,6 +1875,7 @@ fn render_all(
         last_key,
         last_bytes,
         diagnostics,
+        prompt,
     )
 }
 
@@ -1184,6 +1896,7 @@ fn render(
     last_key: Option<&KeyEvent>,
     last_bytes: &[u8],
     diagnostics: &[medit::lsp::Diagnostic],
+    prompt: Option<&Prompt>,
 ) -> io::Result<()> {
     screen.begin_frame();
     let cols = screen.cols;
@@ -1478,6 +2191,13 @@ fn render(
         format!("\x1b[7m{}\x1b[0m", padded)
     };
     screen.write_at(screen.rows, 1, &status_text);
+
+    // Modal prompt overlays everything else, including the diag popup
+    // and status bar. Drawn last so its bytes are the most recent in the
+    // frame and visually win.
+    if let Some(p) = prompt {
+        draw_prompt(screen, p, screen.rows, cols);
+    }
 
     let block_cursor = mode == Mode::Normal;
     screen.set_cursor_shape(block_cursor);

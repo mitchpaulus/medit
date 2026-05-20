@@ -10,3 +10,4 @@ pub mod input;
 pub mod lsp;
 pub mod theme;
 pub mod trace;
+pub mod watch;
