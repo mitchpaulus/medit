@@ -125,6 +125,7 @@ fn run_test_file(path: &Path) -> Result<(), String> {
                     &mut mode,
                     &mut pending_j,
                     &mut registers,
+                    None,
                     k,
                 );
             }

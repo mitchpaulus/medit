@@ -853,6 +853,7 @@ pub fn handle_insert(
     mode: &mut Mode,
     pending_j: &mut bool,
     registers: &mut Registers,
+    indent_for: Option<&dyn Fn(&[u8], usize) -> String>,
     k: KeyEvent,
 ) {
     if *pending_j {
@@ -874,7 +875,23 @@ pub fn handle_insert(
 
     match k.key {
         Key::Esc => exit_insert_mode_multi(buffer, sels, mode),
-        Key::Enter => insert_text_multi(buffer, sels, b"\n"),
+        Key::Enter => {
+            if let Some(f) = indent_for {
+                let bytes = collect_bytes(buffer);
+                let per_cursor: Vec<Vec<u8>> = sels
+                    .iter()
+                    .map(|s| {
+                        let mut v = Vec::with_capacity(1 + 8);
+                        v.push(b'\n');
+                        v.extend_from_slice(f(&bytes, s.head).as_bytes());
+                        v
+                    })
+                    .collect();
+                insert_text_per_cursor(buffer, sels, &per_cursor);
+            } else {
+                insert_text_multi(buffer, sels, b"\n");
+            }
+        }
         Key::Backspace => backspace_multi(buffer, sels),
         Key::Tab => insert_text_multi(buffer, sels, b"\t"),
         Key::Left | Key::Right | Key::Up | Key::Down | Key::Home | Key::End => {
@@ -971,6 +988,26 @@ fn insert_text_multi(buffer: &mut Buffer, sels: &mut Selections, text: &[u8]) {
         buffer.insert(sel.head, text);
         sel.head += text.len();
         shift += n;
+    }
+}
+
+/// Per-cursor variant: `per_cursor[i]` is the bytes to insert at selection `i`.
+/// Used for smart-indent Enter where each cursor's insertion (newline + leading
+/// whitespace) depends on its position in the pre-mutation buffer.
+fn insert_text_per_cursor(buffer: &mut Buffer, sels: &mut Selections, per_cursor: &[Vec<u8>]) {
+    let indices = sels.indices_by_position();
+    let mut shift: i64 = 0;
+    for &idx in &indices {
+        let text = &per_cursor[idx];
+        if text.is_empty() {
+            continue;
+        }
+        let sel = &mut sels.list[idx];
+        sel.anchor = (sel.anchor as i64 + shift).max(0) as usize;
+        sel.head = (sel.head as i64 + shift).max(0) as usize;
+        buffer.insert(sel.head, text);
+        sel.head += text.len();
+        shift += text.len() as i64;
     }
 }
 

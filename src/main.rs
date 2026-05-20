@@ -12,6 +12,7 @@ use medit::core::{
     snap_to_char_or_last, utf8_len,
 };
 use medit::highlight::{Highlighter, flatten_to_byte_scopes};
+use medit::indent::Indenter;
 use medit::input::{Event, Key, KeyEvent, Mods, Parser};
 use medit::lsp::{self, LspClient};
 use medit::theme::{self, ScopeId};
@@ -454,6 +455,7 @@ fn main() -> io::Result<()> {
         _ => Buffer::empty(),
     };
     let highlighter = Highlighter::new();
+    let indenter = Indenter::new();
     let mut buffers: Vec<EditorBuffer> = {
         let mut eb = EditorBuffer::new(initial_buffer, initial_path);
         reparse_and_highlight(&mut eb, &highlighter);
@@ -614,12 +616,23 @@ fn main() -> io::Result<()> {
                 }
                 Mode::Insert => {
                     let cur = &mut buffers[current];
+                    // Smart-indent closure: bracket-counting on the raw
+                    // bytes (no tree required), robust against in-progress
+                    // brackets the user hasn't closed yet.
+                    let indent_fn: Option<Box<dyn Fn(&[u8], usize) -> String>> =
+                        cur.lang_id.map(|lang| {
+                            let indenter = &indenter;
+                            Box::new(move |bytes: &[u8], pos: usize| {
+                                indenter.indent_for(lang, bytes, pos)
+                            }) as Box<dyn Fn(&[u8], usize) -> String>
+                        });
                     handle_insert(
                         &mut cur.buffer,
                         &mut cur.sels,
                         &mut mode,
                         &mut pending_j,
                         &mut registers,
+                        indent_fn.as_deref(),
                         k,
                     );
                 }
