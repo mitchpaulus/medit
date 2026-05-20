@@ -23,6 +23,27 @@ pub struct CursorSnapshot {
     pub desired_col: usize,
 }
 
+/// `(row, byte-column)` pair for tree-sitter incremental-parse edits. Column
+/// is bytes within the line, not display cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Point {
+    pub row: usize,
+    pub column: usize,
+}
+
+/// One mutation's worth of context for incremental tree-sitter parsing.
+/// Field-for-field compatible with `tree_sitter::InputEdit`; converted in
+/// the editor layer to keep this module free of the tree-sitter dep.
+#[derive(Debug, Clone, Copy)]
+pub struct Edit {
+    pub start_byte: usize,
+    pub old_end_byte: usize,
+    pub new_end_byte: usize,
+    pub start_position: Point,
+    pub old_end_position: Point,
+    pub new_end_position: Point,
+}
+
 #[derive(Clone)]
 struct UndoEntry {
     pieces: Vec<Piece>,
@@ -44,6 +65,14 @@ pub struct Buffer {
     /// downstream caches (notably the flat-bytes cache in the editor
     /// front-end) invalidate without re-comparing piece tables.
     version: u64,
+    /// `line_starts[k]` is the byte offset of the start of line `k`. Always
+    /// has `[0]` even for empty buffers. Maintained incrementally on every
+    /// mutation so position-lookup is O(log L) without a separate scan.
+    line_starts: Vec<usize>,
+    /// Mutations recorded since the last `drain_pending_edits` call. The
+    /// syntax-highlight layer drains these to feed `tree.edit` for
+    /// incremental tree-sitter reparsing.
+    pending_edits: Vec<Edit>,
 }
 
 impl Buffer {
@@ -56,6 +85,8 @@ impl Buffer {
             redo_stack: Vec::new(),
             pending_commit: None,
             version: 0,
+            line_starts: vec![0],
+            pending_edits: Vec::new(),
         }
     }
 
@@ -69,6 +100,12 @@ impl Buffer {
                 len: content.len(),
             }]
         };
+        let mut line_starts = vec![0];
+        for (i, &b) in content.iter().enumerate() {
+            if b == b'\n' {
+                line_starts.push(i + 1);
+            }
+        }
         Self {
             original: content,
             append: Vec::new(),
@@ -77,6 +114,8 @@ impl Buffer {
             redo_stack: Vec::new(),
             pending_commit: None,
             version: 0,
+            line_starts,
+            pending_edits: Vec::new(),
         }
     }
 
@@ -174,6 +213,8 @@ impl Buffer {
     /// so it can be saved on the redo stack.
     pub fn undo(&mut self, current_cursor: CursorSnapshot) -> Option<CursorSnapshot> {
         let entry = self.undo_stack.pop()?;
+        let old_len = self.len();
+        let old_end_pos = self.position_at(old_len);
         let current_pieces = std::mem::replace(&mut self.pieces, entry.pieces);
         self.redo_stack.push(UndoEntry {
             pieces: current_pieces,
@@ -181,12 +222,25 @@ impl Buffer {
         });
         self.pending_commit = None;
         self.version = self.version.wrapping_add(1);
+        self.rebuild_line_starts();
+        let new_len = self.len();
+        let new_end_pos = self.position_at(new_len);
+        self.pending_edits.push(Edit {
+            start_byte: 0,
+            old_end_byte: old_len,
+            new_end_byte: new_len,
+            start_position: Point::default(),
+            old_end_position: old_end_pos,
+            new_end_position: new_end_pos,
+        });
         Some(entry.cursor)
     }
 
     /// Re-apply the most recently undone commit. Returns the saved cursor.
     pub fn redo(&mut self, current_cursor: CursorSnapshot) -> Option<CursorSnapshot> {
         let entry = self.redo_stack.pop()?;
+        let old_len = self.len();
+        let old_end_pos = self.position_at(old_len);
         let current_pieces = std::mem::replace(&mut self.pieces, entry.pieces);
         self.undo_stack.push(UndoEntry {
             pieces: current_pieces,
@@ -194,6 +248,17 @@ impl Buffer {
         });
         self.pending_commit = None;
         self.version = self.version.wrapping_add(1);
+        self.rebuild_line_starts();
+        let new_len = self.len();
+        let new_end_pos = self.position_at(new_len);
+        self.pending_edits.push(Edit {
+            start_byte: 0,
+            old_end_byte: old_len,
+            new_end_byte: new_len,
+            start_position: Point::default(),
+            old_end_position: old_end_pos,
+            new_end_position: new_end_pos,
+        });
         Some(entry.cursor)
     }
 
@@ -204,14 +269,121 @@ impl Buffer {
         self.version
     }
 
+    /// `(row, byte-column)` of `offset` in the current buffer. Clamped to
+    /// `len()`. O(log L) via binary search over `line_starts`.
+    pub fn position_at(&self, offset: usize) -> Point {
+        let offset = offset.min(self.len());
+        let idx = match self.line_starts.binary_search(&offset) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+        let line_start = self.line_starts.get(idx).copied().unwrap_or(0);
+        Point {
+            row: idx,
+            column: offset - line_start,
+        }
+    }
+
+    /// Take ownership of the queued edits and clear the log. The
+    /// highlight layer drains these every reparse to feed `tree.edit`.
+    pub fn drain_pending_edits(&mut self) -> Vec<Edit> {
+        std::mem::take(&mut self.pending_edits)
+    }
+
+    /// Compute the position at `start_pos` plus `text`. Walks text once to
+    /// count newlines and locate the column after the last newline.
+    fn position_after_text(start_pos: Point, text: &[u8]) -> Point {
+        let nl_count = text.iter().filter(|&&b| b == b'\n').count();
+        if nl_count == 0 {
+            Point {
+                row: start_pos.row,
+                column: start_pos.column + text.len(),
+            }
+        } else {
+            let last_nl = text
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .expect("nl_count > 0");
+            Point {
+                row: start_pos.row + nl_count,
+                column: text.len() - last_nl - 1,
+            }
+        }
+    }
+
+    /// Splice newlines from `text` into `line_starts` for an insertion at
+    /// `offset`. Shifts existing entries beyond `offset` by `text.len()`.
+    fn update_line_starts_insert(&mut self, offset: usize, text: &[u8]) {
+        let split = self.line_starts.partition_point(|&s| s <= offset);
+        for s in self.line_starts.iter_mut().skip(split) {
+            *s += text.len();
+        }
+        let mut new_starts: Vec<usize> = Vec::new();
+        for (i, &b) in text.iter().enumerate() {
+            if b == b'\n' {
+                new_starts.push(offset + i + 1);
+            }
+        }
+        if !new_starts.is_empty() {
+            self.line_starts.splice(split..split, new_starts);
+        }
+    }
+
+    /// Remove line starts inside `(offset, end]` and shift entries past
+    /// `end` left by `end - offset`. Matches the semantics of `delete`.
+    fn update_line_starts_delete(&mut self, offset: usize, end: usize) {
+        let length = end - offset;
+        let remove_from = self.line_starts.partition_point(|&s| s <= offset);
+        let remove_to = self.line_starts.partition_point(|&s| s <= end);
+        if remove_from < remove_to {
+            self.line_starts.drain(remove_from..remove_to);
+        }
+        for s in self.line_starts.iter_mut().skip(remove_from) {
+            *s -= length;
+        }
+    }
+
+    /// Walk pieces once and rebuild `line_starts` from scratch. Called
+    /// from `undo`/`redo` where the piece-table is swapped wholesale.
+    fn rebuild_line_starts(&mut self) {
+        let pieces_copy = self.pieces.clone();
+        let mut new_starts = vec![0usize];
+        let mut acc = 0usize;
+        for p in &pieces_copy {
+            let slice = self.piece_slice(p);
+            for (i, &b) in slice.iter().enumerate() {
+                if b == b'\n' {
+                    new_starts.push(acc + i + 1);
+                }
+            }
+            acc += slice.len();
+        }
+        self.line_starts = new_starts;
+    }
+
     pub fn insert(&mut self, offset: usize, text: &[u8]) {
         if text.is_empty() {
             return;
         }
-        self.version = self.version.wrapping_add(1);
-        self.maybe_commit();
         let total = self.len();
         let offset = offset.min(total);
+
+        // Record the edit using pre-mutation positions.
+        let start_pos = self.position_at(offset);
+        let new_end_pos = Self::position_after_text(start_pos, text);
+        self.pending_edits.push(Edit {
+            start_byte: offset,
+            old_end_byte: offset,
+            new_end_byte: offset + text.len(),
+            start_position: start_pos,
+            old_end_position: start_pos,
+            new_end_position: new_end_pos,
+        });
+
+        self.version = self.version.wrapping_add(1);
+        self.maybe_commit();
+        self.update_line_starts_insert(offset, text);
+
         let start = self.append.len();
         self.append.extend_from_slice(text);
         let new_piece = Piece {
@@ -258,8 +430,24 @@ impl Buffer {
         if offset >= end {
             return;
         }
+
+        // Record the edit using pre-mutation positions (old_end_position
+        // references the layout before any bytes are removed).
+        let start_pos = self.position_at(offset);
+        let old_end_pos = self.position_at(end);
+        self.pending_edits.push(Edit {
+            start_byte: offset,
+            old_end_byte: end,
+            new_end_byte: offset,
+            start_position: start_pos,
+            old_end_position: old_end_pos,
+            new_end_position: start_pos,
+        });
+
         self.version = self.version.wrapping_add(1);
         self.maybe_commit();
+        self.update_line_starts_delete(offset, end);
+
         let mut remaining = end - offset;
         let (mut pi, po) = self.locate(offset);
 
@@ -406,5 +594,145 @@ mod tests {
         assert_eq!(collect(&b), b"abc");
         b.delete(1, 1);
         assert_eq!(collect(&b), b"ac");
+    }
+
+    /// Recompute line_starts from a freshly-collected byte view. Used by
+    /// tests to confirm the incrementally-maintained `line_starts` matches
+    /// what a from-scratch scan would produce.
+    fn expected_line_starts(content: &[u8]) -> Vec<usize> {
+        let mut v = vec![0usize];
+        for (i, &b) in content.iter().enumerate() {
+            if b == b'\n' {
+                v.push(i + 1);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn line_starts_initialized_from_bytes() {
+        let b = Buffer::from_bytes(b"abc\ndef\nghi".to_vec());
+        assert_eq!(b.line_starts, vec![0, 4, 8]);
+    }
+
+    #[test]
+    fn line_starts_after_insert_in_middle() {
+        let mut b = Buffer::from_bytes(b"abc\ndef".to_vec());
+        b.insert(2, b"X\nY");
+        // Buffer becomes "abX\nYc\ndef"; line_starts should be [0, 4, 7].
+        let bytes = collect(&b);
+        assert_eq!(bytes, b"abX\nYc\ndef");
+        assert_eq!(b.line_starts, expected_line_starts(&bytes));
+    }
+
+    #[test]
+    fn line_starts_after_insert_at_line_boundary() {
+        // Insert at the start of an existing line — the existing line_start
+        // must NOT shift, but new newlines in `text` still create entries.
+        let mut b = Buffer::from_bytes(b"abc\ndef".to_vec());
+        b.insert(4, b"X\n");
+        let bytes = collect(&b);
+        assert_eq!(bytes, b"abc\nX\ndef");
+        assert_eq!(b.line_starts, expected_line_starts(&bytes));
+    }
+
+    #[test]
+    fn line_starts_after_delete_spanning_newline() {
+        let mut b = Buffer::from_bytes(b"abcdef\nghi".to_vec());
+        b.delete(2, 5); // removes "cdef\n"
+        let bytes = collect(&b);
+        assert_eq!(bytes, b"abghi");
+        assert_eq!(b.line_starts, expected_line_starts(&bytes));
+    }
+
+    #[test]
+    fn line_starts_after_delete_multiple_lines() {
+        let mut b = Buffer::from_bytes(b"a\nb\nc\nd".to_vec());
+        b.delete(2, 2); // removes "b\n"
+        let bytes = collect(&b);
+        assert_eq!(bytes, b"a\nc\nd");
+        assert_eq!(b.line_starts, expected_line_starts(&bytes));
+    }
+
+    #[test]
+    fn position_at_returns_row_and_byte_column() {
+        let b = Buffer::from_bytes(b"abc\ndef\nghi".to_vec());
+        assert_eq!(b.position_at(0), Point { row: 0, column: 0 });
+        assert_eq!(b.position_at(2), Point { row: 0, column: 2 });
+        assert_eq!(b.position_at(4), Point { row: 1, column: 0 });
+        assert_eq!(b.position_at(6), Point { row: 1, column: 2 });
+        assert_eq!(b.position_at(10), Point { row: 2, column: 2 });
+        // Past-end clamps to the last position.
+        assert_eq!(b.position_at(999), Point { row: 2, column: 3 });
+    }
+
+    #[test]
+    fn insert_pushes_edit_with_correct_positions() {
+        let mut b = Buffer::from_bytes(b"abc\ndef".to_vec());
+        b.insert(5, b"X\nY"); // inserts after 'd'
+        let edits = b.drain_pending_edits();
+        assert_eq!(edits.len(), 1);
+        let e = edits[0];
+        assert_eq!(e.start_byte, 5);
+        assert_eq!(e.old_end_byte, 5);
+        assert_eq!(e.new_end_byte, 8);
+        assert_eq!(e.start_position, Point { row: 1, column: 1 });
+        assert_eq!(e.old_end_position, Point { row: 1, column: 1 });
+        // After insert: "abc\ndX\nYef" — new_end lands on second line, col 1.
+        assert_eq!(e.new_end_position, Point { row: 2, column: 1 });
+    }
+
+    #[test]
+    fn delete_pushes_edit_with_pre_mutation_old_end() {
+        let mut b = Buffer::from_bytes(b"abc\ndef\nghi".to_vec());
+        b.delete(2, 5); // removes "c\ndef" — crosses one newline
+        let edits = b.drain_pending_edits();
+        assert_eq!(edits.len(), 1);
+        let e = edits[0];
+        assert_eq!(e.start_byte, 2);
+        assert_eq!(e.old_end_byte, 7);
+        assert_eq!(e.new_end_byte, 2);
+        assert_eq!(e.start_position, Point { row: 0, column: 2 });
+        // old_end_position is measured against the PRE-edit layout.
+        assert_eq!(e.old_end_position, Point { row: 1, column: 3 });
+        assert_eq!(e.new_end_position, Point { row: 0, column: 2 });
+    }
+
+    #[test]
+    fn drain_pending_edits_empties_log() {
+        let mut b = Buffer::from_bytes(b"abc".to_vec());
+        b.insert(1, b"x");
+        b.delete(2, 1);
+        assert_eq!(b.drain_pending_edits().len(), 2);
+        assert!(b.drain_pending_edits().is_empty());
+    }
+
+    #[test]
+    fn undo_rebuilds_line_starts_and_logs_whole_buffer_edit() {
+        let mut b = Buffer::from_bytes(b"abc".to_vec());
+        let cur = CursorSnapshot {
+            anchor: 0,
+            head: 0,
+            desired_col: 1,
+        };
+        b.mark_commit_point(cur);
+        b.insert(3, b"\nXY");
+        // Drain the insert's edit log before undoing so we can isolate
+        // the edit produced by undo itself.
+        let _ = b.drain_pending_edits();
+        b.undo(CursorSnapshot {
+            anchor: 6,
+            head: 6,
+            desired_col: 1,
+        });
+        let bytes = collect(&b);
+        assert_eq!(bytes, b"abc");
+        assert_eq!(b.line_starts, expected_line_starts(&bytes));
+        let edits = b.drain_pending_edits();
+        assert_eq!(edits.len(), 1);
+        let e = edits[0];
+        assert_eq!(e.start_byte, 0);
+        assert_eq!(e.old_end_byte, 6);
+        assert_eq!(e.new_end_byte, 3);
     }
 }

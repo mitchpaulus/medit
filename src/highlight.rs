@@ -60,6 +60,10 @@ impl Highlighter {
         };
         h.register("go", unsafe { tree_sitter_go() }, include_str!("../grammars/go/queries/highlights.scm"));
         h.register("mshell", unsafe { tree_sitter_mshell() }, include_str!("../grammars/mshell/queries/highlights.scm"));
+        // Djot doubles as the markdown grammar for now — close enough that
+        // reading other-people's markdown stays useful. Split if it starts
+        // mis-parsing common constructs.
+        h.register("djot", unsafe { tree_sitter_djot() }, include_str!("../grammars/djot/queries/highlights.scm"));
         h
     }
 
@@ -92,6 +96,7 @@ impl Highlighter {
         Some(match ext {
             "go" => "go",
             "msh" | "mshell" => "mshell",
+            "dj" | "djot" | "md" | "markdown" => "djot",
             _ => return None,
         })
     }
@@ -145,6 +150,13 @@ impl Highlighter {
                     .get(cap.index as usize)
                     .copied()
                     .unwrap_or(ScopeId::Default);
+                // Default-scope spans contribute no color and would stomp
+                // on earlier real spans during flatten. Captures like
+                // `@spell`/`@nospell`/`@conceal`/`@none` in the djot grammar
+                // are structural advice for other tools; skip them.
+                if scope == ScopeId::Default {
+                    continue;
+                }
                 let range = cap.node.byte_range();
                 if range.start < range.end {
                     spans.push(HighlightSpan {
@@ -173,6 +185,7 @@ impl Default for Highlighter {
 unsafe extern "C" {
     fn tree_sitter_go() -> Language;
     fn tree_sitter_mshell() -> Language;
+    fn tree_sitter_djot() -> Language;
 }
 
 #[cfg(test)]
@@ -207,6 +220,90 @@ mod tests {
         assert_eq!(Highlighter::language_for_shebang(b"#!/bin/bash\n"), None);
         assert_eq!(Highlighter::language_for_shebang(b"hello world\n"), None);
         assert_eq!(Highlighter::language_for_shebang(b""), None);
+    }
+
+    #[test]
+    fn incremental_reparse_matches_fresh_parse() {
+        // After an edit, applying `tree.edit(&InputEdit)` to the old tree
+        // and reparsing must produce a tree structurally identical to a
+        // from-scratch parse of the new content. That's the load-bearing
+        // contract for incremental tree-sitter — verify it on a real
+        // grammar (go) with a non-trivial edit.
+        use crate::buffer::Buffer;
+        fn collect(buf: &Buffer) -> Vec<u8> {
+            let mut v = Vec::new();
+            for s in buf.slices() {
+                v.extend_from_slice(s);
+            }
+            v
+        }
+        let h = Highlighter::new();
+        let mut parser = h.parser_for("go").expect("go parser");
+
+        let mut buf = Buffer::from_bytes(b"package main\n\nfunc f() {}\n".to_vec());
+        let bytes_v1 = collect(&buf);
+        let tree_v1 = parser.parse(&bytes_v1, None).expect("v1 parse");
+
+        buf.insert(13, b"\nvar X = 1\n"); // insert a var decl mid-file
+        let edits = buf.drain_pending_edits();
+        let mut edited_tree = tree_v1.clone();
+        for e in &edits {
+            edited_tree.edit(&tree_sitter::InputEdit {
+                start_byte: e.start_byte,
+                old_end_byte: e.old_end_byte,
+                new_end_byte: e.new_end_byte,
+                start_position: tree_sitter::Point {
+                    row: e.start_position.row,
+                    column: e.start_position.column,
+                },
+                old_end_position: tree_sitter::Point {
+                    row: e.old_end_position.row,
+                    column: e.old_end_position.column,
+                },
+                new_end_position: tree_sitter::Point {
+                    row: e.new_end_position.row,
+                    column: e.new_end_position.column,
+                },
+            });
+        }
+        let bytes_v2 = collect(&buf);
+        let incremental = parser
+            .parse(&bytes_v2, Some(&edited_tree))
+            .expect("incremental parse");
+        let fresh = parser.parse(&bytes_v2, None).expect("fresh parse");
+
+        // Same S-expression = same tree shape.
+        assert_eq!(
+            incremental.root_node().to_sexp(),
+            fresh.root_node().to_sexp(),
+            "incremental and fresh parses diverged"
+        );
+    }
+
+    #[test]
+    fn djot_parses_and_highlights_a_heading() {
+        let h = Highlighter::new();
+        let mut parser = h.parser_for("djot").expect("djot parser");
+        let src = b"# Title\n\nSome text with `code`.\n";
+        let tree = parser.parse(src.as_slice(), None).expect("parse");
+        let spans = h.highlight("djot", &tree, src);
+        assert!(!spans.is_empty(), "expected at least one highlight span");
+        // `markup.heading` is routed to Keyword in theme.rs.
+        assert!(spans.iter().any(|s| s.scope == ScopeId::Keyword));
+        // `markup.raw` (inline code) is routed to String.
+        assert!(spans.iter().any(|s| s.scope == ScopeId::String));
+    }
+
+    #[test]
+    fn markdown_extensions_route_to_djot() {
+        assert_eq!(
+            Highlighter::language_for_path(std::path::Path::new("README.md")),
+            Some("djot")
+        );
+        assert_eq!(
+            Highlighter::language_for_path(std::path::Path::new("notes.dj")),
+            Some("djot")
+        );
     }
 
     #[test]

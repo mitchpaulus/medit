@@ -65,6 +65,10 @@ struct EditorBuffer {
     /// `byte_at_line_cached` index in O(1).
     line_starts: Vec<usize>,
     cached_version: Option<u64>,
+    /// `buffer.version()` that `tree`/`flat_scopes` were built from. When
+    /// the buffer moves past this, the highlight is stale and the next
+    /// frame re-parses.
+    highlight_version: Option<u64>,
     /// Last `buffer.version()` we sent to the LSP server (via didOpen or
     /// didChange). When the buffer moves past this and we're not in
     /// insert mode, fire a didChange to resync.
@@ -88,6 +92,7 @@ impl EditorBuffer {
             cached_bytes: Vec::new(),
             line_starts: vec![0],
             cached_version: None,
+            highlight_version: None,
             lsp_synced_version: None,
         }
     }
@@ -147,18 +152,35 @@ fn ensure_visible_indexed(
     }
 }
 
-/// Re-parse `eb` from scratch and rebuild its `flat_scopes`. Called after
-/// the buffer is loaded/replaced. Incremental updates (post-edit) are a
-/// separate, later step.
+/// Re-parse `eb` and rebuild its `flat_scopes`. Drains any pending edits
+/// from the buffer and applies them to the existing tree via `tree.edit`
+/// before calling `parser.parse(..., Some(&old_tree))`, so tree-sitter can
+/// reuse unchanged subtrees instead of reparsing the whole buffer. No-op
+/// when the buffer hasn't moved since the last call.
 fn reparse_and_highlight(eb: &mut EditorBuffer, hl: &Highlighter) {
     let lang_id = match eb.lang_id {
         Some(l) => l,
         None => return,
     };
+    let v = eb.buffer.version();
+    if eb.highlight_version == Some(v) {
+        // Even if we skip, swallow any edits the buffer may have queued so
+        // they don't accumulate against a stale tree later.
+        let _ = eb.buffer.drain_pending_edits();
+        return;
+    }
     let mut parser = match hl.parser_for(lang_id) {
         Some(p) => p,
         None => return,
     };
+
+    let edits = eb.buffer.drain_pending_edits();
+    if let Some(tree) = eb.tree.as_mut() {
+        for e in &edits {
+            tree.edit(&edit_to_ts(e));
+        }
+    }
+
     let bytes = collect_bytes(&eb.buffer);
     let tree = match parser.parse(&bytes, eb.tree.as_ref()) {
         Some(t) => t,
@@ -167,6 +189,27 @@ fn reparse_and_highlight(eb: &mut EditorBuffer, hl: &Highlighter) {
     let spans = hl.highlight(lang_id, &tree, &bytes);
     eb.flat_scopes = flatten_to_byte_scopes(&spans, bytes.len());
     eb.tree = Some(tree);
+    eb.highlight_version = Some(v);
+}
+
+fn edit_to_ts(e: &medit::buffer::Edit) -> tree_sitter::InputEdit {
+    tree_sitter::InputEdit {
+        start_byte: e.start_byte,
+        old_end_byte: e.old_end_byte,
+        new_end_byte: e.new_end_byte,
+        start_position: tree_sitter::Point {
+            row: e.start_position.row,
+            column: e.start_position.column,
+        },
+        old_end_position: tree_sitter::Point {
+            row: e.old_end_position.row,
+            column: e.old_end_position.column,
+        },
+        new_end_position: tree_sitter::Point {
+            row: e.new_end_position.row,
+            column: e.new_end_position.column,
+        },
+    }
 }
 
 /// Compute the SGR transition string needed to go from `(cur_fg, cur_bg)`
@@ -697,6 +740,9 @@ fn main() -> io::Result<()> {
             let viewport_rows = screen.rows.saturating_sub(1) as usize;
             let cur = &mut buffers[current];
             refresh_bytes_cache(cur);
+            // Re-parse + rebuild flat_scopes when the buffer has moved.
+            // Otherwise stale byte ranges land scopes on the wrong text.
+            reparse_and_highlight(cur, &highlighter);
             let head = cur.sels.primary().head;
             ensure_visible_indexed(&cur.line_starts, head, &mut cur.top_line, viewport_rows);
         }

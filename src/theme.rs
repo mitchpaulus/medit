@@ -62,6 +62,17 @@ fn exact_scope(name: &str) -> Option<ScopeId> {
         "variable" | "parameter" => ScopeId::Variable,
         "attribute" | "label" => ScopeId::Attribute,
         "tag" => ScopeId::Tag,
+        // Markup captures from the djot grammar (also used for .md files).
+        // Routed onto existing scopes so headings/links/code stand out
+        // without growing the ScopeId enum.
+        "markup.heading" => ScopeId::Keyword,
+        "markup.link.url" => ScopeId::Type,
+        "markup.link.label" | "markup.link" => ScopeId::Function,
+        "markup.raw" | "markup.raw.block" | "markup.math" => ScopeId::String,
+        "markup.quote" => ScopeId::Comment,
+        "markup.list" => ScopeId::Punctuation,
+        "markup.strong" => ScopeId::Constant,
+        "property" => ScopeId::Attribute,
         _ => return None,
     })
 }
