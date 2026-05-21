@@ -2392,15 +2392,29 @@ pub fn move_line_relative_cached(
     sel.anchor = new_head;
 }
 
+/// Minimum number of context lines kept above and below the cursor when
+/// scrolling. Vim's `scrolloff`. Degrades to `viewport_rows / 2 - 1` on
+/// viewports too small to honor it.
+pub const SCROLLOFF: usize = 10;
+
+/// Effective scrolloff for a given viewport — at most `SCROLLOFF`, never
+/// large enough to leave no room for the cursor itself.
+fn effective_scrolloff(viewport_rows: usize) -> usize {
+    SCROLLOFF.min(viewport_rows.saturating_sub(1) / 2)
+}
+
 pub fn ensure_visible(bytes: &[u8], head: usize, top_line: &mut usize, viewport_rows: usize) {
     if viewport_rows == 0 {
         return;
     }
     let head_line = line_index(bytes, head);
-    if head_line < *top_line {
-        *top_line = head_line;
-    } else if head_line >= top_line.saturating_add(viewport_rows) {
-        *top_line = head_line + 1 - viewport_rows;
+    let off = effective_scrolloff(viewport_rows);
+    let top_zone_end = top_line.saturating_add(off);
+    let bottom_zone_start = top_line.saturating_add(viewport_rows).saturating_sub(off);
+    if head_line < top_zone_end {
+        *top_line = head_line.saturating_sub(off);
+    } else if head_line >= bottom_zone_start {
+        *top_line = head_line + off + 1 - viewport_rows;
     }
 }
 
@@ -2474,5 +2488,64 @@ pub fn offset_at_col(bytes: &[u8], from: usize, target_col: usize) -> usize {
         last_char_start
     } else {
         i
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_buf(n_lines: usize) -> Vec<u8> {
+        let mut v = Vec::new();
+        for i in 0..n_lines {
+            v.extend_from_slice(format!("line {}\n", i).as_bytes());
+        }
+        v
+    }
+
+    fn line_offset(bytes: &[u8], line: usize) -> usize {
+        byte_at_line(bytes, line)
+    }
+
+    #[test]
+    fn scrolloff_keeps_cursor_off_bottom() {
+        // 50 lines, viewport of 24 rows. SCROLLOFF=10.
+        let buf = make_buf(50);
+        let viewport = 24;
+        let mut top = 0;
+        // Cursor exactly at viewport bottom-edge would be row 23 (line 23).
+        // With scrolloff=10, the cursor should never be in the bottom 10 rows
+        // (rows 14..23). Place head at line 14 → must scroll.
+        let head = line_offset(&buf, 14);
+        ensure_visible(&buf, head, &mut top, viewport);
+        // After scrolling, cursor (line 14) must be at most row 13.
+        let row = 14 - top;
+        assert!(row < viewport - SCROLLOFF, "row {} should be < {}", row, viewport - SCROLLOFF);
+    }
+
+    #[test]
+    fn scrolloff_keeps_cursor_off_top() {
+        let buf = make_buf(50);
+        let viewport = 24;
+        let mut top = 20;
+        // Cursor at line 25 → row 5 from top, inside the top scrolloff zone
+        // (rows 0..9). Must scroll up.
+        let head = line_offset(&buf, 25);
+        ensure_visible(&buf, head, &mut top, viewport);
+        let row = 25 - top;
+        assert!(row >= SCROLLOFF, "row {} should be >= {}", row, SCROLLOFF);
+    }
+
+    #[test]
+    fn scrolloff_degrades_on_tiny_viewports() {
+        // Viewport too small for SCROLLOFF. Effective scrolloff caps at
+        // (vp-1)/2 so the cursor still has somewhere to live.
+        let buf = make_buf(20);
+        let mut top = 0;
+        let head = line_offset(&buf, 5);
+        ensure_visible(&buf, head, &mut top, 3);
+        // Should not panic and should leave the cursor visible.
+        let row = 5 - top;
+        assert!(row < 3);
     }
 }

@@ -164,8 +164,9 @@ fn refresh_bytes_cache(eb: &mut EditorBuffer) {
     eb.cached_version = Some(v);
 }
 
-/// Cached counterpart to `core::ensure_visible`. Same semantics, but uses
-/// the cached line-starts index for O(log L) line lookup.
+/// Cached counterpart to `core::ensure_visible`. Same semantics
+/// (including `SCROLLOFF`), but uses the cached line-starts index for
+/// O(log L) line lookup.
 fn ensure_visible_indexed(
     line_starts: &[usize],
     head: usize,
@@ -176,10 +177,13 @@ fn ensure_visible_indexed(
         return;
     }
     let head_line = line_index_cached(line_starts, head);
-    if head_line < *top_line {
-        *top_line = head_line;
-    } else if head_line >= top_line.saturating_add(viewport_rows) {
-        *top_line = head_line + 1 - viewport_rows;
+    let off = medit::core::SCROLLOFF.min(viewport_rows.saturating_sub(1) / 2);
+    let top_zone_end = top_line.saturating_add(off);
+    let bottom_zone_start = top_line.saturating_add(viewport_rows).saturating_sub(off);
+    if head_line < top_zone_end {
+        *top_line = head_line.saturating_sub(off);
+    } else if head_line >= bottom_zone_start {
+        *top_line = head_line + off + 1 - viewport_rows;
     }
 }
 
