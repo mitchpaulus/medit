@@ -259,6 +259,27 @@ impl LspClient {
         Ok(parse_definition_result(&result))
     }
 
+    /// Send `textDocument/hover` and return the response text (joined
+    /// across all `MarkedString` items if the server returns an array).
+    /// Returns `Ok(None)` when the server reports no hover info at this
+    /// position.
+    pub fn hover(
+        &mut self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> io::Result<Option<String>> {
+        let id = self.request(
+            "textDocument/hover",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+            }),
+        )?;
+        let result = self.recv_response(id, Duration::from_secs(5))?;
+        Ok(parse_hover_result(&result))
+    }
+
     pub fn shutdown(&mut self) {
         let _ = self.request("shutdown", Value::Null);
         let _ = self.notify("exit", Value::Null);
@@ -313,6 +334,43 @@ fn parse_diagnostic(v: &Value) -> Option<Diagnostic> {
             .and_then(|s| s.as_str())
             .map(String::from),
     })
+}
+
+/// LSP `Hover.contents` is the most overloaded field in the spec:
+/// a plain string, a `{language, value}` object, a `MarkupContent` with
+/// `{kind, value}`, or an array of any of the above. Flatten to a single
+/// string, joining array items with a blank line.
+fn parse_hover_result(v: &Value) -> Option<String> {
+    if v.is_null() {
+        return None;
+    }
+    let contents = v.get("contents")?;
+    fn one(item: &Value) -> Option<String> {
+        if let Some(s) = item.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(obj) = item.as_object() {
+            if let Some(s) = obj.get("value").and_then(|v| v.as_str()) {
+                return Some(s.to_string());
+            }
+        }
+        None
+    }
+    let text = if let Some(arr) = contents.as_array() {
+        let parts: Vec<String> = arr.iter().filter_map(one).collect();
+        if parts.is_empty() {
+            return None;
+        }
+        parts.join("\n\n")
+    } else {
+        one(contents)?
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn parse_definition_result(v: &Value) -> Option<DefinitionLocation> {
@@ -438,4 +496,48 @@ pub fn path_to_uri(path: &Path) -> io::Result<String> {
 /// doesn't start with `file://`.
 pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     uri.strip_prefix("file://").map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_hover_markup_content() {
+        // What `ty server` returns.
+        let v = json!({
+            "contents": { "kind": "plaintext", "value": "def add(\n    a: int,\n    b: int\n) -> int" }
+        });
+        assert_eq!(
+            parse_hover_result(&v).as_deref(),
+            Some("def add(\n    a: int,\n    b: int\n) -> int")
+        );
+    }
+
+    #[test]
+    fn parse_hover_plain_string() {
+        let v = json!({"contents": "hello"});
+        assert_eq!(parse_hover_result(&v).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parse_hover_marked_string_array() {
+        let v = json!({
+            "contents": [
+                {"language": "go", "value": "func Add(a, b int) int"},
+                "Adds two ints."
+            ]
+        });
+        let s = parse_hover_result(&v).unwrap();
+        assert!(s.contains("func Add"));
+        assert!(s.contains("Adds two ints."));
+    }
+
+    #[test]
+    fn parse_hover_null_or_empty() {
+        assert_eq!(parse_hover_result(&json!(null)), None);
+        assert_eq!(parse_hover_result(&json!({"contents": ""})), None);
+        assert_eq!(parse_hover_result(&json!({})), None);
+    }
 }

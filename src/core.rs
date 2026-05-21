@@ -226,6 +226,7 @@ pub enum FindOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LspAction {
     GotoDefinition,
+    Hover,
     NextDiagnostic,
     PrevDiagnostic,
 }
@@ -569,6 +570,9 @@ pub fn handle_normal(
                 }
                 Key::Char('d') => {
                     *lsp_action = Some(LspAction::GotoDefinition);
+                }
+                Key::Char('h') => {
+                    *lsp_action = Some(LspAction::Hover);
                 }
                 _ => {}
             }

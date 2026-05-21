@@ -470,6 +470,151 @@ fn draw_prompt(screen: &mut Screen, prompt: &Prompt, rows: u16, cols: u16) {
     screen.write_at(top + box_h - 1, left, &bot_line);
 }
 
+/// LSP hover popup. Wraps `text` into lines, draws a bordered box near
+/// the cursor (below if there's room, above otherwise) with a cyan border
+/// so it visually parallels the diag popup without being mistaken for one.
+fn draw_hover_popup(
+    screen: &mut Screen,
+    text: &str,
+    cur_row: u16,
+    cur_col: u16,
+    gutter: u16,
+    cols: u16,
+    viewport_rows: u16,
+) {
+    const BORDER: &str = "\x1b[38;5;110m"; // pale cyan
+    let max_text: usize = (cols as usize).saturating_sub(6).max(20).min(80);
+    let lines = wrap_text(text, max_text, 16);
+    if lines.is_empty() {
+        return;
+    }
+    draw_box_at_cursor(
+        screen,
+        &lines,
+        cur_row,
+        cur_col,
+        gutter,
+        cols,
+        viewport_rows,
+        BORDER,
+    );
+}
+
+/// Word-wrap `text` to `max_text` columns. Caps at `max_rows` lines,
+/// trimming the last with an ellipsis. Returns one entry per visible line.
+fn wrap_text(text: &str, max_text: usize, max_rows: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for raw_line in text.lines() {
+        let mut remaining = raw_line.trim_end();
+        if remaining.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        while remaining.chars().count() > max_text {
+            let take = remaining
+                .char_indices()
+                .take(max_text)
+                .last()
+                .map(|(idx, ch)| idx + ch.len_utf8())
+                .unwrap_or(remaining.len());
+            let head_slice = &remaining[..take];
+            let split = head_slice.rfind(' ').map(|p| p + 1).unwrap_or(take);
+            lines.push(remaining[..split].trim_end().to_string());
+            remaining = remaining[split..].trim_start();
+            if remaining.is_empty() {
+                break;
+            }
+        }
+        if !remaining.is_empty() {
+            lines.push(remaining.to_string());
+        }
+    }
+    if lines.len() > max_rows {
+        lines.truncate(max_rows);
+        if let Some(last) = lines.last_mut() {
+            if last.chars().count() > max_text.saturating_sub(1) {
+                let cut = last
+                    .char_indices()
+                    .nth(max_text.saturating_sub(1))
+                    .map(|(i, _)| i)
+                    .unwrap_or(last.len());
+                last.truncate(cut);
+            }
+            last.push('…');
+        }
+    }
+    lines
+}
+
+/// Render a bordered box of `lines` anchored to the cursor. Prefers
+/// placing the box one row below the cursor; flips above if it would
+/// clip past the viewport. Used by both diag and hover popups.
+fn draw_box_at_cursor(
+    screen: &mut Screen,
+    lines: &[String],
+    cur_row: u16,
+    cur_col: u16,
+    gutter: u16,
+    cols: u16,
+    viewport_rows: u16,
+    border: &str,
+) {
+    let width_text = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let inner_w = width_text + 2;
+    let box_w = inner_w as u16 + 2;
+    let box_h = lines.len() as u16 + 2;
+
+    let mut top: u16 = cur_row.saturating_add(1);
+    if top + box_h - 1 > viewport_rows {
+        top = cur_row.saturating_sub(box_h);
+        if top == 0 {
+            top = 1;
+        }
+    }
+    let anchor_col = cur_col.saturating_add(gutter);
+    let mut left: u16 = anchor_col.saturating_sub(1).max(1);
+    if left + box_w - 1 > cols {
+        left = cols.saturating_sub(box_w - 1).max(1);
+    }
+
+    let mut top_line = String::with_capacity(box_w as usize * 3);
+    top_line.push_str(border);
+    top_line.push('┌');
+    for _ in 0..inner_w {
+        top_line.push('─');
+    }
+    top_line.push('┐');
+    top_line.push_str("\x1b[0m");
+    screen.write_at(top, left, &top_line);
+
+    for (i, line) in lines.iter().enumerate() {
+        let pad = inner_w - 1 - line.chars().count();
+        let mut row_str = String::with_capacity(box_w as usize * 3);
+        row_str.push_str(border);
+        row_str.push('│');
+        row_str.push_str("\x1b[0m");
+        row_str.push(' ');
+        row_str.push_str(line);
+        for _ in 0..pad {
+            row_str.push(' ');
+        }
+        row_str.push_str(border);
+        row_str.push('│');
+        row_str.push_str("\x1b[0m");
+        screen.write_at(top + 1 + i as u16, left, &row_str);
+    }
+
+    let mut bot_line = String::with_capacity(box_w as usize * 3);
+    bot_line.push_str(border);
+    bot_line.push('└');
+    for _ in 0..inner_w {
+        bot_line.push('─');
+    }
+    bot_line.push('┘');
+    bot_line.push_str("\x1b[0m");
+    screen.write_at(top + box_h - 1, left, &bot_line);
+}
+
 fn draw_diag_popup(
     screen: &mut Screen,
     d: &medit::lsp::Diagnostic,
@@ -672,6 +817,9 @@ fn main() -> io::Result<()> {
     // consumed by `handle_prompt` instead of being routed to the active
     // mode, and the prompt box overlays the editor view.
     let mut prompt: Option<Prompt> = None;
+    // LSP hover text to display in a popup near the cursor. Set by `gh`
+    // (and similar) and cleared on the next normal-mode keystroke.
+    let mut hover: Option<String> = None;
 
     // LSP. We spawn one server per language, on demand, the first time we
     // open a file of that language (initial buffer or via `:e`). All
@@ -701,6 +849,7 @@ fn main() -> io::Result<()> {
         &last_bytes,
         &lsp_clients,
         prompt.as_ref(),
+        hover.as_deref(),
     )?;
 
     let stdin = io::stdin();
@@ -731,6 +880,7 @@ fn main() -> io::Result<()> {
                 &last_bytes,
                 &lsp_clients,
                 prompt.as_ref(),
+                hover.as_deref(),
             )?;
         }
         let n = match handle.read(&mut io_buf) {
@@ -779,6 +929,9 @@ fn main() -> io::Result<()> {
             }
             if mode == Mode::Normal {
                 ex_message.clear();
+                // Hover popup is informational; dismiss on the next
+                // keystroke just like the status-bar message.
+                hover = None;
             }
             match mode {
                 Mode::Normal => {
@@ -843,6 +996,7 @@ fn main() -> io::Result<()> {
                             &mut current,
                             &highlighter,
                             watcher.as_mut(),
+                            &mut hover,
                             &mut ex_message,
                         );
                     }
@@ -953,6 +1107,7 @@ fn main() -> io::Result<()> {
             &last_bytes,
             &lsp_clients,
             prompt.as_ref(),
+            hover.as_deref(),
         )?;
         let render_ns = trace::toc(render_start);
         let total_ns = trace::toc(frame_start);
@@ -1053,6 +1208,7 @@ fn dispatch_lsp(
     current: &mut usize,
     highlighter: &Highlighter,
     watcher: Option<&mut FileWatcher>,
+    hover: &mut Option<String>,
     ex_message: &mut String,
 ) {
     let lang = match buffers[*current].lang_id {
@@ -1137,6 +1293,29 @@ fn dispatch_lsp(
             p.anchor = new_head;
             p.head = new_head;
             p.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+        }
+        LspAction::Hover => {
+            let (line, character) = {
+                let cur = &buffers[*current];
+                let bytes = collect_bytes(&cur.buffer);
+                let head = cur.sels.primary().head;
+                let line = line_index(&bytes, head) as u32;
+                let line_start_byte = byte_at_line(&bytes, line as usize);
+                let character = head.saturating_sub(line_start_byte) as u32;
+                (line, character)
+            };
+            let client = match clients.get_mut(lang) {
+                Some(c) => c,
+                None => {
+                    *ex_message = "no LSP server for this file".to_string();
+                    return;
+                }
+            };
+            match client.hover(&cur_uri, line, character) {
+                Ok(Some(text)) => *hover = Some(text),
+                Ok(None) => *ex_message = "no hover info".to_string(),
+                Err(e) => *ex_message = format!("LSP error: {}", e),
+            }
         }
         LspAction::NextDiagnostic | LspAction::PrevDiagnostic => {
             let client = match clients.get_mut(lang) {
@@ -1827,6 +2006,7 @@ fn render_all(
     last_bytes: &[u8],
     lsp_clients: &HashMap<&'static str, LspClient>,
     prompt: Option<&Prompt>,
+    hover: Option<&str>,
 ) -> io::Result<()> {
     let cur = &buffers[current];
     let buffer_count = buffers.len();
@@ -1880,6 +2060,7 @@ fn render_all(
         last_bytes,
         diagnostics,
         prompt,
+        hover,
     )
 }
 
@@ -1901,6 +2082,7 @@ fn render(
     last_bytes: &[u8],
     diagnostics: &[medit::lsp::Diagnostic],
     prompt: Option<&Prompt>,
+    hover: Option<&str>,
 ) -> io::Result<()> {
     screen.begin_frame();
     let cols = screen.cols;
@@ -2195,6 +2377,12 @@ fn render(
         format!("\x1b[7m{}\x1b[0m", padded)
     };
     screen.write_at(screen.rows, 1, &status_text);
+
+    // LSP hover popup, anchored near the cursor. Drawn before the modal
+    // prompt so a prompt (if active) still wins.
+    if let Some(text) = hover {
+        draw_hover_popup(screen, text, cur_row, cur_col, gutter, cols, viewport_rows);
+    }
 
     // Modal prompt overlays everything else, including the diag popup
     // and status bar. Drawn last so its bytes are the most recent in the
