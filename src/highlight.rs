@@ -340,6 +340,7 @@ unsafe extern "C" {
     fn tree_sitter_go() -> Language;
     fn tree_sitter_mshell() -> Language;
     fn tree_sitter_djot() -> Language;
+    fn tree_sitter_python() -> Language;
 }
 
 /// Single source of truth for every language the editor knows. To add a
@@ -378,6 +379,19 @@ static LANGS: &[LangSpec] = &[
         extensions: &["dj", "djot", "md", "markdown"],
         shebangs: &[],
         fence_names: &["djot", "markdown", "md"],
+        lsp: None,
+    },
+    LangSpec {
+        name: "python",
+        language: tree_sitter_python,
+        highlights: include_str!("../grammars/python/queries/highlights.scm"),
+        injections: None,
+        extensions: &["py", "pyw", "pyi"],
+        // `uv` is Astral's Python runner; covers `#!/usr/bin/env -S uv run
+        // --script` and direct `#!/usr/bin/uv ...` shebangs since the
+        // shebang parser only looks at the first non-flag word.
+        shebangs: &["python", "python3", "python2", "uv"],
+        fence_names: &["python", "py"],
         lsp: None,
     },
 ];
@@ -587,6 +601,83 @@ mod tests {
             Highlighter::language_for_path(std::path::Path::new("notes.dj")),
             Some("djot")
         );
+    }
+
+    #[test]
+    fn python_parses_and_highlights_a_keyword() {
+        let h = Highlighter::new();
+        let mut parser = h.parser_for("python").expect("python parser");
+        let src = b"def add(a, b):\n    return a + b\n";
+        let tree = parser.parse(src.as_slice(), None).expect("parse");
+        let spans = h.highlight("python", &tree, src);
+        assert!(!spans.is_empty(), "expected at least one highlight span");
+        let def_pos = src
+            .windows(3)
+            .position(|w| w == b"def")
+            .expect("find def");
+        let span = spans
+            .iter()
+            .find(|s| s.start == def_pos && s.end == def_pos + 3)
+            .expect("highlight span for `def` not found");
+        assert_eq!(span.scope, ScopeId::Keyword);
+    }
+
+    #[test]
+    fn python_extension_routes_to_python() {
+        assert_eq!(
+            Highlighter::language_for_path(std::path::Path::new("script.py")),
+            Some("python")
+        );
+    }
+
+    #[test]
+    fn python_shebang_routes_to_python() {
+        assert_eq!(
+            Highlighter::language_for_shebang(b"#!/usr/bin/env python3\n"),
+            Some("python")
+        );
+        assert_eq!(
+            Highlighter::language_for_shebang(b"#!/usr/bin/python\n"),
+            Some("python")
+        );
+    }
+
+    #[test]
+    fn uv_shebang_routes_to_python() {
+        // `uv run --script` (PEP 723 inline metadata) — the script's
+        // interpreter is `uv`, which we treat as Python.
+        assert_eq!(
+            Highlighter::language_for_shebang(b"#!/usr/bin/env -S uv run --script\n"),
+            Some("python")
+        );
+        // Plain `uv run`.
+        assert_eq!(
+            Highlighter::language_for_shebang(b"#!/usr/bin/env -S uv run\n"),
+            Some("python")
+        );
+        // Direct `uv` shebang without env.
+        assert_eq!(
+            Highlighter::language_for_shebang(b"#!/usr/bin/uv run --script\n"),
+            Some("python")
+        );
+    }
+
+    #[test]
+    fn djot_injects_python_into_fenced_code_block() {
+        // Verifies the registry-driven injection lookup picks up Python.
+        let h = Highlighter::new();
+        let mut parser = h.parser_for("djot").expect("djot parser");
+        let src = b"```python\ndef f(): pass\n```\n";
+        let tree = parser.parse(src.as_slice(), None).expect("parse");
+        let spans = h.highlight("djot", &tree, src);
+        let def_pos = src
+            .windows(3)
+            .position(|w| w == b"def")
+            .expect("find def");
+        let hit = spans
+            .iter()
+            .find(|s| s.start == def_pos && s.end == def_pos + 3 && s.scope == ScopeId::Keyword);
+        assert!(hit.is_some(), "expected injected Keyword span for python `def`");
     }
 
     #[test]
