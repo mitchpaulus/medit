@@ -392,7 +392,12 @@ static LANGS: &[LangSpec] = &[
         // shebang parser only looks at the first non-flag word.
         shebangs: &["python", "python3", "python2", "uv"],
         fence_names: &["python", "py"],
-        lsp: None,
+        // Run Astral's `ty` type-checker as the LSP via `uvx`, which
+        // resolves and caches the tool in an ephemeral env on first use
+        // and starts instantly thereafter. Requires `uv` on PATH; if
+        // it's not installed the spawn fails and the editor proceeds
+        // without LSP (highlighting still works).
+        lsp: Some(("uvx", &["ty", "server"])),
     },
 ];
 
