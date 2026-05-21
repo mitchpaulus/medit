@@ -70,6 +70,7 @@ fn run_test_file(path: &Path) -> Result<(), String> {
     let mut pending_bracket: Option<medit::core::BracketDir> = None;
     let mut pending_object: Option<ObjectKind> = None;
     let mut pending_lsp_action: Option<LspAction> = None;
+    let mut pending_jump_action: Option<medit::core::JumpAction> = None;
     let mut pending_ex_action: Option<ExAction> = None;
     let mut top_line: usize = 0;
     let mut search_input = String::new();
@@ -109,14 +110,17 @@ fn run_test_file(path: &Path) -> Result<(), String> {
                     &mut pending_bracket,
                     &mut search_state,
                     &mut pending_lsp_action,
+                    &mut pending_jump_action,
                     &mut top_line,
                     24,
                     &cached_bytes,
                     &line_starts,
                     k,
                 );
-                // LSP actions are not dispatched in tests (no server).
+                // LSP / jump actions are not dispatched in tests (no
+                // server, no buffer registry).
                 pending_lsp_action = None;
+                pending_jump_action = None;
             }
             Mode::Insert => {
                 handle_insert(

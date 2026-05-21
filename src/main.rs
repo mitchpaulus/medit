@@ -14,6 +14,7 @@ use medit::core::{
 use medit::highlight::{Highlighter, flatten_to_byte_scopes};
 use medit::indent::Indenter;
 use medit::input::{Event, Key, KeyEvent, Mods, Parser};
+use medit::jumps::{JumpEntry, JumpList};
 use medit::lsp::{self, LspClient};
 use medit::theme::{self, ScopeId};
 use medit::trace;
@@ -808,7 +809,9 @@ fn main() -> io::Result<()> {
     let mut pending_bracket: Option<medit::core::BracketDir> = None;
     let mut pending_object: Option<ObjectKind> = None;
     let mut pending_lsp_action: Option<LspAction> = None;
+    let mut pending_jump_action: Option<medit::core::JumpAction> = None;
     let mut pending_ex_action: Option<ExAction> = None;
+    let mut jumps = JumpList::new();
     let mut search_input = String::new();
     let mut search_state = SearchState::default();
     let mut last_key: Option<KeyEvent> = None;
@@ -963,6 +966,7 @@ fn main() -> io::Result<()> {
                         &mut pending_bracket,
                         &mut search_state,
                         &mut pending_lsp_action,
+                        &mut pending_jump_action,
                         top_line,
                         viewport_rows,
                         cached_bytes,
@@ -997,6 +1001,19 @@ fn main() -> io::Result<()> {
                             &highlighter,
                             watcher.as_mut(),
                             &mut hover,
+                            &mut jumps,
+                            &mut ex_message,
+                        );
+                    }
+                    if let Some(action) = pending_jump_action.take() {
+                        dispatch_jump(
+                            action,
+                            &mut jumps,
+                            &mut buffers,
+                            &mut current,
+                            &mut lsp_clients,
+                            &highlighter,
+                            watcher.as_mut(),
                             &mut ex_message,
                         );
                     }
@@ -1196,6 +1213,59 @@ fn maybe_start_lsp_and_open(
     }
 }
 
+/// Handle a queued `JumpAction`. Navigates to the target jump entry,
+/// opening or switching to its buffer as needed. The current location is
+/// captured first so a follow-up jump in the opposite direction returns
+/// here.
+fn dispatch_jump(
+    action: medit::core::JumpAction,
+    jumps: &mut JumpList,
+    buffers: &mut Vec<EditorBuffer>,
+    current: &mut usize,
+    lsp_clients: &mut HashMap<&'static str, LspClient>,
+    highlighter: &Highlighter,
+    watcher: Option<&mut FileWatcher>,
+    ex_message: &mut String,
+) {
+    let current_entry = buffers[*current].path.clone().map(|p| JumpEntry {
+        path: p,
+        offset: buffers[*current].sels.primary().head,
+    });
+    let target = match action {
+        medit::core::JumpAction::Back => jumps.back(current_entry),
+        medit::core::JumpAction::Forward => jumps.forward(current_entry),
+    };
+    let target = match target {
+        Some(t) => t,
+        None => {
+            *ex_message = match action {
+                medit::core::JumpAction::Back => "no earlier jumps".to_string(),
+                medit::core::JumpAction::Forward => "no later jumps".to_string(),
+            };
+            return;
+        }
+    };
+    if !open_or_switch_to(
+        buffers,
+        current,
+        &target.path,
+        lsp_clients,
+        highlighter,
+        watcher,
+        ex_message,
+    ) {
+        return;
+    }
+    let cur = &mut buffers[*current];
+    let bytes = collect_bytes(&cur.buffer);
+    let new_head = snap_to_char_or_last(&bytes, target.offset);
+    cur.sels.reduce_to_primary();
+    let p = cur.sels.primary_mut();
+    p.anchor = new_head;
+    p.head = new_head;
+    p.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+}
+
 /// Handle an `LspAction` queued by the modal layer. For goto-definition we
 /// send the request, then either:
 /// - Same-file result: jump the cursor in the current buffer.
@@ -1209,6 +1279,7 @@ fn dispatch_lsp(
     highlighter: &Highlighter,
     watcher: Option<&mut FileWatcher>,
     hover: &mut Option<String>,
+    jumps: &mut JumpList,
     ex_message: &mut String,
 ) {
     let lang = match buffers[*current].lang_id {
@@ -1260,6 +1331,15 @@ fn dispatch_lsp(
                     }
                 }
             };
+            // Record the pre-jump location so `Ctrl+O` can return here.
+            // Scratch buffers with no path can't be revisited; skip the
+            // record in that case rather than fabricating a fake path.
+            if let Some(p) = buffers[*current].path.clone() {
+                jumps.record(JumpEntry {
+                    path: p,
+                    offset: buffers[*current].sels.primary().head,
+                });
+            }
             // If the definition is in another file, open it (or switch to
             // an already-open buffer) before jumping the cursor.
             if loc.uri != cur_uri {

@@ -231,6 +231,14 @@ pub enum LspAction {
     PrevDiagnostic,
 }
 
+/// Out-of-band jump-list request from the modal layer. Dispatched in the
+/// main loop because it may need to open another buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JumpAction {
+    Back,
+    Forward,
+}
+
 /// `]` and `[` prefixes for jump-list-style navigation. Consume a follow-up
 /// key (`d` for diagnostics, future: `e`/`q`/...).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,6 +495,7 @@ pub fn handle_normal(
     pending_bracket: &mut Option<BracketDir>,
     search: &mut SearchState,
     lsp_action: &mut Option<LspAction>,
+    jump_action: &mut Option<JumpAction>,
     top_line: &mut usize,
     viewport_rows: usize,
     cached_bytes: &[u8],
@@ -629,6 +638,13 @@ pub fn handle_normal(
         for sel in sels.iter_mut() {
             move_line_relative_cached(bytes, line_starts, sel, -10);
         }
+        return false;
+    }
+
+    // Ctrl+O: jump back through the global jump list. Pops the most
+    // recent entry pushed by something like `gd` and navigates there.
+    if k.mods == Mods::CTRL && k.key == Key::Char('o') {
+        *jump_action = Some(JumpAction::Back);
         return false;
     }
 

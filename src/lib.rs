@@ -7,6 +7,7 @@ pub mod core;
 pub mod highlight;
 pub mod indent;
 pub mod input;
+pub mod jumps;
 pub mod lsp;
 pub mod theme;
 pub mod trace;
