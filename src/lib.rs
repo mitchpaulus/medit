@@ -3,6 +3,7 @@
 //! library directly via byte-level keystroke input.
 
 pub mod buffer;
+pub mod completion;
 pub mod core;
 pub mod highlight;
 pub mod indent;

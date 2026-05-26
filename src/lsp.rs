@@ -1,28 +1,32 @@
-//! Minimal LSP client. JSON-RPC 2.0 over stdio with a threaded reader and
-//! blocking request/response. Goto-definition is the only feature wired up
-//! for now; diagnostics, completion, etc. arrive later.
+//! LSP client. JSON-RPC 2.0 over stdio with a per-server reader thread
+//! that forwards parsed messages onto the editor's unified event channel.
+//! Hover, goto-definition, completion and diagnostics flow back through
+//! `LspEvent`s emitted from `handle_message`, which the main loop calls
+//! once per forwarded `Message`.
 //!
 //! Threading model:
 //! - The spawned server reads from its stdin and writes to its stdout.
-//! - We own one writer (the main thread writes requests/notifications via
-//!   `ChildStdin`).
-//! - A dedicated reader thread parses Content-Length-framed messages off
-//!   the child's stdout and forwards each as a `Message` over an mpsc
-//!   channel.
-//! - The main thread drains the channel synchronously when it needs a
-//!   response, discarding unrelated notifications in the meantime.
+//! - One reader thread per server parses `Content-Length`-framed messages
+//!   off the child's stdout and invokes the editor-supplied callback. The
+//!   editor's callback funnels each message into its main event loop.
+//! - The main thread owns the `LspClient` and the child stdin. Requests
+//!   are non-blocking writes; responses come back via the callback and
+//!   are resolved against an internal `pending` table that maps response
+//!   ids to the request kind that originated them.
+//! - The `initialize` handshake is the lone synchronous call: it happens
+//!   inline in `spawn` before the reader thread is started, so there is
+//!   no race between init-response delivery and the event-stream startup.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// A response or notification received from the LSP server.
+/// A raw response or notification received from the LSP server. Emitted
+/// by the reader thread; consumed by `LspClient::handle_message`.
 pub enum Message {
     Response {
         id: u64,
@@ -40,15 +44,35 @@ pub struct LspError {
     pub message: String,
 }
 
-pub struct LspClient {
-    child: Child,
-    stdin: ChildStdin,
-    next_id: u64,
-    rx: mpsc::Receiver<Message>,
-    /// Latest published diagnostics per document URI. Replaced wholesale
-    /// every time the server sends `textDocument/publishDiagnostics` for
-    /// that URI (LSP semantics: an empty array clears).
-    diagnostics: HashMap<String, Vec<Diagnostic>>,
+/// Editor-facing event produced when the client correlates a server
+/// message with a pending request (or processes a notification). The
+/// main loop matches on these and updates UI/buffer state.
+pub enum LspEvent {
+    Hover {
+        id: u64,
+        result: Result<Option<String>, LspError>,
+    },
+    Definition {
+        id: u64,
+        result: Result<Option<DefinitionLocation>, LspError>,
+    },
+    /// Completion responses carry the raw `result` payload. Parsing into
+    /// items is done by the completion module so it can read the exact
+    /// fields it needs (textEdit, insertText, isIncomplete, ...).
+    Completion {
+        id: u64,
+        result: Result<Value, LspError>,
+    },
+    DiagnosticsUpdated {
+        uri: String,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum PendingKind {
+    Hover,
+    Definition,
+    Completion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,8 +94,8 @@ pub struct Diagnostic {
     pub source: Option<String>,
 }
 
-/// Result of `textDocument/definition`. Always reduced to a single location
-/// — if the server returned an array, we pick the first.
+/// Result of `textDocument/definition`. Always reduced to a single
+/// location — if the server returned an array, we pick the first.
 #[derive(Debug, Clone)]
 pub struct DefinitionLocation {
     pub uri: String,
@@ -79,18 +103,64 @@ pub struct DefinitionLocation {
     pub character: u32,
 }
 
+/// Why a `textDocument/completion` request is being sent. Maps onto
+/// the LSP `CompletionTriggerKind` enum (1/2/3).
+#[derive(Debug, Clone, Copy)]
+pub enum CompletionTrigger {
+    /// Manually invoked (no trigger character). `triggerKind: 1`.
+    Invoked,
+    /// Triggered by typing one of the server-declared (or our
+    /// language-specific) trigger characters. `triggerKind: 2`.
+    Character(char),
+    /// Re-requesting because the previous response for this session
+    /// had `isIncomplete: true` and the user has typed more
+    /// characters. `triggerKind: 3`.
+    Incomplete,
+}
+
+pub struct LspClient {
+    child: Child,
+    stdin: ChildStdin,
+    next_id: u64,
+    /// Latest published diagnostics per document URI. Replaced wholesale
+    /// every time the server sends `textDocument/publishDiagnostics` for
+    /// that URI (LSP semantics: an empty array clears).
+    diagnostics: HashMap<String, Vec<Diagnostic>>,
+    /// Outstanding request ids → which kind of response we expect. Lets
+    /// `handle_message` translate raw responses into typed `LspEvent`s.
+    pending: HashMap<u64, PendingKind>,
+    /// Trigger characters reported by the server in its `initialize`
+    /// response under `capabilities.completionProvider.triggerCharacters`.
+    completion_trigger_chars: Vec<char>,
+}
+
 impl LspClient {
     /// Spawn `program` with `args` and complete the LSP
-    /// `initialize`/`initialized` handshake. `root_uri` is the `file://`
-    /// URI of the workspace root.
-    pub fn spawn(program: &str, args: &[&str], root_uri: &str) -> io::Result<Self> {
+    /// `initialize`/`initialized` handshake. The reader thread is started
+    /// *after* the handshake so the init response can be consumed
+    /// synchronously from the same buffered stdout reader the thread will
+    /// then own.
+    ///
+    /// `on_message` is invoked from the reader thread for every parsed
+    /// server message after init. The caller is expected to funnel those
+    /// messages back to the main loop (e.g. via an mpsc) and call
+    /// `handle_message` on this client to drive state updates.
+    pub fn spawn<F>(
+        program: &str,
+        args: &[&str],
+        root_uri: &str,
+        on_message: F,
+    ) -> io::Result<Self>
+    where
+        F: Fn(Message) + Send + 'static,
+    {
         let mut child = Command::new(program)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?;
-        let stdin = child
+        let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no child stdin"))?;
@@ -98,18 +168,9 @@ impl LspClient {
             .stdout
             .take()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no child stdout"))?;
+        let mut reader = BufReader::new(stdout);
 
-        let (tx, rx) = mpsc::channel::<Message>();
-        thread::spawn(move || reader_loop(stdout, tx));
-
-        let mut client = LspClient {
-            child,
-            stdin,
-            next_id: 1,
-            rx,
-            diagnostics: HashMap::new(),
-        };
-
+        let init_id: u64 = 1;
         let init_params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
@@ -119,20 +180,70 @@ impl LspClient {
                 "textDocument": {
                     "definition": { "linkSupport": true },
                     "synchronization": { "didSave": false },
-                    "publishDiagnostics": { "relatedInformation": false }
+                    "publishDiagnostics": { "relatedInformation": false },
+                    "completion": {
+                        "completionItem": { "snippetSupport": false }
+                    }
                 }
             },
             "clientInfo": { "name": "medit", "version": "0.1.0" }
         });
-        let id = client.request("initialize", init_params)?;
-        // Wait for the initialize response; gopls can take a few seconds on
-        // first run as it indexes the module.
-        let _init_result = client.recv_response(id, Duration::from_secs(15))?;
-        client.notify("initialized", json!({}))?;
-        Ok(client)
+        write_message(
+            &mut stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": init_id,
+                "method": "initialize",
+                "params": init_params,
+            }),
+        )?;
+        // Drive the init response inline. Notifications received during
+        // the handshake (rare; nothing has been opened yet) are discarded.
+        // No timeout: a server that never responds to initialize is fatal
+        // and the parent process will be killed on Drop anyway.
+        let init_result = loop {
+            match read_message(&mut reader)? {
+                Some(Message::Response { id, result }) if id == init_id => match result {
+                    Ok(v) => break v,
+                    Err(e) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("LSP init error: {}", e.message),
+                        ));
+                    }
+                },
+                Some(_) => continue,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "LSP closed during init",
+                    ));
+                }
+            }
+        };
+        let completion_trigger_chars = parse_completion_trigger_chars(&init_result);
+        write_message(
+            &mut stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "initialized",
+                "params": {},
+            }),
+        )?;
+
+        thread::spawn(move || reader_loop(reader, on_message));
+
+        Ok(LspClient {
+            child,
+            stdin,
+            next_id: init_id + 1,
+            diagnostics: HashMap::new(),
+            pending: HashMap::new(),
+            completion_trigger_chars,
+        })
     }
 
-    fn request(&mut self, method: &str, params: Value) -> io::Result<u64> {
+    fn write_request(&mut self, method: &str, params: Value) -> io::Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
         let msg = json!({
@@ -154,56 +265,40 @@ impl LspClient {
         write_message(&mut self.stdin, &msg)
     }
 
-    /// Block until the response to `id` arrives, processing any unrelated
-    /// notifications received along the way (so diagnostics published
-    /// between requests aren't lost). Returns the inner result or an IO
-    /// error if the server times out or disconnects.
-    fn recv_response(&mut self, id: u64, timeout: Duration) -> io::Result<Value> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "LSP timeout"));
-            }
-            let remaining = deadline - now;
-            match self.rx.recv_timeout(remaining) {
-                Ok(Message::Response { id: rid, result }) if rid == id => {
-                    return result.map_err(|e| {
-                        io::Error::new(io::ErrorKind::Other, format!("LSP error: {}", e.message))
-                    });
-                }
-                Ok(Message::Notification { method, params }) => {
-                    self.handle_notification(&method, &params);
-                }
-                Ok(Message::Response { .. }) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "LSP timeout"));
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "LSP disconnected"));
+    /// Process a server message forwarded from the reader thread. Returns
+    /// zero or more editor-facing events: a matched response produces
+    /// exactly one event, a `publishDiagnostics` notification produces one
+    /// event after updating the internal diagnostics cache, and any other
+    /// notification (or an unmatched response) is dropped.
+    pub fn handle_message(&mut self, msg: Message) -> Vec<LspEvent> {
+        let mut events = Vec::new();
+        match msg {
+            Message::Notification { method, params } => {
+                if method == "textDocument/publishDiagnostics" {
+                    if let Some((uri, diags)) = parse_publish_diagnostics(&params) {
+                        self.diagnostics.insert(uri.clone(), diags);
+                        events.push(LspEvent::DiagnosticsUpdated { uri });
+                    }
                 }
             }
-        }
-    }
-
-    /// Drain any pending notifications from the reader thread without
-    /// blocking. Updates the diagnostics cache as `publishDiagnostics`
-    /// notifications arrive. Stray responses (e.g. a stale definition
-    /// result) are dropped on the floor.
-    pub fn poll(&mut self) {
-        while let Ok(msg) = self.rx.try_recv() {
-            if let Message::Notification { method, params } = msg {
-                self.handle_notification(&method, &params);
+            Message::Response { id, result } => {
+                if let Some(kind) = self.pending.remove(&id) {
+                    let ev = match kind {
+                        PendingKind::Hover => LspEvent::Hover {
+                            id,
+                            result: result.map(|v| parse_hover_result(&v)),
+                        },
+                        PendingKind::Definition => LspEvent::Definition {
+                            id,
+                            result: result.map(|v| parse_definition_result(&v)),
+                        },
+                        PendingKind::Completion => LspEvent::Completion { id, result },
+                    };
+                    events.push(ev);
+                }
             }
         }
-    }
-
-    fn handle_notification(&mut self, method: &str, params: &Value) {
-        if method == "textDocument/publishDiagnostics" {
-            if let Some((uri, diags)) = parse_publish_diagnostics(params) {
-                self.diagnostics.insert(uri, diags);
-            }
-        }
+        events
     }
 
     /// Latest diagnostics published for `uri`, sorted by start position.
@@ -215,7 +310,7 @@ impl LspClient {
     }
 
     /// Send `textDocument/didChange` with full-text sync. Simple and
-    /// gopls-fast — re-runs the diagnostics pass against the new text.
+    /// fast — re-runs the diagnostics pass against the new text.
     /// `version` should monotonically increase per URI.
     pub fn did_change(&mut self, uri: &str, version: u64, text: &str) -> io::Result<()> {
         self.notify(
@@ -241,47 +336,85 @@ impl LspClient {
         )
     }
 
-    /// Send `textDocument/definition` and return the first location, if any.
-    pub fn definition(
+    /// Fire `textDocument/definition`. Returns the request id; the
+    /// response arrives later as `LspEvent::Definition` via
+    /// `handle_message`.
+    pub fn definition_async(
         &mut self,
         uri: &str,
         line: u32,
         character: u32,
-    ) -> io::Result<Option<DefinitionLocation>> {
-        let id = self.request(
+    ) -> io::Result<u64> {
+        let id = self.write_request(
             "textDocument/definition",
             json!({
                 "textDocument": { "uri": uri },
                 "position": { "line": line, "character": character },
             }),
         )?;
-        let result = self.recv_response(id, Duration::from_secs(5))?;
-        Ok(parse_definition_result(&result))
+        self.pending.insert(id, PendingKind::Definition);
+        Ok(id)
     }
 
-    /// Send `textDocument/hover` and return the response text (joined
-    /// across all `MarkedString` items if the server returns an array).
-    /// Returns `Ok(None)` when the server reports no hover info at this
-    /// position.
-    pub fn hover(
-        &mut self,
-        uri: &str,
-        line: u32,
-        character: u32,
-    ) -> io::Result<Option<String>> {
-        let id = self.request(
+    /// Fire `textDocument/hover`. Returns the request id; the response
+    /// arrives later as `LspEvent::Hover` via `handle_message`.
+    pub fn hover_async(&mut self, uri: &str, line: u32, character: u32) -> io::Result<u64> {
+        let id = self.write_request(
             "textDocument/hover",
             json!({
                 "textDocument": { "uri": uri },
                 "position": { "line": line, "character": character },
             }),
         )?;
-        let result = self.recv_response(id, Duration::from_secs(5))?;
-        Ok(parse_hover_result(&result))
+        self.pending.insert(id, PendingKind::Hover);
+        Ok(id)
+    }
+
+    /// Fire `textDocument/completion`. The `trigger` argument is sent
+    /// as the LSP `context` and chooses one of the three
+    /// `CompletionTriggerKind` values.
+    pub fn completion_async(
+        &mut self,
+        uri: &str,
+        line: u32,
+        character: u32,
+        trigger: CompletionTrigger,
+    ) -> io::Result<u64> {
+        let context = match trigger {
+            CompletionTrigger::Character(ch) => json!({
+                "triggerKind": 2,
+                "triggerCharacter": ch.to_string(),
+            }),
+            CompletionTrigger::Invoked => json!({ "triggerKind": 1 }),
+            // TriggerForIncompleteCompletions: the previous result for
+            // this session came back with `isIncomplete: true` and the
+            // user has typed more characters since.
+            CompletionTrigger::Incomplete => json!({ "triggerKind": 3 }),
+        };
+        let id = self.write_request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+                "context": context,
+            }),
+        )?;
+        self.pending.insert(id, PendingKind::Completion);
+        Ok(id)
+    }
+
+    /// True while at least one request is awaiting a response. Drives the
+    /// status-line spinner.
+    pub fn has_outstanding(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    pub fn completion_trigger_chars(&self) -> &[char] {
+        &self.completion_trigger_chars
     }
 
     pub fn shutdown(&mut self) {
-        let _ = self.request("shutdown", Value::Null);
+        let _ = self.write_request("shutdown", Value::Null);
         let _ = self.notify("exit", Value::Null);
         let _ = self.child.wait();
     }
@@ -290,7 +423,7 @@ impl LspClient {
 impl Drop for LspClient {
     fn drop(&mut self) {
         // Best-effort shutdown so child doesn't outlive the editor.
-        let _ = self.request("shutdown", Value::Null);
+        let _ = self.write_request("shutdown", Value::Null);
         let _ = self.notify("exit", Value::Null);
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -403,6 +536,21 @@ fn parse_definition_result(v: &Value) -> Option<DefinitionLocation> {
     })
 }
 
+fn parse_completion_trigger_chars(init_response: &Value) -> Vec<char> {
+    init_response
+        .get("capabilities")
+        .and_then(|c| c.get("completionProvider"))
+        .and_then(|cp| cp.get("triggerCharacters"))
+        .and_then(|tc| tc.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|s| s.chars().next())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn write_message(w: &mut ChildStdin, msg: &Value) -> io::Result<()> {
     let body = serde_json::to_vec(msg)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -411,15 +559,10 @@ fn write_message(w: &mut ChildStdin, msg: &Value) -> io::Result<()> {
     w.flush()
 }
 
-fn reader_loop(stdout: ChildStdout, tx: mpsc::Sender<Message>) {
-    let mut reader = BufReader::new(stdout);
+fn reader_loop<F: Fn(Message)>(mut reader: BufReader<ChildStdout>, on_message: F) {
     loop {
         match read_message(&mut reader) {
-            Ok(Some(msg)) => {
-                if tx.send(msg).is_err() {
-                    break;
-                }
-            }
+            Ok(Some(msg)) => on_message(msg),
             Ok(None) | Err(_) => break,
         }
     }
@@ -539,5 +682,23 @@ mod tests {
         assert_eq!(parse_hover_result(&json!(null)), None);
         assert_eq!(parse_hover_result(&json!({"contents": ""})), None);
         assert_eq!(parse_hover_result(&json!({})), None);
+    }
+
+    #[test]
+    fn parse_trigger_chars_basic() {
+        let v = json!({
+            "capabilities": {
+                "completionProvider": {
+                    "triggerCharacters": [".", ":"]
+                }
+            }
+        });
+        assert_eq!(parse_completion_trigger_chars(&v), vec!['.', ':']);
+    }
+
+    #[test]
+    fn parse_trigger_chars_missing() {
+        let v = json!({ "capabilities": {} });
+        assert!(parse_completion_trigger_chars(&v).is_empty());
     }
 }

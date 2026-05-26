@@ -3,6 +3,9 @@ mod term;
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use medit::buffer::Buffer;
 use medit::core::{
@@ -15,11 +18,181 @@ use medit::highlight::{Highlighter, flatten_to_byte_scopes};
 use medit::indent::Indenter;
 use medit::input::{Event, Key, KeyEvent, Mods, Parser};
 use medit::jumps::{JumpEntry, JumpList};
-use medit::lsp::{self, LspClient};
+use medit::lsp::{self, CompletionTrigger, LspClient, LspEvent, Message as LspMessage};
 use medit::theme::{self, ScopeId};
 use medit::trace;
 use medit::watch::{DiskMeta, FileWatcher};
 use term::{RawMode, Screen};
+
+/// Tagged message into the main loop. Every wake-up of the editor —
+/// keypress, terminal resize, LSP message, animation tick — arrives here
+/// so the loop has a single uniform `recv`.
+enum MainEvent {
+    /// One read-burst worth of stdin bytes.
+    Input(Vec<u8>),
+    /// SIGWINCH (Unix) or a console-size-poll change (Windows).
+    Resize,
+    /// A parsed LSP message tagged with the language id of the client
+    /// it came from. Funneled through `LspClient::handle_message` to
+    /// produce editor-facing events.
+    LspMessage(&'static str, LspMessage),
+    /// Periodic animation tick. Only consumed when something is animating
+    /// (currently: the LSP spinner).
+    Tick,
+}
+
+/// Per-outstanding-request metadata held by the editor. Lets us resolve
+/// an `LspEvent` back to the buffer/version/UI-state that originated the
+/// request, and drop the response if the buffer has moved on (edits)
+/// since then.
+struct RequestMeta {
+    /// Path of the buffer that originated the request. Used to find the
+    /// buffer at response time (buffer indices can shuffle).
+    buf_path: Option<PathBuf>,
+    /// `buffer.version()` at send time. Stale responses (different
+    /// version now) are dropped per the v1 design.
+    buffer_version: u64,
+    /// Goto-definition records a pre-jump location so `Ctrl+O` returns
+    /// here. We capture it at request time, not response time, because
+    /// the user may have already moved on by the time the reply arrives.
+    pre_jump: Option<JumpEntry>,
+}
+
+/// Per-language outstanding-request tables. Indexed first by language id
+/// (matching `lsp_clients`), then by request id.
+type Outstanding = HashMap<&'static str, HashMap<u64, RequestMeta>>;
+
+/// ASCII spinner glyphs, rotated through on each `MainEvent::Tick` while
+/// any LSP request is outstanding.
+const SPINNER: &[char] = &['|', '/', '-', '\\'];
+
+/// Time after the most recent qualifying keystroke before a queued
+/// completion request is actually sent. Picked to balance LSP traffic
+/// against perceived latency.
+const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(50);
+
+/// Editor-side completion state. Tracks the in-flight request id, the
+/// returned items, the current filter prefix, the highlighted item,
+/// and any pending (debounced) trigger waiting to fire.
+struct CompletionUi {
+    /// Latest in-flight request id; stale responses (id mismatch) are
+    /// dropped on arrival.
+    request_id: Option<u64>,
+    /// Byte offset where the replacement starts. Fixed at trigger time
+    /// — the suffix grows from `anchor` to the cursor as the user
+    /// types more characters.
+    anchor: usize,
+    /// Current `[anchor..cursor]` text used for client-side filtering.
+    /// Kept in sync with the buffer on every insert-mode keystroke.
+    prefix: String,
+    /// Items from the most recent matched response, already
+    /// `(sortText, label)`-sorted by `completion::parse_response`.
+    items: Vec<medit::completion::CompletionItem>,
+    /// Indices into `items` matching `prefix` (case-insensitive
+    /// prefix match). The popup walks `filtered` in order.
+    filtered: Vec<usize>,
+    /// Selected index within `filtered`.
+    selected: usize,
+    /// Server flagged the response as incomplete. v1 still uses
+    /// client-side filtering; we just record the flag for later
+    /// behavior.
+    is_incomplete: bool,
+    /// Debounced trigger waiting to fire. `None` when nothing is
+    /// queued (no recent trigger, or already fired).
+    pending: Option<PendingTrigger>,
+}
+
+struct PendingTrigger {
+    anchor: usize,
+    trigger: CompletionTrigger,
+    deadline: Instant,
+}
+
+impl CompletionUi {
+    fn new() -> Self {
+        Self {
+            request_id: None,
+            anchor: 0,
+            prefix: String::new(),
+            items: Vec::new(),
+            filtered: Vec::new(),
+            selected: 0,
+            is_incomplete: false,
+            pending: None,
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        !self.filtered.is_empty()
+    }
+
+    /// Clear all state — popup closes, in-flight request is forgotten
+    /// (its eventual response will be dropped on id mismatch).
+    fn close(&mut self) {
+        self.request_id = None;
+        self.items.clear();
+        self.filtered.clear();
+        self.selected = 0;
+        self.is_incomplete = false;
+        self.pending = None;
+        self.prefix.clear();
+    }
+}
+
+/// Spawn the thread that reads raw bytes from stdin in a loop and
+/// forwards each read-burst onto `tx` as `MainEvent::Input`. SIGWINCH
+/// interrupts the blocking read with `EINTR`; the thread also drains the
+/// resize flag set by `term::install_sigwinch_handler` so the resize
+/// becomes visible to the main loop promptly.
+fn spawn_stdin_thread(tx: mpsc::Sender<MainEvent>) {
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut handle = stdin.lock();
+        let mut io_buf = [0u8; 64];
+        loop {
+            // Drain a pending resize first; SIGWINCH may have set the
+            // flag while the previous read was returning.
+            if term::take_resize_flag() && tx.send(MainEvent::Resize).is_err() {
+                break;
+            }
+            match handle.read(&mut io_buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(MainEvent::Input(io_buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    // SIGWINCH or similar — loop to drain the flag and
+                    // retry the read.
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// Spawn the animation/heartbeat thread. Fires `MainEvent::Tick` every
+/// 100ms so the main loop can advance the LSP spinner during idle, and
+/// also forwards Windows-side resize-poll events (where SIGWINCH isn't
+/// available) by draining the same `take_resize_flag` state.
+fn spawn_tick_thread(tx: mpsc::Sender<MainEvent>) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_millis(100));
+            // On Windows the install_sigwinch_handler shim spawns a
+            // size-poll thread that flips the same flag. Drain it here
+            // so resize doesn't wait for the next keystroke.
+            if term::take_resize_flag() && tx.send(MainEvent::Resize).is_err() {
+                break;
+            }
+            if tx.send(MainEvent::Tick).is_err() {
+                break;
+            }
+        }
+    });
+}
 
 const SEL_BG: &str = "\x1b[48;5;24m";
 const MATCH_BG: &str = "\x1b[48;5;94m";
@@ -474,6 +647,178 @@ fn draw_prompt(screen: &mut Screen, prompt: &Prompt, rows: u16, cols: u16) {
 /// LSP hover popup. Wraps `text` into lines, draws a bordered box near
 /// the cursor (below if there's room, above otherwise) with a cyan border
 /// so it visually parallels the diag popup without being mistaken for one.
+/// Render the completion popup. Anchored at the *replacement-start*
+/// screen column (not the cursor), so as the user types more
+/// characters of the prefix the popup stays put. Shows up to 8 items
+/// with the selected row reverse-video-highlighted; flips above the
+/// cursor when the box would overflow the viewport.
+fn draw_completion_popup(
+    screen: &mut Screen,
+    comp: &CompletionUi,
+    bytes: &[u8],
+    line_starts: &[usize],
+    cursor_byte: usize,
+    cur_row: u16,
+    cur_col: u16,
+    gutter: u16,
+    cols: u16,
+    viewport_rows: u16,
+) {
+    const MAX_ROWS: usize = 8;
+    const BORDER: &str = "\x1b[38;5;139m"; // muted purple
+    const SEL: &str = "\x1b[7m"; // reverse video for the selected row
+
+    if comp.filtered.is_empty() {
+        return;
+    }
+
+    // Anchor the box at the byte where the completion replacement
+    // begins. On the normal "user typed into one line" path, anchor
+    // and cursor share a line and the column delta is just the
+    // visible width of the typed prefix.
+    let cursor_line = line_index_cached(line_starts, cursor_byte);
+    let anchor_line = line_index_cached(line_starts, comp.anchor);
+    let anchor_text_col = if anchor_line == cursor_line && comp.anchor <= cursor_byte {
+        let line_start = byte_at_line_cached(line_starts, cursor_line, bytes.len());
+        let cur_dc = display_col(bytes, line_start, cursor_byte);
+        let anch_dc = display_col(bytes, line_start, comp.anchor);
+        let delta: usize = cur_dc.saturating_sub(anch_dc);
+        cur_col.saturating_sub(delta as u16).max(1)
+    } else {
+        cur_col
+    };
+
+    let take = comp.filtered.len().min(MAX_ROWS);
+    // Scroll the visible window so the highlighted row is in view.
+    let last_window_start = comp.filtered.len().saturating_sub(take);
+    let win_start = comp
+        .selected
+        .saturating_sub(MAX_ROWS.saturating_sub(1))
+        .min(last_window_start);
+
+    // Compute text-area width: max of (label-width + 2 + detail-width)
+    // over visible rows, then clipped so the box fits in the terminal
+    // and labels stay readable.
+    let mut text_w: usize = 0;
+    for &i in comp.filtered[win_start..(win_start + take)].iter() {
+        let it = &comp.items[i];
+        let mut w = it.label.chars().count();
+        if let Some(d) = it.detail.as_deref() {
+            if !d.is_empty() {
+                w += 2 + d.chars().count();
+            }
+        }
+        text_w = text_w.max(w);
+    }
+    // Bound width: never exceed the terminal, and cap at 60 columns so
+    // long detail strings don't make the box absurd.
+    let max_text_w = (cols as usize).saturating_sub(6).min(60);
+    text_w = text_w.min(max_text_w).max(8);
+
+    let inner_w = text_w + 2; // one space pad on each side of text
+    let box_w: u16 = inner_w as u16 + 2; // plus the two vertical borders
+    let box_h: u16 = take as u16 + 2; // plus top/bottom borders
+
+    // Prefer below the cursor; flip above if it would clip past the
+    // last viewport row. `viewport_rows` is the count of buffer-content
+    // rows (the status row sits at `viewport_rows + 1`).
+    let mut top: u16 = cur_row.saturating_add(1);
+    if top + box_h - 1 > viewport_rows {
+        top = cur_row.saturating_sub(box_h);
+        if top == 0 {
+            top = 1;
+        }
+    }
+
+    let anchor_screen_col = anchor_text_col.saturating_add(gutter);
+    let mut left: u16 = anchor_screen_col.saturating_sub(1).max(1);
+    if box_w > 0 && left + box_w - 1 > cols {
+        left = cols.saturating_sub(box_w - 1).max(1);
+    }
+
+    // Top border.
+    let mut top_str = String::with_capacity(box_w as usize * 3);
+    top_str.push_str(BORDER);
+    top_str.push('┌');
+    for _ in 0..inner_w {
+        top_str.push('─');
+    }
+    top_str.push('┐');
+    top_str.push_str("\x1b[0m");
+    screen.write_at(top, left, &top_str);
+
+    // Body rows.
+    for k in 0..take {
+        let it = &comp.items[comp.filtered[win_start + k]];
+        let is_selected = (win_start + k) == comp.selected;
+        let label_chars = it.label.chars().count();
+        let detail_str = it
+            .detail
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("");
+        let detail_chars = detail_str.chars().count();
+        // Fit label + "  " + detail into text_w columns. If the
+        // combined width overflows, drop the detail and truncate
+        // the label.
+        let (lab, det) = if detail_chars > 0 && label_chars + 2 + detail_chars <= text_w {
+            (it.label.clone(), Some(detail_str.to_string()))
+        } else {
+            let truncated: String = it.label.chars().take(text_w).collect();
+            (truncated, None)
+        };
+
+        let mut row_str = String::with_capacity(box_w as usize * 4);
+        row_str.push_str(BORDER);
+        row_str.push('│');
+        row_str.push_str("\x1b[0m");
+        if is_selected {
+            row_str.push_str(SEL);
+        }
+        // Left inner pad.
+        row_str.push(' ');
+        // Body text: label, then (if room) two spaces and detail.
+        let mut written: usize = 0;
+        for ch in lab.chars() {
+            row_str.push(ch);
+            written += 1;
+        }
+        if let Some(d) = det.as_deref() {
+            row_str.push(' ');
+            row_str.push(' ');
+            written += 2;
+            for ch in d.chars() {
+                row_str.push(ch);
+                written += 1;
+            }
+        }
+        // Right pad up to text_w.
+        for _ in written..text_w {
+            row_str.push(' ');
+        }
+        // Right inner pad.
+        row_str.push(' ');
+        if is_selected {
+            row_str.push_str("\x1b[0m");
+        }
+        row_str.push_str(BORDER);
+        row_str.push('│');
+        row_str.push_str("\x1b[0m");
+        screen.write_at(top + 1 + k as u16, left, &row_str);
+    }
+
+    // Bottom border.
+    let mut bot_str = String::with_capacity(box_w as usize * 3);
+    bot_str.push_str(BORDER);
+    bot_str.push('└');
+    for _ in 0..inner_w {
+        bot_str.push('─');
+    }
+    bot_str.push('┘');
+    bot_str.push_str("\x1b[0m");
+    screen.write_at(top + box_h - 1, left, &bot_str);
+}
+
 fn draw_hover_popup(
     screen: &mut Screen,
     text: &str,
@@ -828,13 +1173,33 @@ fn main() -> io::Result<()> {
     // open a file of that language (initial buffer or via `:e`). All
     // buffers of a given language share the same client.
     let mut lsp_clients: HashMap<&'static str, LspClient> = HashMap::new();
-    if let Some(p) = buffers[0].path.clone() {
-        maybe_start_lsp_and_open(&mut lsp_clients, &p, &mut buffers[0]);
-    }
+    // Per-language table of in-flight requests. Indexed first by lang_id
+    // (matching `lsp_clients`), then by the LSP request id. Populated by
+    // `dispatch_lsp` and drained by `handle_lsp_event` as responses
+    // arrive.
+    let mut outstanding: Outstanding = HashMap::new();
+    // Spinner cursor — advanced once per `MainEvent::Tick` while at least
+    // one LSP request is outstanding.
+    let mut spinner_idx: usize = 0;
+    // Completion state for the current insert-mode session.
+    let mut comp = CompletionUi::new();
 
     let _raw = RawMode::enable()?;
     let mut screen = Screen::enter()?;
     term::install_sigwinch_handler()?;
+
+    // Unified event channel. All wake sources — stdin, SIGWINCH, LSP
+    // reader threads, animation ticks — funnel through this channel so
+    // the main loop has a single uniform `recv`.
+    let (main_tx, main_rx) = mpsc::channel::<MainEvent>();
+    spawn_stdin_thread(main_tx.clone());
+    spawn_tick_thread(main_tx.clone());
+
+    // LSP spawn happens after `main_tx` exists so the new client's reader
+    // thread can forward into the unified channel.
+    if let Some(p) = buffers[0].path.clone() {
+        maybe_start_lsp_and_open(&mut lsp_clients, &p, &mut buffers[0], &main_tx);
+    }
 
     // Populate cache before the first frame; subsequent frames refresh in
     // the main loop.
@@ -853,56 +1218,81 @@ fn main() -> io::Result<()> {
         &lsp_clients,
         prompt.as_ref(),
         hover.as_deref(),
+        None,
+        Some(&comp),
     )?;
 
-    let stdin = io::stdin();
-    let mut handle = stdin.lock();
-    let mut io_buf = [0u8; 64];
     let mut parser = Parser::new();
 
     loop {
-        if term::take_resize_flag() {
-            screen.refresh_size()?;
-            let viewport_rows = screen.rows.saturating_sub(1) as usize;
-            {
-                let cur = &mut buffers[current];
-                refresh_bytes_cache(cur);
-                let head = cur.sels.primary().head;
-                ensure_visible_indexed(&cur.line_starts, head, &mut cur.top_line, viewport_rows);
-            }
-            render_all(
-                &mut screen,
-                &buffers,
-                current,
-                mode,
-                &ex_input,
-                &search_input,
-                &search_state,
-                &ex_message,
-                last_key.as_ref(),
-                &last_bytes,
-                &lsp_clients,
-                prompt.as_ref(),
-                hover.as_deref(),
-            )?;
-        }
-        let n = match handle.read(&mut io_buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+        let event = match main_rx.recv() {
+            Ok(e) => e,
+            // All senders dropped — shouldn't happen unless every spawned
+            // thread has died, but treat as graceful exit.
+            Err(_) => break,
         };
-        // Frame timing starts after the blocking read so we don't measure
-        // input-wait latency.
         let frame_start = trace::tic();
         let handle_start = trace::tic();
-        last_bytes = io_buf[..n].to_vec();
-        parser.feed(&io_buf[..n]);
-        // After consuming all complete events from this read burst, fall back
-        // to `flush()` so a lone trailing ESC byte (Esc key in non-kitty
-        // terminals) resolves to `Key::Esc` instead of waiting indefinitely
-        // for a follow-up byte that never arrives.
-        while let Some(event) = parser.next_event().or_else(|| parser.flush()) {
+        let mut should_render = false;
+
+        match event {
+            MainEvent::Resize => {
+                screen.refresh_size()?;
+                let viewport_rows = screen.rows.saturating_sub(1) as usize;
+                {
+                    let cur = &mut buffers[current];
+                    refresh_bytes_cache(cur);
+                    let head = cur.sels.primary().head;
+                    ensure_visible_indexed(
+                        &cur.line_starts,
+                        head,
+                        &mut cur.top_line,
+                        viewport_rows,
+                    );
+                }
+                should_render = true;
+            }
+            MainEvent::LspMessage(lang, msg) => {
+                let events = if let Some(client) = lsp_clients.get_mut(lang) {
+                    client.handle_message(msg)
+                } else {
+                    Vec::new()
+                };
+                for ev in events {
+                    handle_lsp_event(
+                        lang,
+                        ev,
+                        &mut outstanding,
+                        &mut buffers,
+                        &mut current,
+                        &mut lsp_clients,
+                        &highlighter,
+                        watcher.as_mut(),
+                        &mut hover,
+                        &mut jumps,
+                        &mut ex_message,
+                        &mut comp,
+                        &main_tx,
+                    );
+                }
+                should_render = true;
+            }
+            MainEvent::Tick => {
+                let busy = lsp_clients.values().any(|c| c.has_outstanding());
+                if busy {
+                    spinner_idx = spinner_idx.wrapping_add(1);
+                    should_render = true;
+                }
+            }
+            MainEvent::Input(bytes) => {
+                last_bytes = bytes.clone();
+                parser.feed(&bytes);
+                // After consuming all complete events from this read
+                // burst, fall back to `flush()` so a lone trailing ESC
+                // byte (Esc key in non-kitty terminals) resolves to
+                // `Key::Esc` instead of waiting indefinitely for a
+                // follow-up byte that never arrives.
+                while let Some(event) = parser.next_event().or_else(|| parser.flush()) {
             let Event::Key(k) = event;
             last_key = Some(k);
             // Intercept any active prompt: the next keypress is consumed
@@ -998,10 +1388,7 @@ fn main() -> io::Result<()> {
                             &mut lsp_clients,
                             &mut buffers,
                             &mut current,
-                            &highlighter,
-                            watcher.as_mut(),
-                            &mut hover,
-                            &mut jumps,
+                            &mut outstanding,
                             &mut ex_message,
                         );
                     }
@@ -1015,11 +1402,37 @@ fn main() -> io::Result<()> {
                             &highlighter,
                             watcher.as_mut(),
                             &mut ex_message,
+                            &main_tx,
                         );
                     }
                 }
                 Mode::Insert => {
                     let cur = &mut buffers[current];
+                    // First: if the popup is showing, give it a shot
+                    // at consuming the key (Tab/Enter accept, C-n/C-p
+                    // and Up/Down navigate, Esc dismiss). Any of those
+                    // skip the normal insert-mode handler so the key
+                    // doesn't double-act (Tab inserting a tab after
+                    // accepting, Esc exiting insert after dismissing).
+                    match handle_completion_keys(&mut comp, cur, k) {
+                        CompletionKeyOutcome::NotIntercepted => {}
+                        CompletionKeyOutcome::InterceptedNoChange => {
+                            // Navigate/dismiss — buffer unchanged.
+                            // Re-running trigger detection here would
+                            // see the trigger char still in front of
+                            // the cursor and re-arm the debounce,
+                            // wiping the popup.
+                            continue;
+                        }
+                        CompletionKeyOutcome::InterceptedAccepted => {
+                            // Accept rewrote `[anchor..cursor]`.
+                            // Re-detect so a follow-up trigger
+                            // character at the end of the inserted
+                            // text (chained completions) still fires.
+                            update_completion_after_insert(&mut comp, &buffers[current]);
+                            continue;
+                        }
+                    }
                     // Smart-indent closure: bracket-counting on the raw
                     // bytes (no tree required), robust against in-progress
                     // brackets the user hasn't closed yet.
@@ -1039,6 +1452,14 @@ fn main() -> io::Result<()> {
                         indent_fn.as_deref(),
                         k,
                     );
+                    // After every insert-mode mutation: refilter any
+                    // open popup and arm/refresh the debounce if the
+                    // new buffer state matches a trigger. If the key
+                    // moved us out of insert mode (Esc, `jf`), the
+                    // post-loop `mode != Insert` close fires below.
+                    if mode == Mode::Insert {
+                        update_completion_after_insert(&mut comp, &buffers[current]);
+                    }
                 }
                 Mode::Ex => {
                     let path_owned = buffers[current].path.clone();
@@ -1061,6 +1482,7 @@ fn main() -> io::Result<()> {
                             watcher.as_mut(),
                             &mut prompt,
                             &mut ex_message,
+                            &main_tx,
                         ) {
                             AfterAction::Continue => {}
                             AfterAction::Quit => return Ok(()),
@@ -1080,53 +1502,89 @@ fn main() -> io::Result<()> {
                     );
                 }
             }
+                }
+                // After the input burst settles, if we're not actively
+                // typing in insert mode and the buffer has moved past
+                // what the LSP server last saw, push a didChange. Fires
+                // on Esc/`jf` out of insert mode and after any
+                // normal-mode mutation.
+                if mode != Mode::Insert {
+                    sync_lsp_if_dirty(&mut buffers[current], &mut lsp_clients);
+                    // Leaving insert mode closes any open completion
+                    // popup and abandons any queued (debounced) trigger.
+                    comp.close();
+                }
+                should_render = true;
+            }
         }
-        let handle_ns = trace::toc(handle_start);
-        // After the input burst settles, if we're not actively typing in
-        // insert mode and the buffer has moved past what the LSP server
-        // last saw, push a didChange. Fires on Esc/`jf` out of insert
-        // mode and after any normal-mode mutation.
-        if mode != Mode::Insert {
-            sync_lsp_if_dirty(&mut buffers[current], &mut lsp_clients);
-        }
-        // Drain anything each LSP reader thread has parked since the last
-        // wake (diagnostics, etc.) so they're visible in this frame.
-        for client in lsp_clients.values_mut() {
-            client.poll();
-        }
+
+        // Fire any pending completion request whose debounce has
+        // expired. Runs once per main-loop iteration (whether woken by
+        // Input, Tick, or LspMessage) so the 50ms debounce is honored
+        // up to the heartbeat granularity.
+        maybe_fire_completion(
+            &mut comp,
+            &mut buffers,
+            current,
+            &mut lsp_clients,
+            &mut outstanding,
+        );
+
         // Drain the filesystem watcher: clean buffers auto-reload from
         // disk, dirty buffers get marked with a pending conflict and
-        // raise a Conflict prompt.
+        // raise a Conflict prompt. Cheap when no events queued.
         if let Some(w) = watcher.as_ref() {
-            apply_watcher_events(w, &mut buffers, &highlighter, &mut prompt, &mut ex_message);
+            if apply_watcher_events(w, &mut buffers, &highlighter, &mut prompt, &mut ex_message)
+            {
+                should_render = true;
+            }
         }
-        let render_start = trace::tic();
-        {
-            let viewport_rows = screen.rows.saturating_sub(1) as usize;
-            let cur = &mut buffers[current];
-            refresh_bytes_cache(cur);
-            // Re-parse + rebuild flat_scopes when the buffer has moved.
-            // Otherwise stale byte ranges land scopes on the wrong text.
-            reparse_and_highlight(cur, &highlighter);
-            let head = cur.sels.primary().head;
-            ensure_visible_indexed(&cur.line_starts, head, &mut cur.top_line, viewport_rows);
-        }
-        render_all(
-            &mut screen,
-            &buffers,
-            current,
-            mode,
-            &ex_input,
-            &search_input,
-            &search_state,
-            &ex_message,
-            last_key.as_ref(),
-            &last_bytes,
-            &lsp_clients,
-            prompt.as_ref(),
-            hover.as_deref(),
-        )?;
-        let render_ns = trace::toc(render_start);
+
+        let handle_ns = trace::toc(handle_start);
+        let render_ns = if should_render {
+            let render_start = trace::tic();
+            {
+                let viewport_rows = screen.rows.saturating_sub(1) as usize;
+                let cur = &mut buffers[current];
+                refresh_bytes_cache(cur);
+                // Re-parse + rebuild flat_scopes when the buffer has
+                // moved. Otherwise stale byte ranges land scopes on the
+                // wrong text.
+                reparse_and_highlight(cur, &highlighter);
+                let head = cur.sels.primary().head;
+                ensure_visible_indexed(
+                    &cur.line_starts,
+                    head,
+                    &mut cur.top_line,
+                    viewport_rows,
+                );
+            }
+            let spinner_glyph = if lsp_clients.values().any(|c| c.has_outstanding()) {
+                Some(SPINNER[spinner_idx % SPINNER.len()])
+            } else {
+                None
+            };
+            render_all(
+                &mut screen,
+                &buffers,
+                current,
+                mode,
+                &ex_input,
+                &search_input,
+                &search_state,
+                &ex_message,
+                last_key.as_ref(),
+                &last_bytes,
+                &lsp_clients,
+                prompt.as_ref(),
+                hover.as_deref(),
+                spinner_glyph,
+                Some(&comp),
+            )?;
+            trace::toc(render_start)
+        } else {
+            0
+        };
         let total_ns = trace::toc(frame_start);
         trace::emit_frame(
             total_ns,
@@ -1179,10 +1637,15 @@ fn sync_lsp_if_dirty(eb: &mut EditorBuffer, clients: &mut HashMap<&'static str, 
 /// didOpen for its current buffer content. No-op if the language isn't
 /// recognized or if spawn fails. A separate server is spawned per language
 /// the first time a file of that language is opened.
+///
+/// The new client's reader thread forwards every server message into
+/// `main_tx` tagged with `lang_id`; the main loop dispatches each through
+/// `LspClient::handle_message`.
 fn maybe_start_lsp_and_open(
     lsp_clients: &mut HashMap<&'static str, LspClient>,
     path: &Path,
     eb: &mut EditorBuffer,
+    main_tx: &mpsc::Sender<MainEvent>,
 ) {
     let lang_id = match eb.lang_id {
         Some(l) => l,
@@ -1191,24 +1654,49 @@ fn maybe_start_lsp_and_open(
     if !lsp_clients.contains_key(lang_id) {
         let (program, args) = match Highlighter::lsp_command_for_lang(lang_id) {
             Some(c) => c,
-            None => return,
+            None => {
+                trace::note(&format!("lsp_spawn: no LSP configured for lang={}", lang_id));
+                return;
+            }
         };
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let root_uri = match lsp::path_to_uri(&cwd) {
             Ok(u) => u,
             Err(_) => return,
         };
-        match LspClient::spawn(program, args, &root_uri) {
+        let tx = main_tx.clone();
+        let forward = move |msg: LspMessage| {
+            // Sender returns Err only when main has exited; in that case
+            // the editor is tearing down and there's nothing useful to do.
+            let _ = tx.send(MainEvent::LspMessage(lang_id, msg));
+        };
+        match LspClient::spawn(program, args, &root_uri, forward) {
             Ok(c) => {
+                trace::note(&format!(
+                    "lsp_spawn: ok lang={} program={} trigger_chars={:?}",
+                    lang_id, program, c.completion_trigger_chars()
+                ));
                 lsp_clients.insert(lang_id, c);
             }
-            Err(_) => return,
+            Err(e) => {
+                trace::note(&format!(
+                    "lsp_spawn: failed lang={} program={} args={:?} err={}",
+                    lang_id, program, args, e
+                ));
+                return;
+            }
         }
     }
     if let (Some(client), Ok(uri)) = (lsp_clients.get_mut(lang_id), lsp::path_to_uri(path)) {
         let text = String::from_utf8_lossy(&collect_bytes(&eb.buffer)).into_owned();
-        if client.did_open(&uri, lang_id, &text).is_ok() {
-            eb.lsp_synced_version = Some(eb.buffer.version());
+        match client.did_open(&uri, lang_id, &text) {
+            Ok(()) => {
+                trace::note(&format!("lsp_open: lang={} uri={}", lang_id, uri));
+                eb.lsp_synced_version = Some(eb.buffer.version());
+            }
+            Err(e) => {
+                trace::note(&format!("lsp_open: failed lang={} err={}", lang_id, e));
+            }
         }
     }
 }
@@ -1226,6 +1714,7 @@ fn dispatch_jump(
     highlighter: &Highlighter,
     watcher: Option<&mut FileWatcher>,
     ex_message: &mut String,
+    main_tx: &mpsc::Sender<MainEvent>,
 ) {
     let current_entry = buffers[*current].path.clone().map(|p| JumpEntry {
         path: p,
@@ -1253,6 +1742,7 @@ fn dispatch_jump(
         highlighter,
         watcher,
         ex_message,
+        main_tx,
     ) {
         return;
     }
@@ -1266,20 +1756,18 @@ fn dispatch_jump(
     p.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
 }
 
-/// Handle an `LspAction` queued by the modal layer. For goto-definition we
-/// send the request, then either:
-/// - Same-file result: jump the cursor in the current buffer.
-/// - Cross-file result: open or switch to that file as a new buffer, then
-///   jump the cursor there.
+/// Handle an `LspAction` queued by the modal layer. Definition and hover
+/// fire async — `did_change` first to sync the server's view of the
+/// buffer, then `<kind>_async`. The response lands later as an
+/// `LspEvent` via the main loop and gets resolved in
+/// `handle_lsp_event`. Diagnostics navigation is fully local (cached
+/// diagnostics) so it stays synchronous here.
 fn dispatch_lsp(
     action: LspAction,
     clients: &mut HashMap<&'static str, LspClient>,
     buffers: &mut Vec<EditorBuffer>,
     current: &mut usize,
-    highlighter: &Highlighter,
-    watcher: Option<&mut FileWatcher>,
-    hover: &mut Option<String>,
-    jumps: &mut JumpList,
+    outstanding: &mut Outstanding,
     ex_message: &mut String,
 ) {
     let lang = match buffers[*current].lang_id {
@@ -1302,88 +1790,10 @@ fn dispatch_lsp(
     };
     match action {
         LspAction::GotoDefinition => {
-            let (line, character) = {
-                let cur = &buffers[*current];
-                let bytes = collect_bytes(&cur.buffer);
-                let head = cur.sels.primary().head;
-                let line = line_index(&bytes, head) as u32;
-                let line_start_byte = byte_at_line(&bytes, line as usize);
-                let character = head.saturating_sub(line_start_byte) as u32;
-                (line, character)
-            };
-            let loc = {
-                let client = match clients.get_mut(lang) {
-                    Some(c) => c,
-                    None => {
-                        *ex_message = "no LSP server for this file".to_string();
-                        return;
-                    }
-                };
-                match client.definition(&cur_uri, line, character) {
-                    Ok(Some(loc)) => loc,
-                    Ok(None) => {
-                        *ex_message = "no definition found".to_string();
-                        return;
-                    }
-                    Err(e) => {
-                        *ex_message = format!("LSP error: {}", e);
-                        return;
-                    }
-                }
-            };
-            // Record the pre-jump location so `Ctrl+O` can return here.
-            // Scratch buffers with no path can't be revisited; skip the
-            // record in that case rather than fabricating a fake path.
-            if let Some(p) = buffers[*current].path.clone() {
-                jumps.record(JumpEntry {
-                    path: p,
-                    offset: buffers[*current].sels.primary().head,
-                });
-            }
-            // If the definition is in another file, open it (or switch to
-            // an already-open buffer) before jumping the cursor.
-            if loc.uri != cur_uri {
-                let target_path = match lsp::uri_to_path(&loc.uri) {
-                    Some(p) => p,
-                    None => {
-                        *ex_message = format!("LSP: cannot parse target URI: {}", loc.uri);
-                        return;
-                    }
-                };
-                if !open_or_switch_to(
-                    buffers,
-                    current,
-                    &target_path,
-                    clients,
-                    highlighter,
-                    watcher,
-                    ex_message,
-                ) {
-                    return;
-                }
-            }
-            // Now buffers[current] is the target buffer; jump the cursor.
-            let cur = &mut buffers[*current];
-            let bytes = collect_bytes(&cur.buffer);
-            let target_line_start = byte_at_line(&bytes, loc.line as usize);
-            let target = target_line_start.saturating_add(loc.character as usize);
-            let new_head = snap_to_char_or_last(&bytes, target);
-            cur.sels.reduce_to_primary();
-            let p = cur.sels.primary_mut();
-            p.anchor = new_head;
-            p.head = new_head;
-            p.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
-        }
-        LspAction::Hover => {
-            let (line, character) = {
-                let cur = &buffers[*current];
-                let bytes = collect_bytes(&cur.buffer);
-                let head = cur.sels.primary().head;
-                let line = line_index(&bytes, head) as u32;
-                let line_start_byte = byte_at_line(&bytes, line as usize);
-                let character = head.saturating_sub(line_start_byte) as u32;
-                (line, character)
-            };
+            let (line, character) = cursor_line_col(&buffers[*current]);
+            // Sync the server first so its position lookup matches our
+            // current buffer state. Cheap if we're already in sync.
+            sync_lsp_if_dirty(&mut buffers[*current], clients);
             let client = match clients.get_mut(lang) {
                 Some(c) => c,
                 None => {
@@ -1391,11 +1801,50 @@ fn dispatch_lsp(
                     return;
                 }
             };
-            match client.hover(&cur_uri, line, character) {
-                Ok(Some(text)) => *hover = Some(text),
-                Ok(None) => *ex_message = "no hover info".to_string(),
-                Err(e) => *ex_message = format!("LSP error: {}", e),
-            }
+            let id = match client.definition_async(&cur_uri, line, character) {
+                Ok(id) => id,
+                Err(e) => {
+                    *ex_message = format!("LSP error: {}", e);
+                    return;
+                }
+            };
+            // Pre-jump location captured now (not at response time): the
+            // user's cursor at *invocation* is what `Ctrl+O` should
+            // return to, even if they keep moving around while waiting.
+            let pre_jump = buffers[*current].path.clone().map(|p| JumpEntry {
+                path: p,
+                offset: buffers[*current].sels.primary().head,
+            });
+            let meta = RequestMeta {
+                buf_path: buffers[*current].path.clone(),
+                buffer_version: buffers[*current].buffer.version(),
+                pre_jump,
+            };
+            outstanding.entry(lang).or_default().insert(id, meta);
+        }
+        LspAction::Hover => {
+            let (line, character) = cursor_line_col(&buffers[*current]);
+            sync_lsp_if_dirty(&mut buffers[*current], clients);
+            let client = match clients.get_mut(lang) {
+                Some(c) => c,
+                None => {
+                    *ex_message = "no LSP server for this file".to_string();
+                    return;
+                }
+            };
+            let id = match client.hover_async(&cur_uri, line, character) {
+                Ok(id) => id,
+                Err(e) => {
+                    *ex_message = format!("LSP error: {}", e);
+                    return;
+                }
+            };
+            let meta = RequestMeta {
+                buf_path: buffers[*current].path.clone(),
+                buffer_version: buffers[*current].buffer.version(),
+                pre_jump: None,
+            };
+            outstanding.entry(lang).or_default().insert(id, meta);
         }
         LspAction::NextDiagnostic | LspAction::PrevDiagnostic => {
             let client = match clients.get_mut(lang) {
@@ -1446,6 +1895,510 @@ fn dispatch_lsp(
             p.anchor = new_head;
             p.head = new_head;
             p.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+        }
+    }
+}
+
+/// What happened to an insert-mode keystroke after the completion
+/// layer looked at it.
+enum CompletionKeyOutcome {
+    /// Popup didn't claim the key; pass it through to `handle_insert`.
+    NotIntercepted,
+    /// Popup consumed the key but didn't mutate the buffer (navigate
+    /// or dismiss). The caller should NOT re-run trigger detection —
+    /// the surrounding bytes are unchanged, and re-detecting would
+    /// fire a new completion request and wipe the popup.
+    InterceptedNoChange,
+    /// Popup consumed the key by accepting an item, which mutated the
+    /// buffer. The caller should re-run trigger detection so a
+    /// follow-up trigger character in the inserted text (e.g.
+    /// `foo.` → re-fire on the trailing `.`) is honored.
+    InterceptedAccepted,
+}
+
+/// Try to handle an insert-mode keystroke as a completion-popup
+/// interaction.
+/// - Tab/Enter when the popup is showing accept the highlighted item.
+/// - Down/Up and Ctrl-N/Ctrl-P navigate the selection.
+/// - Esc with the popup showing closes the popup without exiting
+///   insert mode (the next Esc behaves normally).
+fn handle_completion_keys(
+    comp: &mut CompletionUi,
+    eb: &mut EditorBuffer,
+    k: KeyEvent,
+) -> CompletionKeyOutcome {
+    if !comp.is_visible() {
+        return CompletionKeyOutcome::NotIntercepted;
+    }
+    if k.mods.is_empty() && (k.key == Key::Tab || k.key == Key::Enter) {
+        accept_completion(comp, eb);
+        return CompletionKeyOutcome::InterceptedAccepted;
+    }
+    let nav_next = (k.mods.is_empty() && k.key == Key::Down)
+        || (k.mods.contains(Mods::CTRL) && k.key == Key::Char('n'));
+    let nav_prev = (k.mods.is_empty() && k.key == Key::Up)
+        || (k.mods.contains(Mods::CTRL) && k.key == Key::Char('p'));
+    if nav_next {
+        if !comp.filtered.is_empty() {
+            comp.selected = (comp.selected + 1) % comp.filtered.len();
+        }
+        return CompletionKeyOutcome::InterceptedNoChange;
+    }
+    if nav_prev {
+        if !comp.filtered.is_empty() {
+            let n = comp.filtered.len();
+            comp.selected = (comp.selected + n - 1) % n;
+        }
+        return CompletionKeyOutcome::InterceptedNoChange;
+    }
+    if k.key == Key::Esc {
+        comp.close();
+        return CompletionKeyOutcome::InterceptedNoChange;
+    }
+    CompletionKeyOutcome::NotIntercepted
+}
+
+/// Apply the highlighted completion item to the buffer: replace
+/// `[anchor..cursor]` with the item's `insert_text`, move the cursor
+/// to the end of the inserted text, and close the popup. No-op (just
+/// closes) if there's nothing selectable, multi-cursor is engaged, or
+/// the anchor is no longer in front of the cursor.
+fn accept_completion(comp: &mut CompletionUi, eb: &mut EditorBuffer) {
+    let item_idx = match comp.filtered.get(comp.selected) {
+        Some(&i) => i,
+        None => {
+            comp.close();
+            return;
+        }
+    };
+    let insert_text = comp.items[item_idx].insert_text.clone();
+    if eb.sels.len() > 1 {
+        comp.close();
+        return;
+    }
+    let cursor = eb.sels.primary().head;
+    if comp.anchor > cursor {
+        comp.close();
+        return;
+    }
+    let range_len = cursor - comp.anchor;
+    if range_len > 0 {
+        eb.buffer.delete(comp.anchor, range_len);
+    }
+    eb.buffer.insert(comp.anchor, insert_text.as_bytes());
+    let new_head = comp.anchor + insert_text.len();
+    let bytes = collect_bytes(&eb.buffer);
+    let p = eb.sels.primary_mut();
+    p.head = new_head;
+    p.anchor = new_head;
+    p.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+    comp.close();
+}
+
+/// Recompute completion state after an insert-mode mutation. Refilters
+/// the popup against the new prefix if one is open, and arms a
+/// debounced completion request if the keystroke landed on a trigger
+/// (per the language's `CompletionTriggers`). Closes the popup when
+/// multi-cursor is engaged, when the language doesn't have completion
+/// rules, or when the cursor moved out of `[anchor..]`.
+fn update_completion_after_insert(comp: &mut CompletionUi, eb: &EditorBuffer) {
+    if eb.sels.len() > 1 {
+        trace::note("update_completion: skip (multi-cursor)");
+        comp.close();
+        return;
+    }
+    let lang = match eb.lang_id {
+        Some(l) => l,
+        None => {
+            trace::note("update_completion: skip (no lang_id)");
+            comp.close();
+            return;
+        }
+    };
+    let triggers = match medit::completion::triggers_for(lang) {
+        Some(t) => t,
+        None => {
+            trace::note(&format!("update_completion: skip (no triggers for lang={})", lang));
+            comp.close();
+            return;
+        }
+    };
+    let cursor = eb.sels.primary().head;
+    let bytes = collect_bytes(&eb.buffer);
+
+    // Refilter the existing popup against the new prefix. If the
+    // cursor moved out of the replacement range (e.g. backspace past
+    // the anchor, or the cursor jumped) close the popup. When the
+    // most recent server response was flagged `isIncomplete`, keep
+    // the session open even if the filter empties — the upcoming
+    // re-request may bring matches for the extended prefix.
+    let mut session_alive = false;
+    if !comp.items.is_empty() {
+        if comp.anchor > cursor || cursor > bytes.len() {
+            comp.close();
+        } else {
+            comp.prefix = String::from_utf8_lossy(&bytes[comp.anchor..cursor]).into_owned();
+            comp.filtered = medit::completion::filter_items(&comp.items, &comp.prefix);
+            if comp.filtered.is_empty() && !comp.is_incomplete {
+                comp.close();
+            } else {
+                comp.selected = 0;
+                session_alive = true;
+            }
+        }
+    }
+
+    // Trigger detection wins over an incomplete refresh: a fresh
+    // trigger (`.` or `@` or a new identifier boundary) starts a new
+    // session, replacing the anchor/trigger kind.
+    let decision = medit::completion::detect(&bytes, cursor, &triggers);
+    if let medit::completion::TriggerDecision::Trigger {
+        anchor,
+        trigger_char,
+        ..
+    } = decision
+    {
+        let trigger = match trigger_char {
+            Some(ch) => CompletionTrigger::Character(ch),
+            None => CompletionTrigger::Invoked,
+        };
+        trace::note(&format!(
+            "update_completion: trigger fired lang={} anchor={} cursor={} kind={:?}",
+            lang, anchor, cursor, trigger,
+        ));
+        comp.pending = Some(PendingTrigger {
+            anchor,
+            trigger,
+            deadline: Instant::now() + COMPLETION_DEBOUNCE,
+        });
+        return;
+    }
+
+    // No fresh trigger. If the popup session is still alive and the
+    // server flagged the previous result as `isIncomplete`, arm a
+    // re-request with `CompletionTrigger::Incomplete`. The 50ms
+    // debounce naturally collapses bursts of keystrokes into one
+    // request.
+    if session_alive && comp.is_incomplete && comp.anchor <= cursor {
+        comp.pending = Some(PendingTrigger {
+            anchor: comp.anchor,
+            trigger: CompletionTrigger::Incomplete,
+            deadline: Instant::now() + COMPLETION_DEBOUNCE,
+        });
+    }
+}
+
+/// Fire any pending completion request whose debounce window has
+/// elapsed. Called once per main-loop iteration. Sends `did_change`
+/// first so the server's position lookup matches the editor's view.
+fn maybe_fire_completion(
+    comp: &mut CompletionUi,
+    buffers: &mut [EditorBuffer],
+    current: usize,
+    lsp_clients: &mut HashMap<&'static str, LspClient>,
+    outstanding: &mut Outstanding,
+) {
+    let ready = matches!(comp.pending.as_ref(), Some(p) if p.deadline <= Instant::now());
+    if !ready {
+        return;
+    }
+    let pending = comp.pending.take().unwrap();
+    let cur = &mut buffers[current];
+    // Re-check guards: the user may have changed something between
+    // arming and firing.
+    if cur.sels.len() > 1 {
+        trace::note("fire_completion: skip (multi-cursor)");
+        return;
+    }
+    let cursor = cur.sels.primary().head;
+    if pending.anchor > cursor {
+        // User deleted past the anchor while waiting; abandon.
+        trace::note("fire_completion: skip (cursor moved past anchor)");
+        return;
+    }
+    let lang = match cur.lang_id {
+        Some(l) => l,
+        None => {
+            trace::note("fire_completion: skip (no lang_id)");
+            return;
+        }
+    };
+    let cur_uri = match cur.path.as_ref().and_then(|p| lsp::path_to_uri(p).ok()) {
+        Some(u) => u,
+        None => {
+            trace::note("fire_completion: skip (no path/uri)");
+            return;
+        }
+    };
+    // Sync the server first — completion `position` would mean
+    // nothing if the document's content differs from what we have.
+    sync_lsp_if_dirty(cur, lsp_clients);
+    let client = match lsp_clients.get_mut(lang) {
+        Some(c) => c,
+        None => {
+            trace::note(&format!("fire_completion: skip (no LSP client for lang={})", lang));
+            return;
+        }
+    };
+    let bytes = collect_bytes(&cur.buffer);
+    let line = line_index(&bytes, cursor) as u32;
+    let line_start_byte = byte_at_line(&bytes, line as usize);
+    let character = cursor.saturating_sub(line_start_byte) as u32;
+    let id = match client.completion_async(&cur_uri, line, character, pending.trigger) {
+        Ok(id) => id,
+        Err(e) => {
+            trace::note(&format!("fire_completion: send failed: {}", e));
+            return;
+        }
+    };
+    trace::note(&format!(
+        "fire_completion: sent id={} lang={} line={} char={} trigger={:?}",
+        id, lang, line, character, pending.trigger,
+    ));
+    let meta = RequestMeta {
+        buf_path: cur.path.clone(),
+        buffer_version: cur.buffer.version(),
+        pre_jump: None,
+    };
+    outstanding.entry(lang).or_default().insert(id, meta);
+    // Mark this as the latest request; any earlier completion
+    // responses still in flight will be dropped on arrival.
+    comp.request_id = Some(id);
+    comp.anchor = pending.anchor;
+    // For new sessions (Character/Invoked), wipe stale items so the
+    // popup doesn't show last-session matches. For an Incomplete
+    // refresh, keep the current items visible until the new response
+    // replaces them — the user just keeps typing, no need to flicker.
+    let is_refresh = matches!(pending.trigger, CompletionTrigger::Incomplete);
+    if !is_refresh {
+        comp.items.clear();
+        comp.filtered.clear();
+        comp.selected = 0;
+    }
+}
+
+/// Resolve the buffer's primary-cursor head into LSP `(line, character)`
+/// coordinates. Both definition and hover request paths need this.
+fn cursor_line_col(eb: &EditorBuffer) -> (u32, u32) {
+    let bytes = collect_bytes(&eb.buffer);
+    let head = eb.sels.primary().head;
+    let line = line_index(&bytes, head) as u32;
+    let line_start_byte = byte_at_line(&bytes, line as usize);
+    let character = head.saturating_sub(line_start_byte) as u32;
+    (line, character)
+}
+
+/// Find a buffer by path. Returns its index in `buffers` or `None`.
+fn buffer_index_by_path(buffers: &[EditorBuffer], path: &Path) -> Option<usize> {
+    buffers.iter().position(|b| b.path.as_deref() == Some(path))
+}
+
+/// Apply an `LspEvent` produced by `LspClient::handle_message`. Looks up
+/// the originating buffer (by path), drops on edit-version mismatch,
+/// then updates editor state accordingly.
+fn handle_lsp_event(
+    lang: &'static str,
+    event: LspEvent,
+    outstanding: &mut Outstanding,
+    buffers: &mut Vec<EditorBuffer>,
+    current: &mut usize,
+    lsp_clients: &mut HashMap<&'static str, LspClient>,
+    highlighter: &Highlighter,
+    watcher: Option<&mut FileWatcher>,
+    hover: &mut Option<String>,
+    jumps: &mut JumpList,
+    ex_message: &mut String,
+    comp: &mut CompletionUi,
+    main_tx: &mpsc::Sender<MainEvent>,
+) {
+    let (id, take_meta): (u64, bool) = match &event {
+        LspEvent::Hover { id, .. } => (*id, true),
+        LspEvent::Definition { id, .. } => (*id, true),
+        LspEvent::Completion { id, .. } => (*id, true),
+        LspEvent::DiagnosticsUpdated { .. } => (0, false),
+    };
+    let meta = if take_meta {
+        outstanding.get_mut(lang).and_then(|m| m.remove(&id))
+    } else {
+        None
+    };
+
+    match event {
+        LspEvent::DiagnosticsUpdated { .. } => {
+            // The client already updated its internal cache. Re-render
+            // will pick it up; nothing else to do.
+        }
+        LspEvent::Hover { result, .. } => {
+            let meta = match meta {
+                Some(m) => m,
+                // Unknown id (already cancelled, or response for a
+                // request from a previous editor session). Drop.
+                None => return,
+            };
+            let idx = match meta.buf_path.as_deref().and_then(|p| buffer_index_by_path(buffers, p)) {
+                Some(i) => i,
+                // Buffer was closed before the response landed.
+                None => return,
+            };
+            if buffers[idx].buffer.version() != meta.buffer_version {
+                // User edited the buffer since the request was sent.
+                // The position the server resolved no longer maps to
+                // the same token; drop.
+                return;
+            }
+            match result {
+                Ok(Some(text)) => *hover = Some(text),
+                Ok(None) => *ex_message = "no hover info".to_string(),
+                Err(e) => *ex_message = format!("LSP error: {}", e.message),
+            }
+        }
+        LspEvent::Definition { result, .. } => {
+            let meta = match meta {
+                Some(m) => m,
+                None => return,
+            };
+            let idx = match meta.buf_path.as_deref().and_then(|p| buffer_index_by_path(buffers, p)) {
+                Some(i) => i,
+                None => return,
+            };
+            if buffers[idx].buffer.version() != meta.buffer_version {
+                return;
+            }
+            let loc = match result {
+                Ok(Some(loc)) => loc,
+                Ok(None) => {
+                    *ex_message = "no definition found".to_string();
+                    return;
+                }
+                Err(e) => {
+                    *ex_message = format!("LSP error: {}", e.message);
+                    return;
+                }
+            };
+            // Switch to the buffer that originated the request before
+            // jumping — if the user moved to a different buffer while
+            // waiting, jumping in the current one would be confusing.
+            *current = idx;
+            if let Some(pj) = meta.pre_jump {
+                jumps.record(pj);
+            }
+            // Decide whether the result is in a different file. We
+            // re-derive the originating uri rather than threading it
+            // through meta — it'd be wrong if the buffer was renamed.
+            let cur_uri = buffers[*current]
+                .path
+                .as_ref()
+                .and_then(|p| lsp::path_to_uri(p).ok());
+            let cross_file = match cur_uri.as_deref() {
+                Some(u) => u != loc.uri,
+                None => true,
+            };
+            if cross_file {
+                let target_path = match lsp::uri_to_path(&loc.uri) {
+                    Some(p) => p,
+                    None => {
+                        *ex_message = format!("LSP: cannot parse target URI: {}", loc.uri);
+                        return;
+                    }
+                };
+                if !open_or_switch_to(
+                    buffers,
+                    current,
+                    &target_path,
+                    lsp_clients,
+                    highlighter,
+                    watcher,
+                    ex_message,
+                    main_tx,
+                ) {
+                    return;
+                }
+            }
+            let cur = &mut buffers[*current];
+            let bytes = collect_bytes(&cur.buffer);
+            let target_line_start = byte_at_line(&bytes, loc.line as usize);
+            let target = target_line_start.saturating_add(loc.character as usize);
+            let new_head = snap_to_char_or_last(&bytes, target);
+            cur.sels.reduce_to_primary();
+            let p = cur.sels.primary_mut();
+            p.anchor = new_head;
+            p.head = new_head;
+            p.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+        }
+        LspEvent::Completion { id, result } => {
+            // Stale by id: there's a newer completion request in
+            // flight (or the popup was closed), so this response is
+            // no longer authoritative.
+            if comp.request_id != Some(id) {
+                trace::note(&format!(
+                    "completion_resp: drop stale id={} (current={:?})",
+                    id, comp.request_id
+                ));
+                return;
+            }
+            let meta = match meta {
+                Some(m) => m,
+                None => {
+                    trace::note(&format!("completion_resp: id={} no meta", id));
+                    return;
+                }
+            };
+            let idx = match meta
+                .buf_path
+                .as_deref()
+                .and_then(|p| buffer_index_by_path(buffers, p))
+            {
+                Some(i) => i,
+                None => {
+                    trace::note(&format!("completion_resp: id={} originating buffer gone", id));
+                    comp.request_id = None;
+                    return;
+                }
+            };
+            // Stale by version: the user edited the buffer since the
+            // request was sent (and we sync didChange before each
+            // completion, so the version we sent was `buffer_version`).
+            if buffers[idx].buffer.version() != meta.buffer_version {
+                trace::note(&format!(
+                    "completion_resp: drop id={} buffer-version mismatch (sent={}, now={})",
+                    id, meta.buffer_version, buffers[idx].buffer.version()
+                ));
+                comp.request_id = None;
+                return;
+            }
+            let raw = match result {
+                Ok(v) => v,
+                Err(e) => {
+                    trace::note(&format!("completion_resp: id={} server error: {}", id, e.message));
+                    comp.request_id = None;
+                    return;
+                }
+            };
+            let parsed = medit::completion::parse_response(&raw);
+            trace::note(&format!(
+                "completion_resp: id={} parsed items={} incomplete={}",
+                id, parsed.items.len(), parsed.is_incomplete
+            ));
+            comp.items = parsed.items;
+            comp.is_incomplete = parsed.is_incomplete;
+            comp.request_id = None;
+            // Compute the filter prefix from the buffer right now. The
+            // cursor may have moved between request and response
+            // (within the same buffer version: cursor moves don't bump
+            // version), so re-read it.
+            let cursor = buffers[idx].sels.primary().head;
+            let bytes = collect_bytes(&buffers[idx].buffer);
+            comp.prefix = if comp.anchor <= cursor && cursor <= bytes.len() {
+                String::from_utf8_lossy(&bytes[comp.anchor..cursor]).into_owned()
+            } else {
+                String::new()
+            };
+            comp.filtered = medit::completion::filter_items(&comp.items, &comp.prefix);
+            comp.selected = 0;
+            trace::note(&format!(
+                "completion_resp: id={} prefix={:?} filtered={}",
+                id, comp.prefix, comp.filtered.len()
+            ));
         }
     }
 }
@@ -1826,6 +2779,7 @@ fn open_or_switch_to(
     highlighter: &Highlighter,
     watcher: Option<&mut FileWatcher>,
     ex_message: &mut String,
+    main_tx: &mpsc::Sender<MainEvent>,
 ) -> bool {
     if let Some(idx) = buffers
         .iter()
@@ -1851,7 +2805,7 @@ fn open_or_switch_to(
     *current = buffers.len() - 1;
     // Spawn the appropriate LSP server lazily (no-op if already running
     // for that language) and send didOpen for the new file.
-    maybe_start_lsp_and_open(lsp_clients, path, &mut buffers[*current]);
+    maybe_start_lsp_and_open(lsp_clients, path, &mut buffers[*current], main_tx);
     if let Some(w) = watcher {
         let _ = w.watch(path);
     }
@@ -1871,10 +2825,10 @@ fn apply_watcher_events(
     highlighter: &Highlighter,
     prompt: &mut Option<Prompt>,
     ex_message: &mut String,
-) {
+) -> bool {
     let changed = watcher.poll();
     if changed.is_empty() {
-        return;
+        return false;
     }
     let mut conflict_index: Option<usize> = None;
     for path in &changed {
@@ -1921,6 +2875,7 @@ fn apply_watcher_events(
             *prompt = Some(build_conflict_prompt(buffers, idx));
         }
     }
+    true
 }
 
 /// What the main loop should do after handling an `ExAction`. Quit
@@ -1943,6 +2898,7 @@ fn dispatch_ex_action(
     watcher: Option<&mut FileWatcher>,
     prompt: &mut Option<Prompt>,
     ex_message: &mut String,
+    main_tx: &mpsc::Sender<MainEvent>,
 ) -> AfterAction {
     match action {
         ExAction::OpenFile(path) => {
@@ -1954,6 +2910,7 @@ fn dispatch_ex_action(
                 highlighter,
                 watcher,
                 ex_message,
+                main_tx,
             );
             AfterAction::Continue
         }
@@ -2087,6 +3044,8 @@ fn render_all(
     lsp_clients: &HashMap<&'static str, LspClient>,
     prompt: Option<&Prompt>,
     hover: Option<&str>,
+    spinner: Option<char>,
+    comp: Option<&CompletionUi>,
 ) -> io::Result<()> {
     let cur = &buffers[current];
     let buffer_count = buffers.len();
@@ -2113,15 +3072,23 @@ fn render_all(
             conflict_marker
         )
     };
-    let diagnostics: &[medit::lsp::Diagnostic] = match (cur.lang_id, cur.path.as_ref()) {
-        (Some(lang), Some(p)) => match lsp::path_to_uri(p) {
-            Ok(uri) => lsp_clients
-                .get(lang)
-                .map(|c| c.diagnostics_for(&uri))
-                .unwrap_or(&[]),
-            Err(_) => &[],
-        },
-        _ => &[],
+    // Diagnostics are hidden while the user is actively editing —
+    // pre-`didChange` underlines on stale text are noisy and we resync
+    // continually during insert mode for completion. They're rendered
+    // again as soon as the user returns to normal mode.
+    let diagnostics: &[medit::lsp::Diagnostic] = if mode == Mode::Insert {
+        &[]
+    } else {
+        match (cur.lang_id, cur.path.as_ref()) {
+            (Some(lang), Some(p)) => match lsp::path_to_uri(p) {
+                Ok(uri) => lsp_clients
+                    .get(lang)
+                    .map(|c| c.diagnostics_for(&uri))
+                    .unwrap_or(&[]),
+                Err(_) => &[],
+            },
+            _ => &[],
+        }
     };
     render(
         screen,
@@ -2141,6 +3108,8 @@ fn render_all(
         diagnostics,
         prompt,
         hover,
+        spinner,
+        comp,
     )
 }
 
@@ -2163,6 +3132,8 @@ fn render(
     diagnostics: &[medit::lsp::Diagnostic],
     prompt: Option<&Prompt>,
     hover: Option<&str>,
+    spinner: Option<char>,
+    comp: Option<&CompletionUi>,
 ) -> io::Result<()> {
     screen.begin_frame();
     let cols = screen.cols;
@@ -2433,9 +3404,14 @@ fn render(
     } else if !ex_message.is_empty() {
         (format!(" {} ", ex_message), cur_row, viewport_cur_col)
     } else {
+        // The spinner glyph occupies a single column between the mode
+        // tag and the buffer label so it doesn't shift other elements
+        // as it appears/disappears (we draw a space when no spinner).
+        let spinner_ch = spinner.unwrap_or(' ');
         let s = format!(
-            " [{}] {} · ln {} col {} · {}sel {}b · last:{} raw:{} ",
+            " [{}] {} {} · ln {} col {} · {}sel {}b · last:{} raw:{} ",
             mode_str,
+            spinner_ch,
             buffer_label,
             abs_line,
             cur_col,
@@ -2462,6 +3438,27 @@ fn render(
     // prompt so a prompt (if active) still wins.
     if let Some(text) = hover {
         draw_hover_popup(screen, text, cur_row, cur_col, gutter, cols, viewport_rows);
+    }
+
+    // Completion popup. Anchored at the replacement-start column, not
+    // the cursor, so it stays put as the user types more characters
+    // of the prefix. Drawn after hover so the active completion wins
+    // visually if both happen to be set.
+    if let Some(c) = comp {
+        if c.is_visible() {
+            draw_completion_popup(
+                screen,
+                c,
+                bytes,
+                line_starts,
+                head,
+                cur_row,
+                cur_col,
+                gutter,
+                cols,
+                viewport_rows,
+            );
+        }
     }
 
     // Modal prompt overlays everything else, including the diag popup

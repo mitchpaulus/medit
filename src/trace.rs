@@ -69,6 +69,20 @@ pub fn record_collect(ns: u64) {
     }
 }
 
+/// Append a free-form diagnostic note. Cheap when the tracer isn't
+/// enabled (`OnceLock::get` returns `None`). Lines are prefixed with
+/// `note\t` so `awk -F'\t'` selectors can pick them out independently
+/// from per-frame stats.
+pub fn note(msg: &str) {
+    let mutex = match TRACER.get() {
+        Some(m) => m,
+        None => return,
+    };
+    if let Ok(mut f) = mutex.lock() {
+        let _ = writeln!(f, "note\t{}", msg);
+    }
+}
+
 /// Append one frame record to the trace file and reset per-frame counters.
 pub fn emit_frame(total_ns: u64, handle_ns: u64, render_ns: u64, bytes_size: usize) {
     let mutex = match TRACER.get() {
