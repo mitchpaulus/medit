@@ -1932,7 +1932,11 @@ fn extend_to_line(bytes: &[u8], sel: &mut Selection) {
     let new_anchor = byte_at_line(bytes, start_line);
     let cur_end = line_end_position(bytes, end_line);
 
-    if sel.anchor == new_anchor && sel.head == cur_end {
+    // Only treat the selection as "already covering" (and thus extend
+    // downward) if it actually has extent. On a blank line, anchor/head
+    // collapsed onto the lone '\n' would otherwise look identical to a
+    // full line cover and cause `x` to skip to the next line.
+    if sel.anchor == new_anchor && sel.head == cur_end && sel.anchor != sel.head {
         let next_ls = byte_at_line(bytes, end_line + 1);
         if next_ls < bytes.len() {
             end_line += 1;
