@@ -1767,9 +1767,12 @@ pub fn op_delete_multi(buffer: &mut Buffer, sels: &mut Selections, registers: &m
     let primary_idx = sels.primary;
     {
         let p = &sels.list[primary_idx];
+        let p_min = p.min();
         let p_last = next_char_or_end(&initial, p.max());
-        if p_last > p.min() {
-            registers.default = initial[p.min()..p_last].to_vec();
+        if p_last > p_min {
+            registers.default = initial[p_min..p_last].to_vec();
+        } else if p_min == initial.len() && initial.last() == Some(&b'\n') {
+            registers.default = vec![b'\n'];
         }
     }
     buffer.mark_commit_point(snapshot_of(sels.primary()));
@@ -1783,13 +1786,21 @@ pub fn op_delete_multi(buffer: &mut Buffer, sels: &mut Selections, registers: &m
         sel.head = (sel.head as i64 + shift).max(0) as usize;
         let min = sel.min();
         let last = next_char_or_end(&now, sel.max());
-        let len = last.saturating_sub(min);
+        // If the cursor sits on the virtual empty line past the trailing
+        // newline, delete that newline so the blank line actually collapses.
+        let (delete_at, len) = if last > min {
+            (min, last - min)
+        } else if min == now.len() && now.last() == Some(&b'\n') {
+            (min - 1, 1)
+        } else {
+            (min, 0)
+        };
         if len > 0 {
-            buffer.delete(min, len);
+            buffer.delete(delete_at, len);
             shift -= len as i64;
         }
-        sel.anchor = min;
-        sel.head = min;
+        sel.anchor = delete_at;
+        sel.head = delete_at;
     }
     let final_bytes = collect_bytes(buffer);
     for sel in sels.list.iter_mut() {
