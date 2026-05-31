@@ -34,6 +34,15 @@ fn main() {
             .include(&src_dir)
             .include("grammars/include")
             .file(&parser_c)
+            // tree-sitter's `array.h` reallocates a buffer and then indexes
+            // the *reloaded* pointer; GCC 16 at -O3 miscompiles this under
+            // its default strict-aliasing assumptions, hoisting the reload of
+            // `self->contents` ahead of the store of the freshly-allocated
+            // pointer and leaving a stale (often NULL) base — a SIGSEGV in
+            // the external scanners (e.g. djot's `push_block`). Disable
+            // strict aliasing for the vendored C, matching upstream
+            // tree-sitter's own build.
+            .flag_if_supported("-fno-strict-aliasing")
             // tree-sitter parsers do a lot of fall-through switches; the
             // generated C has plenty of unused defines / variables.
             .flag_if_supported("-Wno-unused-but-set-variable")

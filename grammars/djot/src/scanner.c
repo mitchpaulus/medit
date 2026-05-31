@@ -3172,19 +3172,39 @@ unsigned tree_sitter_djot_external_scanner_serialize(void *payload,
                                                      char *buffer) {
   Scanner *s = (Scanner *)payload;
   unsigned size = 0;
+
+  // tree-sitter hands us a fixed-size buffer
+  // (TREE_SITTER_SERIALIZATION_BUFFER_SIZE bytes); writing past it corrupts
+  // the heap. The 4-byte header + 1-byte count always fit, but the
+  // open-block / open-inline stacks can in principle exceed the buffer on a
+  // deeply nested document, so every loop body is guarded. We persist only
+  // as much state as fits; a truncated stack costs some incremental-reparse
+  // accuracy but never overflows.
   buffer[size++] = (char)s->blocks_to_close;
   buffer[size++] = (char)s->block_quote_level;
   buffer[size++] = (char)s->indent;
   buffer[size++] = (char)s->state;
 
-  buffer[size++] = (char)s->open_blocks->size;
-  for (size_t i = 0; i < s->open_blocks->size; ++i) {
+  // Reserve the count byte and backfill it with the number we actually
+  // wrote, so deserialize reads back exactly what's present. The count is a
+  // single byte, so it also caps at 255 blocks regardless of buffer space.
+  unsigned count_index = size++;
+  uint8_t blocks_written = 0;
+  for (size_t i = 0; i < s->open_blocks->size && blocks_written < 255; ++i) {
+    if (size + 2 > TREE_SITTER_SERIALIZATION_BUFFER_SIZE) {
+      break;
+    }
     Block *b = *array_get(s->open_blocks, i);
     buffer[size++] = (char)b->type;
     buffer[size++] = (char)b->data;
+    ++blocks_written;
   }
+  buffer[count_index] = (char)blocks_written;
 
   for (size_t i = 0; i < s->open_inline->size; ++i) {
+    if (size + 2 > TREE_SITTER_SERIALIZATION_BUFFER_SIZE) {
+      break;
+    }
     Inline *x = *array_get(s->open_inline, i);
     buffer[size++] = (char)x->type;
     buffer[size++] = (char)x->data;
