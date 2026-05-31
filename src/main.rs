@@ -222,6 +222,11 @@ struct EditorBuffer {
     buffer: Buffer,
     sels: Selections,
     top_line: usize,
+    /// Number of visual columns scrolled off the left edge. The horizontal
+    /// analog of `top_line`: the whole viewport shifts together so the
+    /// cursor stays visible on long lines (no soft-wrap). Recomputed each
+    /// frame from the cursor's visual column by `ensure_visible_horizontal`.
+    left_col: usize,
     path: Option<PathBuf>,
     /// Syntax highlighting state. `lang_id` is set when the file extension
     /// matches a registered grammar; `tree` is the most recent parse;
@@ -277,6 +282,7 @@ impl EditorBuffer {
             buffer,
             sels: Selections::new(),
             top_line: 0,
+            left_col: 0,
             path,
             lang_id,
             tree: None,
@@ -359,6 +365,99 @@ fn ensure_visible_indexed(
     } else if head_line >= bottom_zone_start {
         *top_line = head_line + off + 1 - viewport_rows;
     }
+}
+
+/// Width of the line-number gutter (including its trailing space) for a
+/// buffer with `total_lines` lines on a terminal `cols` wide. Single source
+/// of truth shared by the renderer and the horizontal-scroll calculation so
+/// they always agree on `content_cols`. Returns 0 when the terminal is too
+/// narrow to afford a gutter.
+fn gutter_for(total_lines: usize, cols: u16) -> u16 {
+    let line_digits = total_lines.to_string().len() as u16;
+    if cols > line_digits + 2 {
+        line_digits + 1
+    } else {
+        0
+    }
+}
+
+/// Visual column (1-based, in screen cells) of byte offset `head` within
+/// the line starting at `line_start`. Mirrors the renderer's advance rules
+/// exactly: tabs round up to the next multiple of 4, control bytes take two
+/// cells (`^X`), every other character takes one. Used to drive horizontal
+/// scrolling and the status-bar column readout.
+fn visual_col_at(bytes: &[u8], line_start: usize, head: usize) -> u16 {
+    let mut col: u16 = 1;
+    let mut i = line_start;
+    while i < head {
+        match bytes.get(i) {
+            None | Some(b'\n') => break,
+            Some(b'\r') => i += 1,
+            Some(b'\t') => {
+                let advance = 4 - ((col as usize - 1) % 4);
+                col = col.saturating_add(advance as u16);
+                i += 1;
+            }
+            Some(&c) if c < 0x20 => {
+                col = col.saturating_add(2);
+                i += 1;
+            }
+            Some(&b) => {
+                col = col.saturating_add(1);
+                i += utf8_len(b).max(1);
+            }
+        }
+    }
+    col
+}
+
+/// Adjust `left_col` so the cursor's visual column stays inside the visible
+/// window `[left_col+1, left_col+content_cols]`. Only scrolls when the
+/// cursor would actually fall outside it, so a line that fits the viewport
+/// never scrolls (and the view snaps back to column 0 on short lines).
+fn ensure_visible_horizontal(
+    head_vcol: u16,
+    line_end_vcol: u16,
+    left_col: &mut usize,
+    content_cols: u16,
+) {
+    if content_cols == 0 {
+        return;
+    }
+    let v = head_vcol as usize;
+    let cc = content_cols as usize;
+    if v <= *left_col {
+        *left_col = v.saturating_sub(1);
+    } else if v > *left_col + cc {
+        *left_col = v - cc;
+    }
+    // Never scroll past the end of the current line into empty space. This
+    // also snaps the view back toward column 0 when the whole line fits
+    // (e.g. moving from a long line down to a short one), instead of leaving
+    // the cursor stranded against the left edge showing only the line's tail.
+    let max_left = (line_end_vcol as usize).saturating_sub(cc);
+    *left_col = (*left_col).min(max_left);
+}
+
+/// Clip a run of `width` cells starting at 1-based visual column `col` to
+/// the horizontal window `[left_col+1, left_col+content_cols]`. Returns the
+/// 1-based screen content column to draw at, the number of visible cells,
+/// and how many leading cells were clipped off (so a per-cell body can be
+/// sliced); `None` when the run is entirely scrolled out of view.
+fn clip_run(col: u16, width: u16, left_col: u16, content_cols: u16) -> Option<(u16, u16, usize)> {
+    let start = col as u32;
+    let end = start + width.max(1) as u32 - 1; // inclusive, 1-based
+    let win_lo = left_col as u32 + 1;
+    let win_hi = left_col as u32 + content_cols as u32;
+    let lo = start.max(win_lo);
+    let hi = end.min(win_hi);
+    if hi < lo {
+        return None;
+    }
+    let screen_col = (lo - left_col as u32) as u16; // 1-based within content
+    let vis_width = (hi - lo + 1) as u16;
+    let clipped_left = (lo - start) as usize;
+    Some((screen_col, vis_width, clipped_left))
 }
 
 /// Re-parse `eb` and rebuild its `flat_scopes`. Drains any pending edits
@@ -1557,6 +1656,25 @@ fn main() -> io::Result<()> {
                     head,
                     &mut cur.top_line,
                     viewport_rows,
+                );
+                // Horizontal scroll: shift the viewport so the cursor's
+                // visual column stays on screen on long, unwrapped lines.
+                let gutter = gutter_for(cur.line_starts.len(), screen.cols);
+                let content_cols = screen.cols.saturating_sub(gutter);
+                let head_line = line_index_cached(&cur.line_starts, head);
+                let line_start = cur.line_starts.get(head_line).copied().unwrap_or(0);
+                let line_end = cur
+                    .line_starts
+                    .get(head_line + 1)
+                    .copied()
+                    .unwrap_or(cur.cached_bytes.len());
+                let head_vcol = visual_col_at(&cur.cached_bytes, line_start, head);
+                let line_end_vcol = visual_col_at(&cur.cached_bytes, line_start, line_end);
+                ensure_visible_horizontal(
+                    head_vcol,
+                    line_end_vcol,
+                    &mut cur.left_col,
+                    content_cols,
                 );
             }
             let spinner_glyph = if lsp_clients.values().any(|c| c.has_outstanding()) {
@@ -2766,6 +2884,7 @@ fn reload_from_disk(
         primary.anchor = primary.anchor.min(new_len);
     }
     eb.top_line = 0;
+    eb.left_col = 0;
     refresh_bytes_cache(eb);
     reparse_and_highlight(eb, highlighter);
     true
@@ -3098,6 +3217,7 @@ fn render_all(
         &cur.flat_scopes,
         mode,
         cur.top_line,
+        cur.left_col,
         &buffer_label,
         ex_input,
         search_input,
@@ -3122,6 +3242,7 @@ fn render(
     scopes: &[ScopeId],
     mode: Mode,
     top_line: usize,
+    left_col: usize,
     buffer_label: &str,
     ex_input: &str,
     search_input: &str,
@@ -3153,13 +3274,12 @@ fn render(
     // total number of newline-terminated lines is `line_starts.len()` and
     // the visible-line count is the same (we count trailing partial lines).
     let total_lines = line_starts.len();
-    let line_digits = total_lines.to_string().len() as u16;
-    let gutter: u16 = if cols > line_digits + 2 {
-        line_digits + 1
-    } else {
-        0
-    };
+    let gutter: u16 = gutter_for(total_lines, cols);
     let content_cols = cols.saturating_sub(gutter);
+    // Visual columns hidden off the left edge, clamped to `u16` for the
+    // per-cell math below (the cursor is always kept on screen, so a value
+    // this large only arises on absurdly long lines).
+    let left_col: u16 = left_col.min(u16::MAX as usize) as u16;
 
     let sel_ranges: Vec<(usize, usize)> = sels
         .iter()
@@ -3212,6 +3332,10 @@ fn render(
     let mut col: u16 = 1;
     let mut cur_row: u16 = 1;
     let mut cur_col: u16 = 1;
+    // True 1-based visual column of the cursor (pre horizontal-scroll
+    // offset), for the status-bar readout. `cur_col` is the on-screen
+    // column after subtracting `left_col`.
+    let mut cur_vcol: u16 = 1;
     let mut i = start_byte;
     let mut current_lineno = top_line + 1;
     // Tracked SGR + cursor state.
@@ -3234,7 +3358,8 @@ fn render(
     loop {
         if i == head && row <= viewport_rows {
             cur_row = row;
-            cur_col = col.max(1).min(content_cols.max(1));
+            cur_col = col.saturating_sub(left_col).max(1).min(content_cols.max(1));
+            cur_vcol = col;
         }
         if i >= bytes.len() || row > viewport_rows {
             break;
@@ -3283,10 +3408,15 @@ fn render(
             }
             b'\t' => {
                 let advance = 4 - ((col as usize - 1) % 4);
-                if (bg.is_some() || ul_seq.is_some()) && col <= content_cols {
-                    // Tabs only need a visible body when there's something
-                    // to paint (selection bg, search highlight, or a
-                    // diagnostic underline); otherwise we just advance.
+                // Tabs only need a visible body when there's something to
+                // paint (selection bg, search highlight, or a diagnostic
+                // underline); otherwise we just advance. Clip the run to the
+                // horizontal window so a partially-scrolled tab paints only
+                // its visible cells.
+                if let (true, Some((scol, w, _))) = (
+                    bg.is_some() || ul_seq.is_some(),
+                    clip_run(col, advance as u16, left_col, content_cols),
+                ) {
                     const SPACES: &[u8; 4] = b"    ";
                     emit_styled_cell(
                         screen,
@@ -3295,12 +3425,12 @@ fn render(
                         &mut style_bg,
                         &mut style_ul,
                         row,
-                        col + gutter,
-                        advance as u16,
+                        scol + gutter,
+                        w,
                         fg_seq,
                         bg,
                         ul_seq,
-                        &SPACES[..advance],
+                        &SPACES[..w as usize],
                     );
                 } else {
                     cursor_at = None;
@@ -3311,7 +3441,7 @@ fn render(
             c if c < 0x20 => {
                 let letter = c + 0x40;
                 let body = [b'^', letter];
-                if col <= content_cols {
+                if let Some((scol, w, off)) = clip_run(col, 2, left_col, content_cols) {
                     emit_styled_cell(
                         screen,
                         &mut cursor_at,
@@ -3319,12 +3449,12 @@ fn render(
                         &mut style_bg,
                         &mut style_ul,
                         row,
-                        col + gutter,
-                        2,
+                        scol + gutter,
+                        w,
                         fg_seq,
                         bg,
                         ul_seq,
-                        &body,
+                        &body[off..off + w as usize],
                     );
                 } else {
                     cursor_at = None;
@@ -3335,7 +3465,7 @@ fn render(
             _ => {
                 let n = utf8_len(b);
                 let end = (i + n).min(bytes.len());
-                if col <= content_cols {
+                if let Some((scol, _, _)) = clip_run(col, 1, left_col, content_cols) {
                     let glyph = bytes.get(i..end).unwrap_or(b"?");
                     emit_styled_cell(
                         screen,
@@ -3344,7 +3474,7 @@ fn render(
                         &mut style_bg,
                         &mut style_ul,
                         row,
-                        col + gutter,
+                        scol + gutter,
                         1,
                         fg_seq,
                         bg,
@@ -3421,7 +3551,7 @@ fn render(
             spinner_ch,
             buffer_label,
             abs_line,
-            cur_col,
+            cur_vcol,
             multi_label,
             primary_size,
             key_str,
@@ -3478,4 +3608,85 @@ fn render(
     let block_cursor = mode == Mode::Normal;
     screen.set_cursor_shape(block_cursor);
     screen.end_frame(final_cur_row, final_cur_col)
+}
+
+#[cfg(test)]
+mod horizontal_scroll_tests {
+    use super::{clip_run, ensure_visible_horizontal, visual_col_at};
+
+    #[test]
+    fn visual_col_counts_plain_chars() {
+        assert_eq!(visual_col_at(b"abc", 0, 0), 1);
+        assert_eq!(visual_col_at(b"abc", 0, 1), 2);
+        assert_eq!(visual_col_at(b"abc", 0, 3), 4);
+    }
+
+    #[test]
+    fn visual_col_expands_tabs_to_multiples_of_four() {
+        // A leading tab advances to column 5 (1 -> 5).
+        assert_eq!(visual_col_at(b"\tx", 0, 1), 5);
+        // "ab\tc": a(1->2) b(2->3) tab rounds 3 up by 2 -> 5, so 'c' is col 5.
+        assert_eq!(visual_col_at(b"ab\tc", 0, 3), 5);
+    }
+
+    #[test]
+    fn visual_col_control_chars_take_two_cells() {
+        // ^A renders as two cells, so the following char starts at column 3.
+        assert_eq!(visual_col_at(b"\x01x", 0, 1), 3);
+    }
+
+    #[test]
+    fn ensure_horizontal_scrolls_right_when_cursor_past_edge() {
+        let mut left = 0usize;
+        ensure_visible_horizontal(15, 100, &mut left, 10);
+        assert_eq!(left, 5, "cursor at col 15 in a 10-wide window -> left edge col 6");
+    }
+
+    #[test]
+    fn ensure_horizontal_no_scroll_when_visible() {
+        let mut left = 0usize;
+        ensure_visible_horizontal(5, 100, &mut left, 10);
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn ensure_horizontal_snaps_back_on_short_line() {
+        // Was scrolled far right; cursor now on a line that fits entirely.
+        let mut left = 50usize;
+        ensure_visible_horizontal(8, 8, &mut left, 10);
+        assert_eq!(left, 0, "a line that fits the viewport never stays scrolled");
+    }
+
+    #[test]
+    fn ensure_horizontal_never_scrolls_past_line_end() {
+        // Line ends at visual col 20, window is 10 wide: max useful left is 10.
+        let mut left = 0usize;
+        ensure_visible_horizontal(20, 20, &mut left, 10);
+        assert_eq!(left, 10);
+    }
+
+    #[test]
+    fn clip_run_visible_cell() {
+        // No horizontal offset: column maps straight through.
+        assert_eq!(clip_run(5, 1, 0, 10), Some((5, 1, 0)));
+    }
+
+    #[test]
+    fn clip_run_offsets_by_left_col() {
+        // With 5 columns hidden, visual col 6 lands at screen content col 1.
+        assert_eq!(clip_run(6, 1, 5, 10), Some((1, 1, 0)));
+    }
+
+    #[test]
+    fn clip_run_drops_offscreen_cells() {
+        assert_eq!(clip_run(11, 1, 0, 10), None); // past the right edge
+        assert_eq!(clip_run(3, 1, 5, 10), None); // scrolled off the left
+    }
+
+    #[test]
+    fn clip_run_clips_a_partially_scrolled_run() {
+        // A 4-wide tab at cols 4..=7 with 5 cols hidden: cols 6,7 remain,
+        // drawn at screen col 1, with the first two cells clipped away.
+        assert_eq!(clip_run(4, 4, 5, 10), Some((1, 2, 2)));
+    }
 }
