@@ -493,6 +493,7 @@ pub fn handle_normal(
     pending_object: &mut Option<ObjectKind>,
     pending_find: &mut Option<FindOp>,
     pending_bracket: &mut Option<BracketDir>,
+    pending_replace: &mut bool,
     search: &mut SearchState,
     lsp_action: &mut Option<LspAction>,
     jump_action: &mut Option<JumpAction>,
@@ -535,6 +536,12 @@ pub fn handle_normal(
         return false;
     }
 
+    // `r` waits for the next key, then replaces the char under each cursor.
+    if k.mods.is_empty() && k.key == Key::Char('r') {
+        *pending_replace = true;
+        return false;
+    }
+
     // Consume the char argument for a pending `f`/`F`/`t`/`T`. Search
     // within the current line of each selection; selections whose line
     // has no match are left in place. Collapses the selection (Vim-style
@@ -546,6 +553,19 @@ pub fn handle_normal(
                     sel.head = off;
                     sel.anchor = off;
                 }
+            }
+        }
+        return false;
+    }
+
+    // Consume the char argument for a pending `r` (Vim replace-char). Any
+    // unmodified/shifted printable replaces the character under each cursor;
+    // a non-character key (e.g. Esc) just cancels.
+    if *pending_replace {
+        *pending_replace = false;
+        if let Key::Char(c) = k.key {
+            if !k.mods.contains(Mods::CTRL) && !k.mods.contains(Mods::ALT) {
+                replace_char_multi(buffer, sels, c);
             }
         }
         return false;
@@ -862,6 +882,10 @@ pub fn handle_normal(
             }
             Key::Char('C') => {
                 op_change_to_line_end_multi(buffer, sels, mode, registers);
+                return false;
+            }
+            Key::Char('D') => {
+                op_delete_to_line_end_multi(buffer, sels, registers);
                 return false;
             }
             Key::Char('y') => {
@@ -1862,6 +1886,83 @@ pub fn op_change_to_line_end_multi(
     *mode = Mode::Insert;
 }
 
+/// `D` (Vim's `d$`): delete from each cursor to the end of its line —
+/// `[head, line_end)`, never the trailing newline — and stay in normal mode.
+/// The primary cursor's deleted text goes to the default register. Each
+/// cursor then lands on the new last character of its line (Vim leaves the
+/// cursor just before the EOL), or on an empty line's start.
+pub fn op_delete_to_line_end_multi(
+    buffer: &mut Buffer,
+    sels: &mut Selections,
+    registers: &mut Registers,
+) {
+    let initial = collect_bytes(buffer);
+    let primary = *sels.primary();
+    let p_le = line_end(&initial, primary.head);
+    if p_le > primary.head {
+        registers.default = initial[primary.head..p_le].to_vec();
+    }
+    buffer.mark_commit_point(snapshot_of(sels.primary()));
+
+    let indices = sels.indices_by_position();
+    let mut shift: i64 = 0;
+    for &idx in &indices {
+        let now = collect_bytes(buffer);
+        let sel = &mut sels.list[idx];
+        sel.head = (sel.head as i64 + shift).max(0) as usize;
+        let le = line_end(&now, sel.head);
+        let len = le.saturating_sub(sel.head);
+        if len > 0 {
+            buffer.delete(sel.head, len);
+            shift -= len as i64;
+        }
+        sel.anchor = sel.head;
+    }
+
+    // The cursor now sits on the newline (or buffer end). Step it back onto
+    // the line's last remaining character when the line is non-empty.
+    let final_bytes = collect_bytes(buffer);
+    for sel in sels.list.iter_mut() {
+        let ls = line_start(&final_bytes, sel.head);
+        if sel.head > ls {
+            sel.head = prev_char(&final_bytes, sel.head);
+        }
+        sel.anchor = sel.head;
+        sel.desired_col = display_col(&final_bytes, line_start(&final_bytes, sel.head), sel.head);
+    }
+}
+
+/// `r` (Vim replace-char): replace the character under each cursor with `c`,
+/// staying in normal mode with the cursor on the replaced character. Cursors
+/// sitting on a newline (or past end of buffer) are left untouched, matching
+/// Vim's refusal to replace a line break. Processes cursors in buffer order
+/// so a multi-byte replacement shifts later cursors correctly.
+pub fn replace_char_multi(buffer: &mut Buffer, sels: &mut Selections, c: char) {
+    let initial = collect_bytes(buffer);
+    let replaceable = |s: &Selection, b: &[u8]| s.head < b.len() && b[s.head] != b'\n';
+    if !sels.iter().any(|s| replaceable(s, &initial)) {
+        return;
+    }
+    buffer.mark_commit_point(snapshot_of(sels.primary()));
+
+    let mut buf = [0u8; 4];
+    let rep = c.encode_utf8(&mut buf).as_bytes();
+    let indices = sels.indices_by_position();
+    let mut shift: i64 = 0;
+    for &idx in &indices {
+        let now = collect_bytes(buffer);
+        let sel = &mut sels.list[idx];
+        sel.head = (sel.head as i64 + shift).max(0) as usize;
+        if sel.head < now.len() && now[sel.head] != b'\n' {
+            let old_len = utf8_len(now[sel.head]).min(now.len() - sel.head);
+            buffer.delete(sel.head, old_len);
+            buffer.insert(sel.head, rep);
+            shift += rep.len() as i64 - old_len as i64;
+        }
+        sel.anchor = sel.head;
+    }
+}
+
 pub fn op_paste_after(buffer: &mut Buffer, sel: &mut Selection, registers: &Registers) {
     if registers.default.is_empty() {
         return;
@@ -2640,6 +2741,63 @@ mod tests {
         assert_eq!(mode, Mode::Insert);
         assert_eq!(regs.default, b"world"); // killed text goes to default reg
         assert_eq!(sels.primary().head, 6); // cursor stays where the change began
+    }
+
+    #[test]
+    fn delete_to_line_end_yanks_and_lands_before_eol() {
+        let mut buffer = Buffer::from_bytes(b"hello world\nsecond\n".to_vec());
+        let mut sels = Selections::new();
+        {
+            let p = sels.primary_mut();
+            p.head = 6; // start of "world"
+            p.anchor = 6;
+        }
+        let mut regs = Registers { default: Vec::new() };
+        op_delete_to_line_end_multi(&mut buffer, &mut sels, &mut regs);
+        assert_eq!(collect_bytes(&buffer), b"hello \nsecond\n");
+        assert_eq!(regs.default, b"world");
+        // Vim `D` leaves the cursor on the line's new last char (the space).
+        assert_eq!(sels.primary().head, 5);
+    }
+
+    #[test]
+    fn delete_to_line_end_on_empty_remainder_stays_put() {
+        // Cursor already at line start of an otherwise content-only line:
+        // deleting to EOL empties the line; cursor stays at the line start.
+        let mut buffer = Buffer::from_bytes(b"abc\n".to_vec());
+        let mut sels = Selections::new();
+        // head at 0 (the 'a'); delete whole line content.
+        let mut regs = Registers { default: Vec::new() };
+        op_delete_to_line_end_multi(&mut buffer, &mut sels, &mut regs);
+        assert_eq!(collect_bytes(&buffer), b"\n");
+        assert_eq!(sels.primary().head, 0);
+    }
+
+    #[test]
+    fn replace_char_swaps_under_cursor_and_stays_normal() {
+        let mut buffer = Buffer::from_bytes(b"cat\n".to_vec());
+        let mut sels = Selections::new();
+        {
+            let p = sels.primary_mut();
+            p.head = 1; // the 'a'
+            p.anchor = 1;
+        }
+        replace_char_multi(&mut buffer, &mut sels, 'u');
+        assert_eq!(collect_bytes(&buffer), b"cut\n");
+        assert_eq!(sels.primary().head, 1); // cursor stays on the replaced char
+    }
+
+    #[test]
+    fn replace_char_refuses_to_replace_newline() {
+        let mut buffer = Buffer::from_bytes(b"hi\n".to_vec());
+        let mut sels = Selections::new();
+        {
+            let p = sels.primary_mut();
+            p.head = 2; // the '\n'
+            p.anchor = 2;
+        }
+        replace_char_multi(&mut buffer, &mut sels, 'x');
+        assert_eq!(collect_bytes(&buffer), b"hi\n"); // unchanged
     }
 
     #[test]

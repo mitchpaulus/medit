@@ -61,7 +61,7 @@ editing, multi-cursor.</p>
 <div class="kbd-key"><div class="g">q</div><div class="a">close buf</div></div>
 <div class="kbd-key"><div class="g">w</div><div class="a">word →</div></div>
 <div class="kbd-key"><div class="g">e</div><div class="a">end word</div></div>
-<div class="kbd-key unbound"><div class="g">r</div></div>
+<div class="kbd-key"><div class="g">r</div><div class="a">replace x</div></div>
 <div class="kbd-key"><div class="g">t</div><div class="a">till x→</div></div>
 <div class="kbd-key"><div class="g">y</div><div class="a">yank</div></div>
 <div class="kbd-key"><div class="g">u</div><div class="a">undo</div></div>
@@ -133,7 +133,7 @@ editing, multi-cursor.</p>
 <div class="kbd-row r3">
 <div class="kbd-key"><div class="g">A</div><div class="a">insert ⇥</div></div>
 <div class="kbd-key unbound"><div class="g">S</div></div>
-<div class="kbd-key unbound"><div class="g">D</div></div>
+<div class="kbd-key"><div class="g">D</div><div class="a">del→EOL</div></div>
 <div class="kbd-key"><div class="g">F</div><div class="a">find x◀</div></div>
 <div class="kbd-key"><div class="g">G</div><div class="a">last line</div></div>
 <div class="kbd-key"><div class="g">H</div><div class="a">line start</div></div>
@@ -310,6 +310,8 @@ editing, multi-cursor.</p>
 <tr><td><kbd>d</kbd></td><td>Delete selection (into register)</td></tr>
 <tr><td><kbd>c</kbd></td><td>Change selection (delete + enter Insert)</td></tr>
 <tr><td><kbd>C</kbd></td><td>Change to end of line (delete cursor&rarr;EOL + enter Insert)</td></tr>
+<tr><td><kbd>D</kbd></td><td>Delete to end of line (cursor&rarr;EOL, into register; stays in Normal)</td></tr>
+<tr><td><kbd>r</kbd><i>x</i></td><td>Replace the character under each cursor with <i>x</i> (stays in Normal)</td></tr>
 <tr><td><kbd>y</kbd></td><td>Yank primary selection</td></tr>
 <tr><td><kbd>p</kbd> / <kbd>P</kbd></td><td>Paste after / before</td></tr>
 <tr><td><kbd>u</kbd> / <kbd>U</kbd></td><td>Undo / redo</td></tr>

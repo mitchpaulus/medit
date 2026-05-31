@@ -1252,6 +1252,7 @@ fn main() -> io::Result<()> {
     let mut pending_find: Option<medit::core::FindOp> = None;
     let mut pending_bracket: Option<medit::core::BracketDir> = None;
     let mut pending_object: Option<ObjectKind> = None;
+    let mut pending_replace = false;
     let mut pending_lsp_action: Option<LspAction> = None;
     let mut pending_jump_action: Option<medit::core::JumpAction> = None;
     let mut pending_ex_action: Option<ExAction> = None;
@@ -1453,6 +1454,7 @@ fn main() -> io::Result<()> {
                         &mut pending_object,
                         &mut pending_find,
                         &mut pending_bracket,
+                        &mut pending_replace,
                         &mut search_state,
                         &mut pending_lsp_action,
                         &mut pending_jump_action,
