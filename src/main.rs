@@ -1209,6 +1209,77 @@ Keybindings and Ex commands are documented in doc/medit.html."
     );
 }
 
+/// Recompute scroll/highlight for the current buffer and draw one frame.
+/// Factored out of the main loop so input coalescing can call it from a
+/// single place — every queued event is processed first, then this renders
+/// exactly once, which is what keeps held-key repeats from piling up a
+/// backlog of (synchronized-output) frames the terminal plays back behind
+/// the cursor.
+#[allow(clippy::too_many_arguments)]
+fn present(
+    screen: &mut Screen,
+    buffers: &mut [EditorBuffer],
+    current: usize,
+    highlighter: &Highlighter,
+    mode: Mode,
+    ex_input: &str,
+    search_input: &str,
+    search_state: &SearchState,
+    ex_message: &str,
+    last_key: Option<&KeyEvent>,
+    last_bytes: &[u8],
+    lsp_clients: &HashMap<&'static str, LspClient>,
+    prompt: Option<&Prompt>,
+    hover: Option<&str>,
+    spinner_idx: usize,
+    comp: &CompletionUi,
+) -> io::Result<()> {
+    let viewport_rows = screen.rows.saturating_sub(1) as usize;
+    {
+        let cur = &mut buffers[current];
+        refresh_bytes_cache(cur);
+        // Re-parse + rebuild flat_scopes when the buffer has moved.
+        reparse_and_highlight(cur, highlighter);
+        let head = cur.sels.primary().head;
+        ensure_visible_indexed(&cur.line_starts, head, &mut cur.top_line, viewport_rows);
+        // Horizontal scroll: keep the cursor's visual column on screen.
+        let gutter = gutter_for(cur.line_starts.len(), screen.cols);
+        let content_cols = screen.cols.saturating_sub(gutter);
+        let head_line = line_index_cached(&cur.line_starts, head);
+        let line_start = cur.line_starts.get(head_line).copied().unwrap_or(0);
+        let line_end = cur
+            .line_starts
+            .get(head_line + 1)
+            .copied()
+            .unwrap_or(cur.cached_bytes.len());
+        let head_vcol = visual_col_at(&cur.cached_bytes, line_start, head);
+        let line_end_vcol = visual_col_at(&cur.cached_bytes, line_start, line_end);
+        ensure_visible_horizontal(head_vcol, line_end_vcol, &mut cur.left_col, content_cols);
+    }
+    let spinner_glyph = if lsp_clients.values().any(|c| c.has_outstanding()) {
+        Some(SPINNER[spinner_idx % SPINNER.len()])
+    } else {
+        None
+    };
+    render_all(
+        screen,
+        buffers,
+        current,
+        mode,
+        ex_input,
+        search_input,
+        search_state,
+        ex_message,
+        last_key,
+        last_bytes,
+        lsp_clients,
+        prompt,
+        hover,
+        spinner_glyph,
+        Some(comp),
+    )
+}
+
 fn main() -> io::Result<()> {
     trace::init_from_env();
     let arg1 = std::env::args().nth(1);
@@ -1304,10 +1375,11 @@ fn main() -> io::Result<()> {
     // Populate cache before the first frame; subsequent frames refresh in
     // the main loop.
     refresh_bytes_cache(&mut buffers[current]);
-    render_all(
+    present(
         &mut screen,
-        &buffers,
+        &mut buffers,
         current,
+        &highlighter,
         mode,
         &ex_input,
         &search_input,
@@ -1318,20 +1390,63 @@ fn main() -> io::Result<()> {
         &lsp_clients,
         prompt.as_ref(),
         hover.as_deref(),
-        None,
-        Some(&comp),
+        spinner_idx,
+        &comp,
     )?;
 
     let mut parser = Parser::new();
+    // Coalesced rendering: events are processed as fast as they arrive and
+    // mark the screen dirty; we only paint once the event queue drains.
+    // Holding a key (which streams a burst of `Input` events) thus collapses
+    // into a single frame per idle moment instead of one frame per keystroke,
+    // so the display can't fall behind the cursor.
+    let mut dirty = false;
+    let mut pending_handle_ns: u64 = 0;
 
     loop {
-        let event = match main_rx.recv() {
+        let event = match main_rx.try_recv() {
             Ok(e) => e,
-            // All senders dropped — shouldn't happen unless every spawned
-            // thread has died, but treat as graceful exit.
-            Err(_) => break,
+            Err(mpsc::TryRecvError::Empty) => {
+                // Caught up on input — flush a pending frame, then block.
+                if dirty {
+                    let render_start = trace::tic();
+                    present(
+                        &mut screen,
+                        &mut buffers,
+                        current,
+                        &highlighter,
+                        mode,
+                        &ex_input,
+                        &search_input,
+                        &search_state,
+                        &ex_message,
+                        last_key.as_ref(),
+                        &last_bytes,
+                        &lsp_clients,
+                        prompt.as_ref(),
+                        hover.as_deref(),
+                        spinner_idx,
+                        &comp,
+                    )?;
+                    let render_ns = trace::toc(render_start);
+                    trace::emit_frame(
+                        pending_handle_ns + render_ns,
+                        pending_handle_ns,
+                        render_ns,
+                        buffers[current].buffer.len(),
+                    );
+                    pending_handle_ns = 0;
+                    dirty = false;
+                }
+                match main_rx.recv() {
+                    Ok(e) => e,
+                    // All senders dropped — shouldn't happen unless every
+                    // spawned thread has died, but treat as graceful exit.
+                    Err(_) => break,
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => break,
         };
-        let frame_start = trace::tic();
         let handle_start = trace::tic();
         let mut should_render = false;
 
@@ -1641,77 +1756,11 @@ fn main() -> io::Result<()> {
             }
         }
 
-        let handle_ns = trace::toc(handle_start);
-        let render_ns = if should_render {
-            let render_start = trace::tic();
-            {
-                let viewport_rows = screen.rows.saturating_sub(1) as usize;
-                let cur = &mut buffers[current];
-                refresh_bytes_cache(cur);
-                // Re-parse + rebuild flat_scopes when the buffer has
-                // moved. Otherwise stale byte ranges land scopes on the
-                // wrong text.
-                reparse_and_highlight(cur, &highlighter);
-                let head = cur.sels.primary().head;
-                ensure_visible_indexed(
-                    &cur.line_starts,
-                    head,
-                    &mut cur.top_line,
-                    viewport_rows,
-                );
-                // Horizontal scroll: shift the viewport so the cursor's
-                // visual column stays on screen on long, unwrapped lines.
-                let gutter = gutter_for(cur.line_starts.len(), screen.cols);
-                let content_cols = screen.cols.saturating_sub(gutter);
-                let head_line = line_index_cached(&cur.line_starts, head);
-                let line_start = cur.line_starts.get(head_line).copied().unwrap_or(0);
-                let line_end = cur
-                    .line_starts
-                    .get(head_line + 1)
-                    .copied()
-                    .unwrap_or(cur.cached_bytes.len());
-                let head_vcol = visual_col_at(&cur.cached_bytes, line_start, head);
-                let line_end_vcol = visual_col_at(&cur.cached_bytes, line_start, line_end);
-                ensure_visible_horizontal(
-                    head_vcol,
-                    line_end_vcol,
-                    &mut cur.left_col,
-                    content_cols,
-                );
-            }
-            let spinner_glyph = if lsp_clients.values().any(|c| c.has_outstanding()) {
-                Some(SPINNER[spinner_idx % SPINNER.len()])
-            } else {
-                None
-            };
-            render_all(
-                &mut screen,
-                &buffers,
-                current,
-                mode,
-                &ex_input,
-                &search_input,
-                &search_state,
-                &ex_message,
-                last_key.as_ref(),
-                &last_bytes,
-                &lsp_clients,
-                prompt.as_ref(),
-                hover.as_deref(),
-                spinner_glyph,
-                Some(&comp),
-            )?;
-            trace::toc(render_start)
-        } else {
-            0
-        };
-        let total_ns = trace::toc(frame_start);
-        trace::emit_frame(
-            total_ns,
-            handle_ns,
-            render_ns,
-            buffers[current].buffer.len(),
-        );
+        // Don't paint yet — accumulate the dirty flag and loop back to drain
+        // any other queued events first. The actual frame is rendered at the
+        // top of the loop once `try_recv` reports the queue is empty.
+        pending_handle_ns += trace::toc(handle_start);
+        dirty |= should_render;
     }
     Ok(())
 }
