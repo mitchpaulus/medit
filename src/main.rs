@@ -126,6 +126,25 @@ impl CompletionUi {
         !self.filtered.is_empty()
     }
 
+    /// Populate the popup synchronously (buffer-word source — no LSP round
+    /// trip). Sets the replacement anchor/prefix and filters the supplied
+    /// items immediately. `is_incomplete` is false: the full candidate set
+    /// is known, so an empty filter means the session should close.
+    fn set_items(
+        &mut self,
+        items: Vec<medit::completion::CompletionItem>,
+        anchor: usize,
+        prefix: String,
+    ) {
+        self.request_id = None;
+        self.is_incomplete = false;
+        self.anchor = anchor;
+        self.filtered = medit::completion::filter_items(&items, &prefix);
+        self.prefix = prefix;
+        self.items = items;
+        self.selected = 0;
+    }
+
     /// Clear all state — popup closes, in-flight request is forgotten
     /// (its eventual response will be dropped on id mismatch).
     fn close(&mut self) {
@@ -2096,6 +2115,25 @@ fn handle_completion_keys(
     eb: &mut EditorBuffer,
     k: KeyEvent,
 ) -> CompletionKeyOutcome {
+    // Ctrl-n with no popup open: manually force completion on the word
+    // prefix under the cursor, at any length (the manual counterpart to the
+    // automatic triggers). We arm a debounced `Invoked` request anchored at
+    // the word start; `maybe_fire_completion` serves it from the buffer
+    // (markdown) or the LSP server later this iteration. When the popup is
+    // already open, Ctrl-n falls through to the "next item" handler below.
+    if !comp.is_visible() && k.mods.contains(Mods::CTRL) && k.key == Key::Char('n') {
+        if eb.sels.len() == 1 {
+            let cursor = eb.sels.primary().head;
+            let bytes = collect_bytes(&eb.buffer);
+            let anchor = medit::completion::ident_prefix_start(&bytes, cursor);
+            comp.pending = Some(PendingTrigger {
+                anchor,
+                trigger: CompletionTrigger::Invoked,
+                deadline: Instant::now(),
+            });
+        }
+        return CompletionKeyOutcome::InterceptedNoChange;
+    }
     if !comp.is_visible() {
         return CompletionKeyOutcome::NotIntercepted;
     }
@@ -2292,6 +2330,26 @@ fn maybe_fire_completion(
             return;
         }
     };
+
+    // Buffer-word source (markdown/djot): no server round trip — gather
+    // matching words from the buffer and fill the popup synchronously.
+    if medit::completion::is_buffer_source(lang) {
+        let bytes = collect_bytes(&cur.buffer);
+        let prefix = String::from_utf8_lossy(&bytes[pending.anchor..cursor]).into_owned();
+        let items = medit::completion::buffer_word_items(&bytes, &prefix);
+        trace::note(&format!(
+            "fire_completion: buffer source lang={} prefix={:?} items={}",
+            lang,
+            prefix,
+            items.len()
+        ));
+        if items.is_empty() {
+            return;
+        }
+        comp.set_items(items, pending.anchor, prefix);
+        return;
+    }
+
     let cur_uri = match cur.path.as_ref().and_then(|p| lsp::path_to_uri(p).ok()) {
         Some(u) => u,
         None => {

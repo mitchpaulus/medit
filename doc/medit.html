@@ -207,7 +207,7 @@ editing, multi-cursor.</p>
 <div class="kbd-key"><div class="g">c</div><div class="a glob">quit</div></div>
 <div class="kbd-key unbound"><div class="g">v</div></div>
 <div class="kbd-key"><div class="g">b</div><div class="a ins">char ◀</div></div>
-<div class="kbd-key unbound"><div class="g">n</div></div>
+<div class="kbd-key"><div class="g">n</div><div class="a ins">complete</div></div>
 <div class="kbd-key unbound"><div class="g">m</div></div>
 <div class="kbd-key unbound"><div class="g">,</div></div>
 <div class="kbd-key unbound"><div class="g">.</div></div>
@@ -371,6 +371,27 @@ editing, multi-cursor.</p>
 <tr><td><kbd>Ctrl</kbd>+<kbd>k</kbd></td><td>Kill to line end</td></tr>
 <tr><td><kbd>Ctrl</kbd>+<kbd>u</kbd></td><td>Kill to line start</td></tr>
 </table>
+
+<h2>Completion</h2>
+<p>A completion popup appears automatically while typing in insert mode, or
+on demand with <kbd>Ctrl</kbd>+<kbd>n</kbd>. What triggers it automatically
+depends on the file type:</p>
+<table>
+<tr><th>File type</th><th>Triggers</th><th>Source</th></tr>
+<tr><td>Markdown / djot</td><td>After the 3rd character of a word</td><td>Words already in the buffer</td></tr>
+<tr><td>Python</td><td>After 2 identifier chars, or after <kbd>.</kbd></td><td>LSP (<code>ty</code>)</td></tr>
+<tr><td>mshell</td><td>After <kbd>@</kbd> (variables)</td><td>LSP (<code>msh lsp</code>)</td></tr>
+</table>
+<table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>n</kbd> <span class="note">(popup closed)</span></td><td>Force the popup on the word before the cursor, at any prefix length</td></tr>
+<tr><td><kbd>Tab</kbd> / <kbd>Enter</kbd></td><td>Accept the highlighted item</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>n</kbd> / <kbd>Ctrl</kbd>+<kbd>p</kbd>, <kbd>&darr;</kbd> / <kbd>&uarr;</kbd> <span class="note">(popup open)</span></td><td>Next / previous item</td></tr>
+<tr><td><kbd>Esc</kbd></td><td>Dismiss the popup (stays in insert mode)</td></tr>
+</table>
+<p class="note">Markdown completion offers distinct words from the current
+buffer that start with what you've typed (case-insensitive); typing more
+narrows the list, and it closes when nothing matches.</p>
 
 <h2>Ex commands (<kbd>:</kbd>)</h2>
 <table>

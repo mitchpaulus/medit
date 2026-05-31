@@ -76,8 +76,76 @@ pub fn triggers_for(lang_id: &str) -> Option<CompletionTriggers> {
             }],
             min_identifier_prefix: None,
         }),
+        // Markdown/djot has no LSP; completions come from words already in
+        // the buffer (see [`is_buffer_source`]). Auto-trigger once the word
+        // prefix at the cursor first reaches three characters.
+        "djot" => Some(CompletionTriggers {
+            chars: &[],
+            min_identifier_prefix: Some(3),
+        }),
         _ => None,
     }
+}
+
+/// Languages whose completions are served from the buffer's own words
+/// rather than an LSP server. The main loop fills the popup synchronously
+/// via [`buffer_word_items`] instead of sending a request.
+pub fn is_buffer_source(lang_id: &str) -> bool {
+    matches!(lang_id, "djot")
+}
+
+/// Largest number of buffer words to offer at once. The popup only shows a
+/// handful of rows; this just bounds the gather/sort work on large files.
+const MAX_BUFFER_WORDS: usize = 200;
+
+/// Collect distinct words already present in `bytes` that begin with
+/// `prefix` (case-insensitive) and are longer than it, as completion
+/// items. Used for the buffer-word source (markdown). Words are runs of
+/// identifier bytes; results are de-duplicated and sorted alphabetically.
+pub fn buffer_word_items(bytes: &[u8], prefix: &str) -> Vec<CompletionItem> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<CompletionItem> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_ident_byte(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_ident_byte(bytes[i]) {
+            i += 1;
+        }
+        // A word worth offering is strictly longer than the prefix (so it
+        // actually completes something) and shares the prefix. Skip
+        // non-UTF-8 runs defensively, though identifier bytes are ASCII.
+        let word = match std::str::from_utf8(&bytes[start..i]) {
+            Ok(w) => w,
+            Err(_) => continue,
+        };
+        if word.len() <= prefix.len() {
+            continue;
+        }
+        if !word.to_ascii_lowercase().starts_with(&prefix_lower) {
+            continue;
+        }
+        if !seen.insert(word.to_string()) {
+            continue;
+        }
+        out.push(CompletionItem {
+            label: word.to_string(),
+            filter_text: word.to_string(),
+            insert_text: word.to_string(),
+            sort_text: word.to_string(),
+            detail: None,
+        });
+    }
+    out.sort_by(|a, b| a.sort_text.cmp(&b.sort_text).then(a.label.cmp(&b.label)));
+    out.truncate(MAX_BUFFER_WORDS);
+    out
 }
 
 /// Decide whether a completion should fire given the buffer bytes and
@@ -135,6 +203,18 @@ pub fn detect(bytes: &[u8], cursor: usize, triggers: &CompletionTriggers) -> Tri
 
 fn is_ident_byte(b: u8) -> bool {
     b == b'_' || b.is_ascii_alphanumeric()
+}
+
+/// Start of the identifier-byte run ending at `cursor` — the word prefix
+/// under the cursor. Returns `cursor` itself when the preceding byte isn't
+/// an identifier byte (no word there). Used by the manual completion
+/// trigger (Ctrl-n) to anchor the replacement range at any prefix length.
+pub fn ident_prefix_start(bytes: &[u8], cursor: usize) -> usize {
+    let mut a = cursor.min(bytes.len());
+    while a > 0 && is_ident_byte(bytes[a - 1]) {
+        a -= 1;
+    }
+    a
 }
 
 /// A single completion candidate parsed from a server response.
@@ -433,5 +513,47 @@ mod tests {
         assert_eq!(filter_items(&items, "match"), vec![0]);
         // Doesn't match the label.
         assert!(filter_items(&items, "display").is_empty());
+    }
+
+    #[test]
+    fn djot_prefix_triggers_at_three_chars() {
+        let dj = triggers_for("djot").unwrap();
+        assert!(dj.chars.is_empty());
+        // 2 chars: no trigger.
+        assert!(matches!(detect(b"th", 2, &dj), TriggerDecision::None));
+        // 3 chars: fires, anchored at the word start.
+        assert_eq!(parts(&detect(b"the", 3, &dj)), Some((3, 0, None)));
+        // 4 chars: extending an existing word, no re-trigger.
+        assert!(matches!(detect(b"theo", 4, &dj), TriggerDecision::None));
+    }
+
+    #[test]
+    fn djot_is_buffer_source() {
+        assert!(is_buffer_source("djot"));
+        assert!(!is_buffer_source("python"));
+    }
+
+    #[test]
+    fn buffer_words_collects_longer_distinct_matches() {
+        let text = b"completion completes complete\ncompletion again";
+        let items = buffer_word_items(text, "com");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        // Distinct, sorted, each longer than the prefix; "completion"
+        // appears twice but is de-duplicated.
+        assert_eq!(labels, vec!["complete", "completes", "completion"]);
+    }
+
+    #[test]
+    fn buffer_words_is_case_insensitive_but_keeps_original_case() {
+        let items = buffer_word_items(b"Markdown markup", "mar");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["Markdown", "markup"]);
+    }
+
+    #[test]
+    fn buffer_words_excludes_the_prefix_itself() {
+        // A word equal to the prefix is no completion at all.
+        let items = buffer_word_items(b"the the the", "the");
+        assert!(items.is_empty());
     }
 }
