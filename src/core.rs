@@ -890,9 +890,9 @@ pub fn handle_normal(
 
     let (motion, extend) = match k.key {
         Key::Char('h') => (Some(Motion::Left), false),
-        Key::Char('H') => (Some(Motion::Left), true),
+        Key::Char('H') => (Some(Motion::LineStart), false),
         Key::Char('l') => (Some(Motion::Right), false),
-        Key::Char('L') => (Some(Motion::Right), true),
+        Key::Char('L') => (Some(Motion::LineEnd), false),
         Key::Char('k') => (Some(Motion::Up), false),
         Key::Char('K') => (Some(Motion::Up), true),
         Key::Char('j') => (Some(Motion::Down), false),
