@@ -137,8 +137,27 @@ impl Screen {
 
     pub fn begin_frame(&mut self) {
         self.back.clear();
-        // Hide cursor + clear screen + home
-        self.back.extend_from_slice(b"\x1b[?25l\x1b[2J\x1b[H");
+        // Open a synchronized update (DEC private mode 2026) so the terminal
+        // buffers the whole frame and swaps it in atomically — it never
+        // displays a half-drawn or momentarily-blanked intermediate state,
+        // which is what causes flicker when redrawing the full screen every
+        // frame. Closed in `end_frame`. Terminals that don't implement 2026
+        // ignore the private-mode set/reset harmlessly.
+        //
+        // Then hide the cursor + home. We deliberately do NOT erase the whole
+        // display (`\x1b[2J`) here: the renderer erases each row to
+        // end-of-line (`clear_row`) just before overwriting it, avoiding both
+        // the full repaint and (on some terminals) `2J` spilling cleared rows
+        // into scrollback.
+        self.back.extend_from_slice(b"\x1b[?2026h\x1b[?25l\x1b[H");
+    }
+
+    /// Position at the start of `row` and erase it to end-of-line. The
+    /// renderer calls this for every viewport row in lieu of a per-frame
+    /// full-screen clear; rows past the buffer's end are erased the same
+    /// way so a short buffer never leaves stale content behind.
+    pub fn clear_row(&mut self, row: u16) {
+        let _ = write!(self.back, "\x1b[{};1H\x1b[K", row);
     }
 
     pub fn write_at(&mut self, row: u16, col: u16, text: &str) {
@@ -165,7 +184,11 @@ impl Screen {
     }
 
     pub fn end_frame(&mut self, cursor_row: u16, cursor_col: u16) -> io::Result<()> {
+        // Position + reveal the cursor, then close the synchronized update so
+        // the terminal presents the completed frame in one atomic swap.
+        // `\x1b[?2026l` must be the final bytes of the frame.
         let _ = write!(self.back, "\x1b[{};{}H\x1b[?25h", cursor_row, cursor_col);
+        self.back.extend_from_slice(b"\x1b[?2026l");
         let mut out = io::stdout();
         out.write_all(&self.back)?;
         out.flush()

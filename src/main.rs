@@ -3138,6 +3138,13 @@ fn render(
     screen.begin_frame();
     let cols = screen.cols;
     let viewport_rows = screen.rows.saturating_sub(1);
+    // Erase every content row to end-of-line up front (in place of a
+    // full-screen clear). Covers rows the buffer doesn't reach, so short
+    // buffers and upward scrolls don't leave stale glyphs behind. The
+    // status row is repainted full-width below, so it isn't cleared here.
+    for r in 1..=viewport_rows {
+        screen.clear_row(r);
+    }
     let primary = sels.primary();
     let head = primary.head;
     let start_byte = byte_at_line_cached(line_starts, top_line, bytes.len());
