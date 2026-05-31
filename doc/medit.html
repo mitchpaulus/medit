@@ -13,6 +13,22 @@
   kbd { font-family: ui-monospace, Consolas, monospace; background: #f0f0f0; border: 1px solid #ccc; border-radius: 3px; padding: 0 4px; font-size: 0.9em; }
   td:first-child { white-space: nowrap; }
   .note { color: #666; font-size: 0.9em; }
+
+  .kbd-legend { font-size: 0.82em; color: #555; margin: 0.3em 0 1em; }
+  .kbd-legend span { display:inline-block; margin-right:1.1em; }
+  .sw { display:inline-block; width:0.7em; height:0.7em; border-radius:2px; vertical-align:baseline; margin-right:3px; }
+  .kbd-diagram { margin: 0.4em 0 1.8em; overflow-x:auto; }
+  .kbd-rows { display:inline-flex; flex-direction:column; gap:5px; background:#fafafa; padding:10px; border:1px solid #e4e4e4; border-radius:8px; }
+  .kbd-row { display:flex; gap:5px; }
+  .kbd-row.r2 { margin-left:14px; } .kbd-row.r3 { margin-left:24px; } .kbd-row.r4 { margin-left:38px; }
+  .kbd-key { width:54px; min-height:50px; border:1px solid #cfcfcf; border-radius:5px; background:#fff;
+             display:flex; flex-direction:column; align-items:center; padding:3px 2px 4px; box-sizing:border-box; }
+  .kbd-key .g { font-family: ui-monospace, Consolas, monospace; font-weight:700; font-size:0.82em; line-height:1; color:#333; }
+  .kbd-key .a { font-size:0.56rem; line-height:1.08; text-align:center; margin-top:3px; color:#1a56b8; }
+  .kbd-key .a.ins { color:#177245; } .kbd-key .a.glob { color:#8a2bbd; }
+  .kbd-key.unbound { background:#f3f3f3; border-color:#e7e7e7; }
+  .kbd-key.unbound .g { color:#c2c2c2; }
+  .kbd-key.prefix { background:#fffbe6; border-color:#ecd98a; }
 </style>
 </head>
 <body>
@@ -21,11 +37,247 @@
 <p>A small modal text editor. Vim-like motions, Kakoune-like selection-first
 editing, multi-cursor.</p>
 
+<h2>Keyboard map</h2>
+<p>What every key does, by modifier. Letters/symbols show the glyph; the caption is the action. Dimmed keys are unbound. Lower- and upper-case maps are <em>normal mode</em>; the <kbd>Ctrl</kbd>/<kbd>Alt</kbd> maps fold in insert-mode (readline) bindings, colour-coded by mode.</p>
+<p class="kbd-legend"><span><span class="sw" style="background:#1a56b8"></span>normal mode</span><span><span class="sw" style="background:#177245"></span>insert mode</span><span><span class="sw" style="background:#8a2bbd"></span>global</span><span><span class="sw" style="background:#fffbe6;border:1px solid #ecd98a"></span>multi-key prefix</span></p>
+<h3>Unmodified (normal mode)</h3>
+<div class="kbd-diagram"><div class="kbd-rows">
+<div class="kbd-row r1">
+<div class="kbd-key unbound"><div class="g">`</div></div>
+<div class="kbd-key unbound"><div class="g">1</div></div>
+<div class="kbd-key unbound"><div class="g">2</div></div>
+<div class="kbd-key unbound"><div class="g">3</div></div>
+<div class="kbd-key unbound"><div class="g">4</div></div>
+<div class="kbd-key unbound"><div class="g">5</div></div>
+<div class="kbd-key unbound"><div class="g">6</div></div>
+<div class="kbd-key unbound"><div class="g">7</div></div>
+<div class="kbd-key unbound"><div class="g">8</div></div>
+<div class="kbd-key unbound"><div class="g">9</div></div>
+<div class="kbd-key unbound"><div class="g">0</div></div>
+<div class="kbd-key unbound"><div class="g">-</div></div>
+<div class="kbd-key unbound"><div class="g">=</div></div>
+</div>
+<div class="kbd-row r2">
+<div class="kbd-key"><div class="g">q</div><div class="a">close buf</div></div>
+<div class="kbd-key"><div class="g">w</div><div class="a">word →</div></div>
+<div class="kbd-key"><div class="g">e</div><div class="a">end word</div></div>
+<div class="kbd-key unbound"><div class="g">r</div></div>
+<div class="kbd-key"><div class="g">t</div><div class="a">till x→</div></div>
+<div class="kbd-key"><div class="g">y</div><div class="a">yank</div></div>
+<div class="kbd-key"><div class="g">u</div><div class="a">undo</div></div>
+<div class="kbd-key"><div class="g">i</div><div class="a">insert ◂</div></div>
+<div class="kbd-key"><div class="g">o</div><div class="a">open ↓</div></div>
+<div class="kbd-key"><div class="g">p</div><div class="a">paste ▸</div></div>
+<div class="kbd-key prefix"><div class="g">[</div><div class="a">[d diag</div></div>
+<div class="kbd-key prefix"><div class="g">]</div><div class="a">] diag</div></div>
+<div class="kbd-key unbound"><div class="g">\</div></div>
+</div>
+<div class="kbd-row r3">
+<div class="kbd-key"><div class="g">a</div><div class="a">insert ▸</div></div>
+<div class="kbd-key"><div class="g">s</div><div class="a">sel match</div></div>
+<div class="kbd-key"><div class="g">d</div><div class="a">delete</div></div>
+<div class="kbd-key"><div class="g">f</div><div class="a">find x→</div></div>
+<div class="kbd-key prefix"><div class="g">g</div><div class="a">g… prefix</div></div>
+<div class="kbd-key"><div class="g">h</div><div class="a">◀ left</div></div>
+<div class="kbd-key"><div class="g">j</div><div class="a">▼ down</div></div>
+<div class="kbd-key"><div class="g">k</div><div class="a">▲ up</div></div>
+<div class="kbd-key"><div class="g">l</div><div class="a">right ▶</div></div>
+<div class="kbd-key"><div class="g">;</div><div class="a">collapse</div></div>
+<div class="kbd-key unbound"><div class="g">'</div></div>
+</div>
+<div class="kbd-row r4">
+<div class="kbd-key prefix"><div class="g">z</div><div class="a">z… prefix</div></div>
+<div class="kbd-key"><div class="g">x</div><div class="a">sel line</div></div>
+<div class="kbd-key"><div class="g">c</div><div class="a">change</div></div>
+<div class="kbd-key unbound"><div class="g">v</div></div>
+<div class="kbd-key"><div class="g">b</div><div class="a">word ◀</div></div>
+<div class="kbd-key"><div class="g">n</div><div class="a">next match</div></div>
+<div class="kbd-key unbound"><div class="g">m</div></div>
+<div class="kbd-key"><div class="g">,</div><div class="a">1 sel</div></div>
+<div class="kbd-key unbound"><div class="g">.</div></div>
+<div class="kbd-key"><div class="g">/</div><div class="a">search /</div></div>
+</div>
+</div></div>
+<h3><kbd>Shift</kbd> &mdash; uppercase (normal mode)</h3>
+<div class="kbd-diagram"><div class="kbd-rows">
+<div class="kbd-row r1">
+<div class="kbd-key unbound"><div class="g">~</div></div>
+<div class="kbd-key unbound"><div class="g">!</div></div>
+<div class="kbd-key unbound"><div class="g">@</div></div>
+<div class="kbd-key unbound"><div class="g">#</div></div>
+<div class="kbd-key unbound"><div class="g">$</div></div>
+<div class="kbd-key unbound"><div class="g">%</div></div>
+<div class="kbd-key unbound"><div class="g">^</div></div>
+<div class="kbd-key unbound"><div class="g">&amp;</div></div>
+<div class="kbd-key"><div class="g">*</div><div class="a">sel word</div></div>
+<div class="kbd-key unbound"><div class="g">(</div></div>
+<div class="kbd-key unbound"><div class="g">)</div></div>
+<div class="kbd-key unbound"><div class="g">_</div></div>
+<div class="kbd-key unbound"><div class="g">+</div></div>
+</div>
+<div class="kbd-row r2">
+<div class="kbd-key unbound"><div class="g">Q</div></div>
+<div class="kbd-key"><div class="g">W</div><div class="a">ext →w</div></div>
+<div class="kbd-key"><div class="g">E</div><div class="a">ext we</div></div>
+<div class="kbd-key unbound"><div class="g">R</div></div>
+<div class="kbd-key"><div class="g">T</div><div class="a">till x◀</div></div>
+<div class="kbd-key unbound"><div class="g">Y</div></div>
+<div class="kbd-key"><div class="g">U</div><div class="a">redo</div></div>
+<div class="kbd-key"><div class="g">I</div><div class="a">insert ⇤</div></div>
+<div class="kbd-key"><div class="g">O</div><div class="a">open ↑</div></div>
+<div class="kbd-key"><div class="g">P</div><div class="a">paste ◂</div></div>
+<div class="kbd-key"><div class="g">{</div><div class="a">¶ prev</div></div>
+<div class="kbd-key"><div class="g">}</div><div class="a">¶ next</div></div>
+<div class="kbd-key unbound"><div class="g">|</div></div>
+</div>
+<div class="kbd-row r3">
+<div class="kbd-key"><div class="g">A</div><div class="a">insert ⇥</div></div>
+<div class="kbd-key unbound"><div class="g">S</div></div>
+<div class="kbd-key unbound"><div class="g">D</div></div>
+<div class="kbd-key"><div class="g">F</div><div class="a">find x◀</div></div>
+<div class="kbd-key"><div class="g">G</div><div class="a">last line</div></div>
+<div class="kbd-key"><div class="g">H</div><div class="a">line start</div></div>
+<div class="kbd-key"><div class="g">J</div><div class="a">ext ▼</div></div>
+<div class="kbd-key"><div class="g">K</div><div class="a">ext ▲</div></div>
+<div class="kbd-key"><div class="g">L</div><div class="a">line end</div></div>
+<div class="kbd-key"><div class="g">:</div><div class="a">Ex :</div></div>
+<div class="kbd-key unbound"><div class="g">"</div></div>
+</div>
+<div class="kbd-row r4">
+<div class="kbd-key unbound"><div class="g">Z</div></div>
+<div class="kbd-key unbound"><div class="g">X</div></div>
+<div class="kbd-key"><div class="g">C</div><div class="a">chg→EOL</div></div>
+<div class="kbd-key unbound"><div class="g">V</div></div>
+<div class="kbd-key"><div class="g">B</div><div class="a">ext ◀w</div></div>
+<div class="kbd-key"><div class="g">N</div><div class="a">prev match</div></div>
+<div class="kbd-key unbound"><div class="g">M</div></div>
+<div class="kbd-key"><div class="g">&lt;</div><div class="a">rot ◀</div></div>
+<div class="kbd-key"><div class="g">&gt;</div><div class="a">rot ▶</div></div>
+<div class="kbd-key unbound"><div class="g">?</div></div>
+</div>
+</div></div>
+<h3><kbd>Ctrl</kbd></h3>
+<div class="kbd-diagram"><div class="kbd-rows">
+<div class="kbd-row r1">
+<div class="kbd-key unbound"><div class="g">`</div></div>
+<div class="kbd-key unbound"><div class="g">1</div></div>
+<div class="kbd-key unbound"><div class="g">2</div></div>
+<div class="kbd-key unbound"><div class="g">3</div></div>
+<div class="kbd-key unbound"><div class="g">4</div></div>
+<div class="kbd-key unbound"><div class="g">5</div></div>
+<div class="kbd-key unbound"><div class="g">6</div></div>
+<div class="kbd-key unbound"><div class="g">7</div></div>
+<div class="kbd-key unbound"><div class="g">8</div></div>
+<div class="kbd-key unbound"><div class="g">9</div></div>
+<div class="kbd-key unbound"><div class="g">0</div></div>
+<div class="kbd-key unbound"><div class="g">-</div></div>
+<div class="kbd-key unbound"><div class="g">=</div></div>
+</div>
+<div class="kbd-row r2">
+<div class="kbd-key unbound"><div class="g">q</div></div>
+<div class="kbd-key"><div class="g">w</div><div class="a ins">del word◀</div></div>
+<div class="kbd-key"><div class="g">e</div><div class="a ins">line end</div></div>
+<div class="kbd-key unbound"><div class="g">r</div></div>
+<div class="kbd-key unbound"><div class="g">t</div></div>
+<div class="kbd-key unbound"><div class="g">y</div></div>
+<div class="kbd-key"><div class="g">u</div><div class="a">↑ 10 ln</div><div class="a ins">kill→BOL</div></div>
+<div class="kbd-key unbound"><div class="g">i</div></div>
+<div class="kbd-key"><div class="g">o</div><div class="a">jump back</div></div>
+<div class="kbd-key unbound"><div class="g">p</div></div>
+<div class="kbd-key unbound"><div class="g">[</div></div>
+<div class="kbd-key unbound"><div class="g">]</div></div>
+<div class="kbd-key unbound"><div class="g">\</div></div>
+</div>
+<div class="kbd-row r3">
+<div class="kbd-key"><div class="g">a</div><div class="a ins">line start</div></div>
+<div class="kbd-key unbound"><div class="g">s</div></div>
+<div class="kbd-key"><div class="g">d</div><div class="a">↓ 10 ln</div></div>
+<div class="kbd-key"><div class="g">f</div><div class="a ins">char ▶</div></div>
+<div class="kbd-key unbound"><div class="g">g</div></div>
+<div class="kbd-key unbound"><div class="g">h</div></div>
+<div class="kbd-key"><div class="g">j</div><div class="a">+cur ▾</div></div>
+<div class="kbd-key"><div class="g">k</div><div class="a">+cur ▴</div><div class="a ins">kill→EOL</div></div>
+<div class="kbd-key unbound"><div class="g">l</div></div>
+<div class="kbd-key unbound"><div class="g">;</div></div>
+<div class="kbd-key unbound"><div class="g">'</div></div>
+</div>
+<div class="kbd-row r4">
+<div class="kbd-key unbound"><div class="g">z</div></div>
+<div class="kbd-key unbound"><div class="g">x</div></div>
+<div class="kbd-key"><div class="g">c</div><div class="a glob">quit</div></div>
+<div class="kbd-key unbound"><div class="g">v</div></div>
+<div class="kbd-key"><div class="g">b</div><div class="a ins">char ◀</div></div>
+<div class="kbd-key unbound"><div class="g">n</div></div>
+<div class="kbd-key unbound"><div class="g">m</div></div>
+<div class="kbd-key unbound"><div class="g">,</div></div>
+<div class="kbd-key unbound"><div class="g">.</div></div>
+<div class="kbd-key unbound"><div class="g">/</div></div>
+</div>
+</div></div>
+<h3><kbd>Alt</kbd></h3>
+<div class="kbd-diagram"><div class="kbd-rows">
+<div class="kbd-row r1">
+<div class="kbd-key unbound"><div class="g">`</div></div>
+<div class="kbd-key unbound"><div class="g">1</div></div>
+<div class="kbd-key unbound"><div class="g">2</div></div>
+<div class="kbd-key unbound"><div class="g">3</div></div>
+<div class="kbd-key unbound"><div class="g">4</div></div>
+<div class="kbd-key unbound"><div class="g">5</div></div>
+<div class="kbd-key unbound"><div class="g">6</div></div>
+<div class="kbd-key unbound"><div class="g">7</div></div>
+<div class="kbd-key unbound"><div class="g">8</div></div>
+<div class="kbd-key unbound"><div class="g">9</div></div>
+<div class="kbd-key unbound"><div class="g">0</div></div>
+<div class="kbd-key unbound"><div class="g">-</div></div>
+<div class="kbd-key unbound"><div class="g">=</div></div>
+</div>
+<div class="kbd-row r2">
+<div class="kbd-key unbound"><div class="g">q</div></div>
+<div class="kbd-key unbound"><div class="g">w</div></div>
+<div class="kbd-key unbound"><div class="g">e</div></div>
+<div class="kbd-key unbound"><div class="g">r</div></div>
+<div class="kbd-key unbound"><div class="g">t</div></div>
+<div class="kbd-key unbound"><div class="g">y</div></div>
+<div class="kbd-key unbound"><div class="g">u</div></div>
+<div class="kbd-key prefix"><div class="g">i</div><div class="a">inner obj</div></div>
+<div class="kbd-key unbound"><div class="g">o</div></div>
+<div class="kbd-key unbound"><div class="g">p</div></div>
+<div class="kbd-key unbound"><div class="g">[</div></div>
+<div class="kbd-key unbound"><div class="g">]</div></div>
+<div class="kbd-key unbound"><div class="g">\</div></div>
+</div>
+<div class="kbd-row r3">
+<div class="kbd-key prefix"><div class="g">a</div><div class="a">around obj</div></div>
+<div class="kbd-key unbound"><div class="g">s</div></div>
+<div class="kbd-key unbound"><div class="g">d</div></div>
+<div class="kbd-key"><div class="g">f</div><div class="a ins">word ▶</div></div>
+<div class="kbd-key unbound"><div class="g">g</div></div>
+<div class="kbd-key unbound"><div class="g">h</div></div>
+<div class="kbd-key unbound"><div class="g">j</div></div>
+<div class="kbd-key unbound"><div class="g">k</div></div>
+<div class="kbd-key unbound"><div class="g">l</div></div>
+<div class="kbd-key unbound"><div class="g">;</div></div>
+<div class="kbd-key unbound"><div class="g">'</div></div>
+</div>
+<div class="kbd-row r4">
+<div class="kbd-key unbound"><div class="g">z</div></div>
+<div class="kbd-key unbound"><div class="g">x</div></div>
+<div class="kbd-key unbound"><div class="g">c</div></div>
+<div class="kbd-key unbound"><div class="g">v</div></div>
+<div class="kbd-key"><div class="g">b</div><div class="a ins">word ◀</div></div>
+<div class="kbd-key unbound"><div class="g">n</div></div>
+<div class="kbd-key unbound"><div class="g">m</div></div>
+<div class="kbd-key unbound"><div class="g">,</div></div>
+<div class="kbd-key unbound"><div class="g">.</div></div>
+<div class="kbd-key unbound"><div class="g">/</div></div>
+</div>
+</div></div>
+
 <h2>Modes</h2>
 <table>
 <tr><th>Mode</th><th>Enter from Normal</th><th>Exit</th></tr>
 <tr><td>Normal</td><td>(default)</td><td>&mdash;</td></tr>
-<tr><td>Insert</td><td><kbd>i</kbd> <kbd>a</kbd> <kbd>I</kbd> <kbd>A</kbd> <kbd>o</kbd> <kbd>O</kbd> <kbd>c</kbd></td><td><kbd>Esc</kbd> or <kbd>jf</kbd></td></tr>
+<tr><td>Insert</td><td><kbd>i</kbd> <kbd>a</kbd> <kbd>I</kbd> <kbd>A</kbd> <kbd>o</kbd> <kbd>O</kbd> <kbd>c</kbd> <kbd>C</kbd></td><td><kbd>Esc</kbd> or <kbd>jf</kbd></td></tr>
 <tr><td>Ex</td><td><kbd>:</kbd></td><td><kbd>Enter</kbd> / <kbd>Esc</kbd></td></tr>
 <tr><td>Search</td><td><kbd>/</kbd> or <kbd>s</kbd></td><td><kbd>Enter</kbd> / <kbd>Esc</kbd></td></tr>
 </table>
@@ -34,7 +286,8 @@ editing, multi-cursor.</p>
 <table>
 <tr><th>Key</th><th>Action</th></tr>
 <tr><td><kbd>h</kbd> <kbd>j</kbd> <kbd>k</kbd> <kbd>l</kbd></td><td>Left / down / up / right</td></tr>
-<tr><td><kbd>H</kbd> <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd></td><td>Same, extending the selection</td></tr>
+<tr><td><kbd>H</kbd> / <kbd>L</kbd></td><td>Line start / line end</td></tr>
+<tr><td><kbd>J</kbd> / <kbd>K</kbd></td><td>Down / up, extending the selection</td></tr>
 <tr><td>Arrows, <kbd>Home</kbd>, <kbd>End</kbd></td><td>Move; with <kbd>Shift</kbd> extends</td></tr>
 <tr><td><kbd>w</kbd> / <kbd>b</kbd> / <kbd>e</kbd></td><td>Next word start / prev word start / word end</td></tr>
 <tr><td><kbd>W</kbd> / <kbd>B</kbd> / <kbd>E</kbd></td><td>Same, extending</td></tr>
@@ -56,6 +309,7 @@ editing, multi-cursor.</p>
 <tr><td><kbd>o</kbd> / <kbd>O</kbd></td><td>Open line below / above</td></tr>
 <tr><td><kbd>d</kbd></td><td>Delete selection (into register)</td></tr>
 <tr><td><kbd>c</kbd></td><td>Change selection (delete + enter Insert)</td></tr>
+<tr><td><kbd>C</kbd></td><td>Change to end of line (delete cursor&rarr;EOL + enter Insert)</td></tr>
 <tr><td><kbd>y</kbd></td><td>Yank primary selection</td></tr>
 <tr><td><kbd>p</kbd> / <kbd>P</kbd></td><td>Paste after / before</td></tr>
 <tr><td><kbd>u</kbd> / <kbd>U</kbd></td><td>Undo / redo</td></tr>

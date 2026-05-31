@@ -860,6 +860,10 @@ pub fn handle_normal(
                 op_change_multi(buffer, sels, mode, registers);
                 return false;
             }
+            Key::Char('C') => {
+                op_change_to_line_end_multi(buffer, sels, mode, registers);
+                return false;
+            }
             Key::Char('y') => {
                 op_yank(buffer, sels.primary(), registers);
                 return false;
@@ -1822,6 +1826,42 @@ pub fn op_change_multi(
     *mode = Mode::Insert;
 }
 
+/// `C` (Vim's `c$`): change from each cursor to the end of its line. Deletes
+/// `[head, line_end)` — never the trailing newline — and enters insert mode.
+/// The primary cursor's deleted text goes to the default register. Cursors
+/// are processed in buffer order, each shifted by the bytes earlier deletes
+/// removed, so it behaves with multiple selections.
+pub fn op_change_to_line_end_multi(
+    buffer: &mut Buffer,
+    sels: &mut Selections,
+    mode: &mut Mode,
+    registers: &mut Registers,
+) {
+    let initial = collect_bytes(buffer);
+    let primary = *sels.primary();
+    let p_le = line_end(&initial, primary.head);
+    if p_le > primary.head {
+        registers.default = initial[primary.head..p_le].to_vec();
+    }
+    buffer.mark_commit_point(snapshot_of(sels.primary()));
+
+    let indices = sels.indices_by_position();
+    let mut shift: i64 = 0;
+    for &idx in &indices {
+        let now = collect_bytes(buffer);
+        let sel = &mut sels.list[idx];
+        sel.head = (sel.head as i64 + shift).max(0) as usize;
+        let le = line_end(&now, sel.head);
+        let len = le.saturating_sub(sel.head);
+        if len > 0 {
+            buffer.delete(sel.head, len);
+            shift -= len as i64;
+        }
+        sel.anchor = sel.head;
+    }
+    *mode = Mode::Insert;
+}
+
 pub fn op_paste_after(buffer: &mut Buffer, sel: &mut Selection, registers: &Registers) {
     if registers.default.is_empty() {
         return;
@@ -2582,5 +2622,41 @@ mod tests {
         // Should not panic and should leave the cursor visible.
         let row = 5 - top;
         assert!(row < 3);
+    }
+
+    #[test]
+    fn change_to_line_end_deletes_to_eol_and_enters_insert() {
+        let mut buffer = Buffer::from_bytes(b"hello world\nsecond\n".to_vec());
+        let mut sels = Selections::new();
+        {
+            let p = sels.primary_mut();
+            p.head = 6; // start of "world"
+            p.anchor = 6;
+        }
+        let mut mode = Mode::Normal;
+        let mut regs = Registers { default: Vec::new() };
+        op_change_to_line_end_multi(&mut buffer, &mut sels, &mut mode, &mut regs);
+        assert_eq!(collect_bytes(&buffer), b"hello \nsecond\n");
+        assert_eq!(mode, Mode::Insert);
+        assert_eq!(regs.default, b"world"); // killed text goes to default reg
+        assert_eq!(sels.primary().head, 6); // cursor stays where the change began
+    }
+
+    #[test]
+    fn change_to_line_end_keeps_newline_when_at_eol() {
+        // Cursor sitting on the newline: nothing to delete, newline preserved,
+        // still drops into insert mode (matches Vim `C` on an empty tail).
+        let mut buffer = Buffer::from_bytes(b"abc\ndef\n".to_vec());
+        let mut sels = Selections::new();
+        {
+            let p = sels.primary_mut();
+            p.head = 3; // the '\n' after "abc"
+            p.anchor = 3;
+        }
+        let mut mode = Mode::Normal;
+        let mut regs = Registers { default: Vec::new() };
+        op_change_to_line_end_multi(&mut buffer, &mut sels, &mut mode, &mut regs);
+        assert_eq!(collect_bytes(&buffer), b"abc\ndef\n");
+        assert_eq!(mode, Mode::Insert);
     }
 }
