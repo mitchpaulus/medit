@@ -872,7 +872,7 @@ pub fn handle_normal(
                 *mode = Mode::Ex;
                 return false;
             }
-            Key::Char('d') => {
+            Key::Char('d') | Key::Delete => {
                 op_delete_multi(buffer, sels, registers);
                 return false;
             }
@@ -995,6 +995,7 @@ pub fn handle_insert(
             }
         }
         Key::Backspace => backspace_multi(buffer, sels),
+        Key::Delete => delete_forward_multi(buffer, sels),
         Key::Tab => insert_text_multi(buffer, sels, b"\t"),
         Key::Left | Key::Right | Key::Up | Key::Down | Key::Home | Key::End => {
             let bytes = collect_bytes(buffer);
@@ -1241,6 +1242,29 @@ fn backspace_multi(buffer: &mut Buffer, sels: &mut Selections) {
         let len = sel.head - new_head;
         buffer.delete(new_head, len);
         sel.head = new_head;
+        if sel.anchor > sel.head {
+            sel.anchor = sel.anchor.saturating_sub(len);
+        }
+        shift -= len as i64;
+    }
+}
+
+/// Delete the character at each selection's head (forward delete), shifting
+/// subsequent selections.
+fn delete_forward_multi(buffer: &mut Buffer, sels: &mut Selections) {
+    let indices = sels.indices_by_position();
+    let mut shift: i64 = 0;
+    for &idx in &indices {
+        let now = collect_bytes(buffer);
+        let sel = &mut sels.list[idx];
+        sel.anchor = (sel.anchor as i64 + shift).max(0) as usize;
+        sel.head = (sel.head as i64 + shift).max(0) as usize;
+        if sel.head >= now.len() {
+            continue;
+        }
+        let next = next_char_or_end(&now, sel.head);
+        let len = next - sel.head;
+        buffer.delete(sel.head, len);
         if sel.anchor > sel.head {
             sel.anchor = sel.anchor.saturating_sub(len);
         }
