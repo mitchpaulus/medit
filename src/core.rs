@@ -917,6 +917,14 @@ pub fn handle_normal(
     }
 
     let (motion, extend) = match k.key {
+        // Ctrl reinstates the extend variants that Shift can't provide on the
+        // h/l axis (Shift there is spent on the line motions below). Ctrl-h/l
+        // extend left/right (the Kakoune `H`/`L`); add Shift to extend the
+        // *line* motion. `Ctrl-Shift-h` normalizes to `Char('H') + CTRL`.
+        Key::Char('h') if k.mods.contains(Mods::CTRL) => (Some(Motion::Left), true),
+        Key::Char('l') if k.mods.contains(Mods::CTRL) => (Some(Motion::Right), true),
+        Key::Char('H') if k.mods.contains(Mods::CTRL) => (Some(Motion::LineStart), true),
+        Key::Char('L') if k.mods.contains(Mods::CTRL) => (Some(Motion::LineEnd), true),
         Key::Char('h') => (Some(Motion::Left), false),
         Key::Char('H') => (Some(Motion::LineStart), false),
         Key::Char('l') => (Some(Motion::Right), false),

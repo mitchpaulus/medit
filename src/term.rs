@@ -119,6 +119,13 @@ impl Screen {
         let mut out = io::stdout();
         out.write_all(b"\x1b[?1049h")?;
         out.write_all(b"\x1b[>17u")?;
+        // Enable Windows Terminal's win32-input-mode alongside the kitty push.
+        // The two are mutually exclusive in practice: kitty terminals honor
+        // `>17u` and ignore this unknown DEC private mode, while WT ignores
+        // `>17u` and honors this — reporting every key as an `ESC [ … _` record
+        // that carries full modifier state (so e.g. Ctrl-Shift is no longer
+        // indistinguishable from a bare control byte). See `decode_win32`.
+        out.write_all(b"\x1b[?9001h")?;
         out.flush()?;
         let (cols, rows) = term_size()?;
         Ok(Self {
@@ -199,6 +206,7 @@ impl Drop for Screen {
     fn drop(&mut self) {
         let mut out = io::stdout();
         let _ = out.write_all(b"\x1b[<u");
+        let _ = out.write_all(b"\x1b[?9001l"); // disable win32-input-mode
         let _ = out.write_all(b"\x1b[0 q");
         let _ = out.write_all(b"\x1b[?25h\x1b[?1049l");
         let _ = out.flush();
