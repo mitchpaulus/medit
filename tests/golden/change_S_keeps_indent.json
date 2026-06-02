@@ -1,0 +1,7 @@
+{
+  "name": "S on an indented line keeps the leading indentation and enters insert just after it",
+  "initial": "    ab<c>\ndef",
+  "keys": "SX\u001b[27u",
+  "expected": "    <X>\ndef",
+  "expected_mode": "normal"
+}

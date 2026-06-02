@@ -1,0 +1,7 @@
+{
+  "name": "S substitutes the whole line: deletes its contents, keeps the empty line, enters insert at line start",
+  "initial": "ab<c>\ndef",
+  "keys": "SX\u001b[27u",
+  "expected": "<X>\ndef",
+  "expected_mode": "normal"
+}

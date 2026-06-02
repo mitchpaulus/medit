@@ -884,6 +884,10 @@ pub fn handle_normal(
                 op_change_to_line_end_multi(buffer, sels, mode, registers);
                 return false;
             }
+            Key::Char('S') => {
+                op_substitute_line_multi(buffer, sels, mode, registers);
+                return false;
+            }
             Key::Char('D') => {
                 op_delete_to_line_end_multi(buffer, sels, registers);
                 return false;
@@ -1918,6 +1922,47 @@ pub fn op_change_to_line_end_multi(
     *mode = Mode::Insert;
 }
 
+/// `S` (Vim's `cc` with autoindent): change the line's text at each cursor
+/// while keeping its leading indentation. Deletes `[indent_end, line_end)` —
+/// the line's leading whitespace and trailing newline both survive — and
+/// enters insert mode just after the preserved indent. The primary cursor's
+/// deleted text goes to the default register. Cursors are processed in buffer
+/// order, each shifted by the bytes earlier deletes removed, so it behaves
+/// with multiple selections (one per line).
+pub fn op_substitute_line_multi(
+    buffer: &mut Buffer,
+    sels: &mut Selections,
+    mode: &mut Mode,
+    registers: &mut Registers,
+) {
+    let initial = collect_bytes(buffer);
+    let primary = *sels.primary();
+    let p_is = indent_end(&initial, primary.head);
+    let p_le = line_end(&initial, primary.head);
+    if p_le > p_is {
+        registers.default = initial[p_is..p_le].to_vec();
+    }
+    buffer.mark_commit_point(snapshot_of(sels.primary()));
+
+    let indices = sels.indices_by_position();
+    let mut shift: i64 = 0;
+    for &idx in &indices {
+        let now = collect_bytes(buffer);
+        let sel = &mut sels.list[idx];
+        sel.head = (sel.head as i64 + shift).max(0) as usize;
+        let is = indent_end(&now, sel.head);
+        let le = line_end(&now, sel.head);
+        let len = le.saturating_sub(is);
+        if len > 0 {
+            buffer.delete(is, len);
+            shift -= len as i64;
+        }
+        sel.head = is;
+        sel.anchor = is;
+    }
+    *mode = Mode::Insert;
+}
+
 /// `D` (Vim's `d$`): delete from each cursor to the end of its line —
 /// `[head, line_end)`, never the trailing newline — and stay in normal mode.
 /// The primary cursor's deleted text goes to the default register. Each
@@ -2475,6 +2520,17 @@ pub fn line_start(bytes: &[u8], offset: usize) -> usize {
         }
     }
     0
+}
+
+/// Offset of the first non-blank byte on `offset`'s line (the end of its
+/// leading indentation). For a blank or all-whitespace line this is the line
+/// end. Used by `S` to preserve indentation while clearing the line's text.
+pub fn indent_end(bytes: &[u8], offset: usize) -> usize {
+    let mut p = line_start(bytes, offset);
+    while matches!(bytes.get(p), Some(b' ') | Some(b'\t')) {
+        p += 1;
+    }
+    p
 }
 
 /// Search for `target` within the current line per `op`. The search
