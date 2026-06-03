@@ -2128,7 +2128,7 @@ enum CompletionKeyOutcome {
 
 /// Try to handle an insert-mode keystroke as a completion-popup
 /// interaction.
-/// - Tab/Enter when the popup is showing accept the highlighted item.
+/// - Tab/Enter/Ctrl-Y when the popup is showing accept the highlighted item.
 /// - Down/Up and Ctrl-N/Ctrl-P navigate the selection.
 /// - Esc with the popup showing closes the popup without exiting
 ///   insert mode (the next Esc behaves normally).
@@ -2148,8 +2148,7 @@ fn handle_completion_keys(
     // handler so the generic word/LSP accept doesn't run.
     if comp.is_path_session
         && comp.is_visible()
-        && k.mods.is_empty()
-        && (k.key == Key::Tab || k.key == Key::Enter)
+        && is_completion_accept_key(k)
     {
         accept_path_completion(comp, eb);
         return CompletionKeyOutcome::InterceptedNoChange;
@@ -2176,7 +2175,7 @@ fn handle_completion_keys(
     if !comp.is_visible() {
         return CompletionKeyOutcome::NotIntercepted;
     }
-    if k.mods.is_empty() && (k.key == Key::Tab || k.key == Key::Enter) {
+    if is_completion_accept_key(k) {
         accept_completion(comp, eb);
         return CompletionKeyOutcome::InterceptedAccepted;
     }
@@ -2202,6 +2201,11 @@ fn handle_completion_keys(
         return CompletionKeyOutcome::InterceptedNoChange;
     }
     CompletionKeyOutcome::NotIntercepted
+}
+
+fn is_completion_accept_key(k: KeyEvent) -> bool {
+    (k.mods.is_empty() && (k.key == Key::Tab || k.key == Key::Enter))
+        || (k.mods == Mods::CTRL && k.key == Key::Char('y'))
 }
 
 /// Apply the highlighted completion item to the buffer: replace
@@ -3884,6 +3888,73 @@ fn render(
     let block_cursor = mode == Mode::Normal;
     screen.set_cursor_shape(block_cursor);
     screen.end_frame(final_cur_row, final_cur_col)
+}
+
+#[cfg(test)]
+mod completion_key_tests {
+    use super::{
+        CompletionKeyOutcome, CompletionUi, EditorBuffer, collect_bytes, handle_completion_keys,
+    };
+    use medit::buffer::Buffer;
+    use medit::completion::CompletionItem;
+    use medit::input::{Key, KeyEvent, Mods};
+
+    fn item(text: &str) -> CompletionItem {
+        CompletionItem {
+            label: text.to_string(),
+            filter_text: text.to_string(),
+            insert_text: text.to_string(),
+            sort_text: text.to_string(),
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn ctrl_y_accepts_visible_completion() {
+        let mut eb = EditorBuffer::new(Buffer::from_bytes(b"fo".to_vec()), None);
+        eb.sels.primary_mut().head = 2;
+        eb.sels.primary_mut().anchor = 2;
+
+        let mut comp = CompletionUi::new();
+        comp.set_items(vec![item("food")], 0, "fo".to_string());
+
+        let outcome = handle_completion_keys(
+            &mut comp,
+            &mut eb,
+            KeyEvent {
+                key: Key::Char('y'),
+                mods: Mods::CTRL,
+            },
+        );
+
+        assert!(matches!(outcome, CompletionKeyOutcome::InterceptedAccepted));
+        assert_eq!(collect_bytes(&eb.buffer), b"food");
+        assert!(!comp.is_visible());
+    }
+
+    #[test]
+    fn ctrl_y_accepts_visible_path_completion() {
+        let mut eb = EditorBuffer::new(Buffer::from_bytes(b"Car".to_vec()), None);
+        eb.sels.primary_mut().head = 3;
+        eb.sels.primary_mut().anchor = 3;
+
+        let mut comp = CompletionUi::new();
+        comp.set_items(vec![item("Cargo.toml")], 0, "Car".to_string());
+        comp.is_path_session = true;
+
+        let outcome = handle_completion_keys(
+            &mut comp,
+            &mut eb,
+            KeyEvent {
+                key: Key::Char('y'),
+                mods: Mods::CTRL,
+            },
+        );
+
+        assert!(matches!(outcome, CompletionKeyOutcome::InterceptedNoChange));
+        assert_eq!(collect_bytes(&eb.buffer), b"Cargo.toml");
+        assert!(!comp.is_visible());
+    }
 }
 
 #[cfg(test)]
