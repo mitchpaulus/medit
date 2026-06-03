@@ -10,7 +10,8 @@
 //!   identifier prefix at the cursor first reaches two characters.
 //! - **mshell**: trigger character `@` (variable completion). The `@`
 //!   itself is part of the replacement range — the server returns
-//!   items that include the `@` prefix.
+//!   items that include the `@` prefix. Also auto-triggers when the
+//!   identifier prefix at the cursor first reaches three characters.
 
 /// Per-language rules for when to open the completion popup.
 pub struct CompletionTriggers {
@@ -74,7 +75,7 @@ pub fn triggers_for(lang_id: &str) -> Option<CompletionTriggers> {
                 ch: '@',
                 anchor_includes_char: true,
             }],
-            min_identifier_prefix: None,
+            min_identifier_prefix: Some(3),
         }),
         // Markdown/djot has no LSP; completions come from words already in
         // the buffer (see [`is_buffer_source`]). Auto-trigger once the word
@@ -394,10 +395,15 @@ mod tests {
     }
 
     #[test]
-    fn mshell_no_prefix_trigger() {
-        // mshell only triggers on `@`, never on bare identifier
-        // chars.
-        assert!(matches!(detect(b"foo", 3, &msh()), TriggerDecision::None));
+    fn mshell_prefix_triggers_at_three_chars() {
+        // 2 chars: no trigger.
+        assert!(matches!(detect(b"fo", 2, &msh()), TriggerDecision::None));
+        // 3 chars: fires, anchored at the word start.
+        assert_eq!(parts(&detect(b"foo", 3, &msh())), Some((3, 0, None)));
+        // 4 chars: extending an existing word, no re-trigger.
+        assert!(matches!(detect(b"foob", 4, &msh()), TriggerDecision::None));
+        // `@` trigger still takes precedence and includes the sign.
+        assert_eq!(parts(&detect(b"echo @", 6, &msh())), Some((6, 5, Some('@'))));
     }
 
     #[test]
