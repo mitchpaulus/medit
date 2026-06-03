@@ -100,6 +100,13 @@ struct CompletionUi {
     /// Debounced trigger waiting to fire. `None` when nothing is
     /// queued (no recent trigger, or already fired).
     pending: Option<PendingTrigger>,
+    /// `true` while the popup is showing filesystem path completions
+    /// (opened with `Alt-/`). Path sessions accept, refilter, and descend
+    /// directories through their own logic rather than the word/LSP path.
+    is_path_session: bool,
+    /// When the path is being typed inside a string literal, the opening
+    /// quote char — used to auto-close the string when a file is accepted.
+    path_quote: Option<char>,
 }
 
 struct PendingTrigger {
@@ -119,6 +126,8 @@ impl CompletionUi {
             selected: 0,
             is_incomplete: false,
             pending: None,
+            is_path_session: false,
+            path_quote: None,
         }
     }
 
@@ -138,11 +147,22 @@ impl CompletionUi {
     ) {
         self.request_id = None;
         self.is_incomplete = false;
+        self.is_path_session = false;
+        self.path_quote = None;
         self.anchor = anchor;
         self.filtered = medit::completion::filter_items(&items, &prefix);
         self.prefix = prefix;
         self.items = items;
         self.selected = 0;
+    }
+
+    /// Populate the popup with filesystem path items (the `Alt-/` source)
+    /// and flag the session so subsequent keys route through path logic.
+    fn set_path_items(&mut self, pc: medit::path_complete::PathCompletion) {
+        let quote = pc.quote;
+        self.set_items(pc.items, pc.anchor, pc.prefix);
+        self.is_path_session = true;
+        self.path_quote = quote;
     }
 
     /// Clear all state — popup closes, in-flight request is forgotten
@@ -155,6 +175,8 @@ impl CompletionUi {
         self.is_incomplete = false;
         self.pending = None;
         self.prefix.clear();
+        self.is_path_session = false;
+        self.path_quote = None;
     }
 }
 
@@ -2115,6 +2137,23 @@ fn handle_completion_keys(
     eb: &mut EditorBuffer,
     k: KeyEvent,
 ) -> CompletionKeyOutcome {
+    // Alt-/ : open a path-only completion popup from the filesystem,
+    // regardless of language or whether another popup is showing. Synchronous
+    // (no LSP round trip), so we fill it right here.
+    if k.mods == Mods::ALT && k.key == Key::Char('/') {
+        open_path_completion(comp, eb);
+        return CompletionKeyOutcome::InterceptedNoChange;
+    }
+    // Path sessions accept (and chain into directories) through their own
+    // handler so the generic word/LSP accept doesn't run.
+    if comp.is_path_session
+        && comp.is_visible()
+        && k.mods.is_empty()
+        && (k.key == Key::Tab || k.key == Key::Enter)
+    {
+        accept_path_completion(comp, eb);
+        return CompletionKeyOutcome::InterceptedNoChange;
+    }
     // Ctrl-n with no popup open: manually force completion on the word
     // prefix under the cursor, at any length (the manual counterpart to the
     // automatic triggers). We arm a debounced `Invoked` request anchored at
@@ -2202,6 +2241,115 @@ fn accept_completion(comp: &mut CompletionUi, eb: &mut EditorBuffer) {
     comp.close();
 }
 
+/// Open the `Alt-/` filesystem path popup at the primary cursor. Gathers
+/// matching entries synchronously; closes any existing popup when there's
+/// nothing to offer or multi-cursor is engaged.
+fn open_path_completion(comp: &mut CompletionUi, eb: &EditorBuffer) {
+    if eb.sels.len() != 1 {
+        comp.close();
+        return;
+    }
+    let cursor = eb.sels.primary().head;
+    let bytes = collect_bytes(&eb.buffer);
+    match medit::path_complete::complete(&bytes, cursor) {
+        Some(pc) => comp.set_path_items(pc),
+        None => comp.close(),
+    }
+}
+
+/// Accept the highlighted path item: replace `[anchor..cursor]` with its
+/// `insert_text`. When the item is a directory (its text ends with a
+/// separator) re-open path completion one level deeper so the user can keep
+/// walking the tree; otherwise the popup closes.
+fn accept_path_completion(comp: &mut CompletionUi, eb: &mut EditorBuffer) {
+    let item_idx = match comp.filtered.get(comp.selected) {
+        Some(&i) => i,
+        None => {
+            comp.close();
+            return;
+        }
+    };
+    let insert_text = comp.items[item_idx].insert_text.clone();
+    if eb.sels.len() != 1 {
+        comp.close();
+        return;
+    }
+    let cursor = eb.sels.primary().head;
+    if comp.anchor > cursor {
+        comp.close();
+        return;
+    }
+    let range_len = cursor - comp.anchor;
+    if range_len > 0 {
+        eb.buffer.delete(comp.anchor, range_len);
+    }
+    eb.buffer.insert(comp.anchor, insert_text.as_bytes());
+    let mut new_head = comp.anchor + insert_text.len();
+    let descended = insert_text.ends_with(['/', '\\']);
+
+    // Accepting a file (not a directory) inside a string literal closes the
+    // quote for you — unless the matching quote is already right there.
+    if !descended
+        && let Some(qc) = comp.path_quote
+    {
+        let here = collect_bytes(&eb.buffer);
+        if here.get(new_head) != Some(&(qc as u8)) {
+            let mut buf = [0u8; 4];
+            let s = qc.encode_utf8(&mut buf);
+            eb.buffer.insert(new_head, s.as_bytes());
+            new_head += s.len();
+        }
+    }
+
+    let bytes = collect_bytes(&eb.buffer);
+    let p = eb.sels.primary_mut();
+    p.head = new_head;
+    p.anchor = new_head;
+    p.desired_col = display_col(&bytes, line_start(&bytes, new_head), new_head);
+
+    comp.close();
+    if descended
+        && let Some(pc) = medit::path_complete::complete(&bytes, new_head)
+    {
+        comp.set_path_items(pc);
+    }
+}
+
+/// Refilter (or re-gather) the path popup after an insert-mode mutation.
+/// Typing a separator descends a level; other characters narrow the current
+/// listing, falling back to a fresh gather when the narrowed filter empties
+/// (e.g. a space extended the directory part).
+fn update_path_completion_after_insert(comp: &mut CompletionUi, eb: &EditorBuffer) {
+    if eb.sels.len() != 1 {
+        comp.close();
+        return;
+    }
+    let cursor = eb.sels.primary().head;
+    let bytes = collect_bytes(&eb.buffer);
+    if comp.anchor > cursor || cursor > bytes.len() {
+        comp.close();
+        return;
+    }
+    let typed_sep = cursor > 0 && (bytes[cursor - 1] == b'/' || bytes[cursor - 1] == b'\\');
+    if typed_sep {
+        match medit::path_complete::complete(&bytes, cursor) {
+            Some(pc) => comp.set_path_items(pc),
+            None => comp.close(),
+        }
+        return;
+    }
+    comp.prefix = String::from_utf8_lossy(&bytes[comp.anchor..cursor]).into_owned();
+    comp.filtered = medit::completion::filter_items(&comp.items, &comp.prefix);
+    if comp.filtered.is_empty() {
+        match medit::path_complete::complete(&bytes, cursor) {
+            Some(pc) => comp.set_path_items(pc),
+            None => comp.close(),
+        }
+    } else {
+        comp.selected = 0;
+    }
+}
+
 /// Recompute completion state after an insert-mode mutation. Refilters
 /// the popup against the new prefix if one is open, and arms a
 /// debounced completion request if the keystroke landed on a trigger
@@ -2209,11 +2357,32 @@ fn accept_completion(comp: &mut CompletionUi, eb: &mut EditorBuffer) {
 /// multi-cursor is engaged, when the language doesn't have completion
 /// rules, or when the cursor moved out of `[anchor..]`.
 fn update_completion_after_insert(comp: &mut CompletionUi, eb: &EditorBuffer) {
+    // Path sessions are language-independent and filesystem-backed; they
+    // refilter/re-gather on their own rather than via language triggers.
+    if comp.is_path_session {
+        update_path_completion_after_insert(comp, eb);
+        return;
+    }
     if eb.sels.len() > 1 {
         trace::note("update_completion: skip (multi-cursor)");
         comp.close();
         return;
     }
+    let cursor = eb.sels.primary().head;
+    let bytes = collect_bytes(&eb.buffer);
+
+    // Auto-trigger: typing a path separator (with a non-whitespace char
+    // before it, e.g. `./`, `../`, `src/`) opens path completion when it
+    // resolves to a real directory. Self-limiting — in non-path contexts
+    // `complete` finds no resolving directory and returns None, so nothing
+    // pops up. Runs before the language check so it works in any buffer.
+    if medit::path_complete::separator_should_autotrigger(&bytes, cursor)
+        && let Some(pc) = medit::path_complete::complete(&bytes, cursor)
+    {
+        comp.set_path_items(pc);
+        return;
+    }
+
     let lang = match eb.lang_id {
         Some(l) => l,
         None => {
@@ -2230,8 +2399,6 @@ fn update_completion_after_insert(comp: &mut CompletionUi, eb: &EditorBuffer) {
             return;
         }
     };
-    let cursor = eb.sels.primary().head;
-    let bytes = collect_bytes(&eb.buffer);
 
     // Refilter the existing popup against the new prefix. If the
     // cursor moved out of the replacement range (e.g. backspace past
