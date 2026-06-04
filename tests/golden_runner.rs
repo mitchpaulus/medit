@@ -121,6 +121,7 @@ fn run_test_file(path: &Path) -> Result<(), String> {
                     24,
                     &cached_bytes,
                     &line_starts,
+                    None,
                     k,
                 );
                 // LSP / jump actions are not dispatched in tests (no

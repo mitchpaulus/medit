@@ -5,6 +5,7 @@ use std::io;
 
 use crate::buffer::{Buffer, CursorSnapshot};
 use crate::input::{Key, KeyEvent, Mods};
+use tree_sitter::Tree;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -476,6 +477,126 @@ fn bracket_object(
     }
 }
 
+/// Container node kinds whose first child is the opening delimiter token and
+/// whose last child is the closing delimiter token. Covers mshell bracket
+/// groups and keyword blocks; see `grammars/mshell/...`.
+const MATCH_NODES: &[&str] = &[
+    "quotation",
+    "list",
+    "dict",
+    "grid",
+    "definition",
+    "match_block",
+    "if_block",
+    "prefix_quote_block",
+];
+
+/// Bracket pairs for the byte-based fallback (buffers with no parse tree).
+/// Mirrors Vim's default `%`.
+const BRACKET_PAIRS: &[(u8, u8)] = &[(b'(', b')'), (b'[', b']'), (b'{', b'}')];
+
+/// `%` matching. With a parse tree, walk to the container whose opening or
+/// closing delimiter sits under the cursor and select the whole node. Without
+/// a tree, fall back to byte-based bracket matching.
+///
+/// Returns `(anchor, head)` for a Kakoune-inclusive selection spanning the
+/// whole pair; `head` lands on the delimiter we jumped to so the span is ready
+/// for `d`/`c`.
+pub fn match_pair(bytes: &[u8], tree: Option<&Tree>, head: usize) -> Option<(usize, usize)> {
+    if let Some(tree) = tree {
+        // matchit behavior: try the delimiter under the cursor, otherwise
+        // scan forward on the current line for the first one.
+        let le = line_end(bytes, head);
+        let mut o = head;
+        loop {
+            if let Some(r) = match_at_tree(bytes, tree, o) {
+                return Some(r);
+            }
+            if o >= le {
+                return None;
+            }
+            o = next_char_or_end(bytes, o);
+        }
+    } else {
+        match_bracket_bytes(bytes, head)
+    }
+}
+
+/// If byte `off` sits on the opening or closing delimiter of a matchable
+/// container node, return the `(anchor, head)` spanning that node.
+fn match_at_tree(bytes: &[u8], tree: &Tree, off: usize) -> Option<(usize, usize)> {
+    let mut node = tree.root_node().descendant_for_byte_range(off, off)?;
+    loop {
+        if MATCH_NODES.contains(&node.kind()) {
+            let open = node.child(0)?;
+            let close = node.child(node.child_count().checked_sub(1)?)?;
+            let on_open = off >= open.start_byte() && off < open.end_byte();
+            let on_close = off >= close.start_byte() && off < close.end_byte();
+            if on_open || on_close {
+                let start = node.start_byte();
+                let last = snap_to_char_or_last(bytes, node.end_byte().saturating_sub(1));
+                // Cursor (head) lands on the delimiter we jumped to; the span
+                // is identical either way so the whole block is selected.
+                return Some(if on_open { (start, last) } else { (last, start) });
+            }
+        }
+        node = node.parent()?;
+    }
+}
+
+/// Byte-based `%` for buffers without a parse tree: find the bracket at or
+/// after the cursor on the current line and select to its partner, with
+/// nesting. Scans `() [] {}` only, like Vim's default `%`.
+fn match_bracket_bytes(bytes: &[u8], head: usize) -> Option<(usize, usize)> {
+    let le = line_end(bytes, head);
+    let mut pos = head;
+    let (open, close, is_open) = loop {
+        let b = *bytes.get(pos)?;
+        if let Some(&(o, c)) = BRACKET_PAIRS.iter().find(|&&(o, c)| b == o || b == c) {
+            break (o, c, b == o);
+        }
+        if pos >= le {
+            return None;
+        }
+        pos = next_char_or_end(bytes, pos);
+    };
+    if is_open {
+        let mut depth: i32 = 1;
+        let mut j = pos + 1;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if b == open {
+                depth += 1;
+            } else if b == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((pos, j));
+                }
+            }
+            j += 1;
+        }
+        None
+    } else {
+        let mut depth: i32 = 1;
+        let mut i = pos;
+        loop {
+            if i == 0 {
+                return None;
+            }
+            i -= 1;
+            let b = bytes[i];
+            if b == close {
+                depth += 1;
+            } else if b == open {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((pos, i));
+                }
+            }
+        }
+    }
+}
+
 /// Returns `true` if this key was a quit request.
 /// `cached_bytes` / `cached_line_starts`: pre-built flat byte view and
 /// line-starts index from the caller's cache. Both stay valid through
@@ -503,6 +624,7 @@ pub fn handle_normal(
     viewport_rows: usize,
     cached_bytes: &[u8],
     cached_line_starts: &[usize],
+    tree: Option<&Tree>,
     k: KeyEvent,
 ) -> bool {
     let bytes: &[u8] = cached_bytes;
@@ -535,6 +657,19 @@ pub fn handle_normal(
     }
     if k.mods.is_empty() && k.key == Key::Char('[') {
         *pending_bracket = Some(BracketDir::Prev);
+        return false;
+    }
+
+    // `%` jumps to the matching pair (bracket group or mshell keyword block),
+    // selecting the whole bounded region so it can be deleted/changed.
+    if k.mods.is_empty() && k.key == Key::Char('%') {
+        for sel in sels.iter_mut() {
+            if let Some((anchor, head)) = match_pair(bytes, tree, sel.head) {
+                sel.anchor = anchor;
+                sel.head = head;
+                sel.desired_col = display_col(bytes, line_start(bytes, head), head);
+            }
+        }
         return false;
     }
 

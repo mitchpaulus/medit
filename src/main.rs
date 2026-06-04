@@ -1802,6 +1802,7 @@ fn main() -> io::Result<()> {
                         top_line,
                         cached_bytes,
                         line_starts,
+                        tree,
                         ..
                     } = cur;
                     if handle_normal(
@@ -1824,6 +1825,7 @@ fn main() -> io::Result<()> {
                         viewport_rows,
                         cached_bytes,
                         line_starts,
+                        tree.as_ref(),
                         k,
                     ) {
                         // Normal-mode `q` closes the active buffer. Clean

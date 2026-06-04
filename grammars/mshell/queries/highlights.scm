@@ -19,12 +19,21 @@
 (keyword)      @keyword
 (type_keyword) @type.builtin
 
-; Built-in functions / stack operators — intentionally unhighlighted by default.
-; (builtin) @function.builtin
+; Block keywords now consumed as literals by definition/match_block/if_block
+"def"   @keyword
+"match" @keyword
+"if"    @keyword
+"else"  @keyword
+"else*" @keyword
+"*if"   @keyword
+"end"   @keyword
+
+; Built-in functions / stack operators
+(builtin) @function.builtin
 
 ; Variables
-(var_retrieve) @variable.retrieve
-(var_store)    @variable.store
+(var_retrieve) @variable
+(var_store)    @variable
 
 ; Environment variables
 (env_retrieve) @variable.builtin
@@ -34,6 +43,9 @@
 
 ; Prefix-quote references like `filter.`
 (prefix_quote) @function
+
+; Field getters like `:name`, `:'children'`
+(getter) @property
 
 ; Indexers
 (indexer)        @operator
@@ -49,6 +61,10 @@
 
 ; General punctuation
 (punctuation) @punctuation.delimiter
+
+; Structural separators: dict/grid/match commas and dict/match `:`
+"," @punctuation.delimiter
+":" @punctuation.delimiter
 
 ; Brackets
 "["  @punctuation.bracket

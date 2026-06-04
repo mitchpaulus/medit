@@ -8,10 +8,11 @@
 //! Trigger rules are hardcoded per language ([`triggers_for`]) for v1:
 //! - **Python**: trigger character `.`; otherwise auto-trigger when the
 //!   identifier prefix at the cursor first reaches two characters.
-//! - **mshell**: trigger character `@` (variable completion). The `@`
-//!   itself is part of the replacement range — the server returns
-//!   items that include the `@` prefix. Also auto-triggers when the
-//!   identifier prefix at the cursor first reaches three characters.
+//! - **mshell**: trigger characters `@` (variable completion) and `$`
+//!   (environment variable completion). The sign itself is part of the
+//!   replacement range — the server returns items that include the
+//!   `@`/`$` prefix. Also auto-triggers when the identifier prefix at
+//!   the cursor first reaches three characters.
 
 /// Per-language rules for when to open the completion popup.
 pub struct CompletionTriggers {
@@ -71,10 +72,16 @@ pub fn triggers_for(lang_id: &str) -> Option<CompletionTriggers> {
             min_identifier_prefix: Some(2),
         }),
         "mshell" => Some(CompletionTriggers {
-            chars: &[TriggerChar {
-                ch: '@',
-                anchor_includes_char: true,
-            }],
+            chars: &[
+                TriggerChar {
+                    ch: '@',
+                    anchor_includes_char: true,
+                },
+                TriggerChar {
+                    ch: '$',
+                    anchor_includes_char: true,
+                },
+            ],
             min_identifier_prefix: Some(3),
         }),
         // Markdown/djot has no LSP; completions come from words already in
@@ -392,6 +399,13 @@ mod tests {
         let d = detect(b"echo @", 6, &msh());
         // `@` is part of the replacement — anchor sits at it.
         assert_eq!(parts(&d), Some((6, 5, Some('@'))));
+    }
+
+    #[test]
+    fn mshell_dollar_anchors_at_dollar_sign() {
+        let d = detect(b"echo $", 6, &msh());
+        // `$` (env var) behaves like `@` — anchor includes the sign.
+        assert_eq!(parts(&d), Some((6, 5, Some('$'))));
     }
 
     #[test]
