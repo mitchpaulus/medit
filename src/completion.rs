@@ -13,6 +13,12 @@
 //!   replacement range — the server returns items that include the
 //!   `@`/`$` prefix. Also auto-triggers when the identifier prefix at
 //!   the cursor first reaches three characters.
+//! - **Everything else** (unrecognized file types and any registered
+//!   language without an LSP): the [`DEFAULT_TRIGGERS`] fallback, surfaced
+//!   through [`effective_triggers`] — no trigger characters, auto-trigger
+//!   at a three-character word prefix, with candidates gathered from the
+//!   words already in the buffer ([`buffer_word_items`]). This guarantees
+//!   every buffer gets word completion from its own contents.
 
 /// Per-language rules for when to open the completion popup.
 pub struct CompletionTriggers {
@@ -84,9 +90,11 @@ pub fn triggers_for(lang_id: &str) -> Option<CompletionTriggers> {
             ],
             min_identifier_prefix: Some(3),
         }),
-        // Markdown/djot has no LSP; completions come from words already in
-        // the buffer (see [`is_buffer_source`]). Auto-trigger once the word
-        // prefix at the cursor first reaches three characters.
+        // Markdown/djot has no LSP; like any LSP-less buffer it completes
+        // from the words already present (the rules here match
+        // [`DEFAULT_TRIGGERS`]). Kept explicit to document the intent:
+        // auto-trigger once the word prefix at the cursor first reaches
+        // three characters.
         "djot" => Some(CompletionTriggers {
             chars: &[],
             min_identifier_prefix: Some(3),
@@ -95,11 +103,22 @@ pub fn triggers_for(lang_id: &str) -> Option<CompletionTriggers> {
     }
 }
 
-/// Languages whose completions are served from the buffer's own words
-/// rather than an LSP server. The main loop fills the popup synchronously
-/// via [`buffer_word_items`] instead of sending a request.
-pub fn is_buffer_source(lang_id: &str) -> bool {
-    matches!(lang_id, "djot")
+/// Trigger rules for any buffer without language-specific completion:
+/// no trigger characters, auto-trigger once the word prefix at the cursor
+/// first reaches three characters. Applies to unrecognized file types and
+/// to registered languages without an LSP — they all complete from the
+/// words already in the buffer ([`buffer_word_items`]).
+pub const DEFAULT_TRIGGERS: CompletionTriggers = CompletionTriggers {
+    chars: &[],
+    min_identifier_prefix: Some(3),
+};
+
+/// The trigger rules in effect for a buffer, given its language id
+/// (`None` for an unrecognized file type). Languages with explicit rules
+/// ([`triggers_for`]) use them; everything else falls back to
+/// [`DEFAULT_TRIGGERS`] so every buffer can complete from its own words.
+pub fn effective_triggers(lang: Option<&str>) -> CompletionTriggers {
+    lang.and_then(triggers_for).unwrap_or(DEFAULT_TRIGGERS)
 }
 
 /// Largest number of buffer words to offer at once. The popup only shows a
@@ -548,9 +567,19 @@ mod tests {
     }
 
     #[test]
-    fn djot_is_buffer_source() {
-        assert!(is_buffer_source("djot"));
-        assert!(!is_buffer_source("python"));
+    fn effective_triggers_falls_back_for_unknown_and_lspless() {
+        // Unrecognized file type (no lang id): default buffer-word rules.
+        let d = effective_triggers(None);
+        assert!(d.chars.is_empty());
+        assert_eq!(d.min_identifier_prefix, Some(3));
+        // A registered language with no explicit rules also gets the
+        // fallback rather than nothing.
+        let r = effective_triggers(Some("rust"));
+        assert!(r.chars.is_empty());
+        assert_eq!(r.min_identifier_prefix, Some(3));
+        // Explicit languages keep their own rules.
+        assert_eq!(effective_triggers(Some("python")).min_identifier_prefix, Some(2));
+        assert_eq!(effective_triggers(Some("mshell")).chars.len(), 2);
     }
 
     #[test]

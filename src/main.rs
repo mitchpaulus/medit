@@ -2571,9 +2571,9 @@ fn update_path_completion_after_insert(comp: &mut CompletionUi, eb: &EditorBuffe
 /// Recompute completion state after an insert-mode mutation. Refilters
 /// the popup against the new prefix if one is open, and arms a
 /// debounced completion request if the keystroke landed on a trigger
-/// (per the language's `CompletionTriggers`). Closes the popup when
-/// multi-cursor is engaged, when the language doesn't have completion
-/// rules, or when the cursor moved out of `[anchor..]`.
+/// (per the language's `CompletionTriggers`, or the buffer-word fallback
+/// for unrecognized/LSP-less buffers). Closes the popup when multi-cursor
+/// is engaged or when the cursor moved out of `[anchor..]`.
 fn update_completion_after_insert(comp: &mut CompletionUi, eb: &EditorBuffer) {
     // Path sessions are language-independent and filesystem-backed; they
     // refilter/re-gather on their own rather than via language triggers.
@@ -2601,22 +2601,11 @@ fn update_completion_after_insert(comp: &mut CompletionUi, eb: &EditorBuffer) {
         return;
     }
 
-    let lang = match eb.lang_id {
-        Some(l) => l,
-        None => {
-            trace::note("update_completion: skip (no lang_id)");
-            comp.close();
-            return;
-        }
-    };
-    let triggers = match medit::completion::triggers_for(lang) {
-        Some(t) => t,
-        None => {
-            trace::note(&format!("update_completion: skip (no triggers for lang={})", lang));
-            comp.close();
-            return;
-        }
-    };
+    // Every buffer has trigger rules: explicit per-language ones where we
+    // have them, otherwise the buffer-word fallback (no trigger chars,
+    // 3-char prefix) so unrecognized file types still complete from their
+    // own words.
+    let triggers = medit::completion::effective_triggers(eb.lang_id);
 
     // Refilter the existing popup against the new prefix. If the
     // cursor moved out of the replacement range (e.g. backspace past
@@ -2656,7 +2645,7 @@ fn update_completion_after_insert(comp: &mut CompletionUi, eb: &EditorBuffer) {
         };
         trace::note(&format!(
             "update_completion: trigger fired lang={} anchor={} cursor={} kind={:?}",
-            lang, anchor, cursor, trigger,
+            eb.lang_id.unwrap_or("none"), anchor, cursor, trigger,
         ));
         comp.pending = Some(PendingTrigger {
             anchor,
@@ -2708,32 +2697,33 @@ fn maybe_fire_completion(
         trace::note("fire_completion: skip (cursor moved past anchor)");
         return;
     }
-    let lang = match cur.lang_id {
+    // Completion source: an LSP server when the buffer has a recognized
+    // language with one registered, otherwise the buffer's own words. The
+    // buffer-word path covers unrecognized file types and any language
+    // without an LSP, so every buffer gets word completion. No server
+    // round trip — gather matching words from the buffer synchronously.
+    let lsp_lang = cur
+        .lang_id
+        .filter(|l| Highlighter::lsp_command_for_lang(l).is_some());
+    let lang = match lsp_lang {
         Some(l) => l,
         None => {
-            trace::note("fire_completion: skip (no lang_id)");
+            let bytes = collect_bytes(&cur.buffer);
+            let prefix = String::from_utf8_lossy(&bytes[pending.anchor..cursor]).into_owned();
+            let items = medit::completion::buffer_word_items(&bytes, &prefix);
+            trace::note(&format!(
+                "fire_completion: buffer source lang={} prefix={:?} items={}",
+                cur.lang_id.unwrap_or("none"),
+                prefix,
+                items.len()
+            ));
+            if items.is_empty() {
+                return;
+            }
+            comp.set_items(items, pending.anchor, prefix);
             return;
         }
     };
-
-    // Buffer-word source (markdown/djot): no server round trip — gather
-    // matching words from the buffer and fill the popup synchronously.
-    if medit::completion::is_buffer_source(lang) {
-        let bytes = collect_bytes(&cur.buffer);
-        let prefix = String::from_utf8_lossy(&bytes[pending.anchor..cursor]).into_owned();
-        let items = medit::completion::buffer_word_items(&bytes, &prefix);
-        trace::note(&format!(
-            "fire_completion: buffer source lang={} prefix={:?} items={}",
-            lang,
-            prefix,
-            items.len()
-        ));
-        if items.is_empty() {
-            return;
-        }
-        comp.set_items(items, pending.anchor, prefix);
-        return;
-    }
 
     let cur_uri = match cur.path.as_ref().and_then(|p| lsp::path_to_uri(p).ok()) {
         Some(u) => u,
