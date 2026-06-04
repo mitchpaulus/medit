@@ -10,6 +10,7 @@ pub mod indent;
 pub mod input;
 pub mod jumps;
 pub mod lsp;
+pub mod palette;
 pub mod path_complete;
 pub mod theme;
 pub mod trace;

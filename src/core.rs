@@ -490,6 +490,8 @@ pub fn handle_normal(
     registers: &mut Registers,
     pending_g: &mut bool,
     pending_z: &mut bool,
+    pending_space: &mut bool,
+    open_palette: &mut bool,
     pending_object: &mut Option<ObjectKind>,
     pending_find: &mut Option<FindOp>,
     pending_bracket: &mut Option<BracketDir>,
@@ -578,6 +580,24 @@ pub fn handle_normal(
     }
     if k.mods == Mods::ALT && k.key == Key::Char('a') {
         *pending_object = Some(ObjectKind::Around);
+        return false;
+    }
+
+    // `<Space>` is the which-key leader. Resolve the follow-up key. For now
+    // the only binding is `p` → open the command palette; unknown keys just
+    // cancel the leader.
+    if *pending_space {
+        *pending_space = false;
+        if k.mods.is_empty()
+            && let Key::Char('p') = k.key
+        {
+            *open_palette = true;
+        }
+        return false;
+    }
+
+    if k.mods.is_empty() && k.key == Key::Char(' ') {
+        *pending_space = true;
         return false;
     }
 

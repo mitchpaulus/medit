@@ -238,6 +238,9 @@ fn spawn_tick_thread(tx: mpsc::Sender<MainEvent>) {
 const SEL_BG: &str = "\x1b[48;5;24m";
 const MATCH_BG: &str = "\x1b[48;5;94m";
 const LINENO_FG: &str = "\x1b[38;5;240m";
+// Faint foreground for visualized whitespace glyphs (`→` for tab, `·` for
+// space) when the "show whitespace" view toggle is on.
+const WS_FG: &str = "\x1b[38;5;240m";
 
 // Diagnostic underlines: curly underline (`4:3`) with severity-tinted
 // underline color (`58:5:N`). Terminals that don't support curly fall
@@ -784,6 +787,153 @@ fn draw_prompt(screen: &mut Screen, prompt: &Prompt, rows: u16, cols: u16) {
     screen.write_at(top + box_h - 1, left, &bot_line);
 }
 
+/// Render the command palette: a centered bordered box with a query input
+/// row on top and the filtered command list below. The highlighted row is
+/// reverse-video; an empty result set shows a dim "(no matches)" line. The
+/// visible window scrolls to keep the selection in view. Drawn last in the
+/// frame so it overlays the buffer.
+fn draw_command_palette(screen: &mut Screen, pal: &medit::palette::CommandPalette, rows: u16, cols: u16) {
+    const BORDER: &str = "\x1b[38;5;139m"; // muted purple, matches completion
+    const PROMPT_FG: &str = "\x1b[38;5;110m"; // pale cyan for the `>` prompt
+    const SEL: &str = "\x1b[7m"; // reverse video for the highlighted row
+    const DIM: &str = "\x1b[38;5;243m";
+    const RESET: &str = "\x1b[0m";
+    const MAX_ROWS: usize = 10;
+
+    // The visible window of `filtered`, scrolled so `selected` is in view.
+    let total = pal.filtered.len();
+    let take = total.min(MAX_ROWS);
+    let last_window_start = total.saturating_sub(take);
+    let win_start = pal
+        .selected
+        .saturating_sub(MAX_ROWS.saturating_sub(1))
+        .min(last_window_start);
+
+    // Text rows to render inside the box: the query line, then list rows.
+    // Each carries a style tag so the row body is wrapped appropriately.
+    enum RowStyle {
+        Query,
+        Normal,
+        Selected,
+        Dim,
+    }
+    let mut content: Vec<(String, RowStyle)> = Vec::new();
+    content.push((format!("> {}", pal.query), RowStyle::Query));
+    if total == 0 {
+        content.push(("(no matches)".to_string(), RowStyle::Dim));
+    } else {
+        for k in 0..take {
+            let cmd_idx = pal.filtered[win_start + k];
+            let title = pal.commands[cmd_idx].title;
+            let style = if win_start + k == pal.selected {
+                RowStyle::Selected
+            } else {
+                RowStyle::Normal
+            };
+            content.push((title.to_string(), style));
+        }
+    }
+
+    // Box geometry. Width fits the widest row, with a sane minimum, clamped
+    // to the terminal.
+    let max_text = content
+        .iter()
+        .map(|(s, _)| s.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(24);
+    let max_text = max_text.min((cols as usize).saturating_sub(4));
+    let inner_w = max_text + 2; // one space pad each side
+    let box_w = inner_w as u16 + 2; // vertical borders
+    let box_h = content.len() as u16 + 2; // horizontal borders
+
+    if box_w >= cols || box_h >= rows {
+        return; // window too small — skip rather than mangle
+    }
+    let top = (rows.saturating_sub(box_h)) / 3; // upper third reads better
+    let left = (cols.saturating_sub(box_w)) / 2;
+
+    // Top border.
+    let mut top_line = String::with_capacity(box_w as usize * 3);
+    top_line.push_str(BORDER);
+    top_line.push('┌');
+    for _ in 0..inner_w {
+        top_line.push('─');
+    }
+    top_line.push('┐');
+    top_line.push_str(RESET);
+    screen.write_at(top, left, &top_line);
+
+    for (i, (text, style)) in content.iter().enumerate() {
+        // Truncate over-long text to the inner text width.
+        let shown: String = text.chars().take(max_text).collect();
+        let visible = shown.chars().count();
+        let pad = max_text.saturating_sub(visible);
+
+        let mut row_str = String::with_capacity(box_w as usize * 4);
+        row_str.push_str(BORDER);
+        row_str.push('│');
+        row_str.push_str(RESET);
+        match style {
+            RowStyle::Selected => {
+                // Reverse-video spans the full inner width (pad + text) so the
+                // whole row highlights.
+                row_str.push_str(SEL);
+                row_str.push(' ');
+                row_str.push_str(&shown);
+                for _ in 0..pad {
+                    row_str.push(' ');
+                }
+                row_str.push(' ');
+                row_str.push_str(RESET);
+            }
+            RowStyle::Query => {
+                row_str.push(' ');
+                row_str.push_str(PROMPT_FG);
+                row_str.push_str(&shown);
+                row_str.push_str(RESET);
+                for _ in 0..pad {
+                    row_str.push(' ');
+                }
+                row_str.push(' ');
+            }
+            RowStyle::Dim => {
+                row_str.push(' ');
+                row_str.push_str(DIM);
+                row_str.push_str(&shown);
+                row_str.push_str(RESET);
+                for _ in 0..pad {
+                    row_str.push(' ');
+                }
+                row_str.push(' ');
+            }
+            RowStyle::Normal => {
+                row_str.push(' ');
+                row_str.push_str(&shown);
+                for _ in 0..pad {
+                    row_str.push(' ');
+                }
+                row_str.push(' ');
+            }
+        }
+        row_str.push_str(BORDER);
+        row_str.push('│');
+        row_str.push_str(RESET);
+        screen.write_at(top + 1 + i as u16, left, &row_str);
+    }
+
+    // Bottom border.
+    let mut bot_line = String::with_capacity(box_w as usize * 3);
+    bot_line.push_str(BORDER);
+    bot_line.push('└');
+    for _ in 0..inner_w {
+        bot_line.push('─');
+    }
+    bot_line.push('┘');
+    bot_line.push_str(RESET);
+    screen.write_at(top + box_h - 1, left, &bot_line);
+}
+
 /// LSP hover popup. Wraps `text` into lines, draws a bordered box near
 /// the cursor (below if there's room, above otherwise) with a cyan border
 /// so it visually parallels the diag popup without being mistaken for one.
@@ -1274,6 +1424,8 @@ fn present(
     hover: Option<&str>,
     spinner_idx: usize,
     comp: &CompletionUi,
+    palette: Option<&medit::palette::CommandPalette>,
+    show_whitespace: bool,
 ) -> io::Result<()> {
     let viewport_rows = screen.rows.saturating_sub(1) as usize;
     {
@@ -1318,6 +1470,8 @@ fn present(
         hover,
         spinner_glyph,
         Some(comp),
+        palette,
+        show_whitespace,
     )
 }
 
@@ -1361,6 +1515,11 @@ fn main() -> io::Result<()> {
     let mut pending_j = false;
     let mut pending_g = false;
     let mut pending_z = false;
+    // `<Space>` leader state. `pending_space` is set after the leader key;
+    // `open_palette` is the signal `handle_normal` raises to ask the main
+    // loop to open the command palette.
+    let mut pending_space = false;
+    let mut open_palette = false;
     let mut pending_find: Option<medit::core::FindOp> = None;
     let mut pending_bracket: Option<medit::core::BracketDir> = None;
     let mut pending_object: Option<ObjectKind> = None;
@@ -1377,6 +1536,14 @@ fn main() -> io::Result<()> {
     // consumed by `handle_prompt` instead of being routed to the active
     // mode, and the prompt box overlays the editor view.
     let mut prompt: Option<Prompt> = None;
+    // Command palette overlay. When `Some`, keypresses are routed to
+    // `handle_palette` (filter/navigate/accept) and the palette box overlays
+    // the view, just like `prompt`.
+    let mut palette: Option<medit::palette::CommandPalette> = None;
+    // Editor-wide "visualize control characters" toggle (tabs as `→`,
+    // spaces as `·`). Flipped by the palette's "Toggle whitespace display"
+    // command. Applies to every buffer.
+    let mut show_whitespace = false;
     // LSP hover text to display in a popup near the cursor. Set by `gh`
     // (and similar) and cleared on the next normal-mode keystroke.
     let mut hover: Option<String> = None;
@@ -1433,6 +1600,8 @@ fn main() -> io::Result<()> {
         hover.as_deref(),
         spinner_idx,
         &comp,
+        palette.as_ref(),
+        show_whitespace,
     )?;
 
     let mut parser = Parser::new();
@@ -1468,6 +1637,8 @@ fn main() -> io::Result<()> {
                         hover.as_deref(),
                         spinner_idx,
                         &comp,
+                        palette.as_ref(),
+                        show_whitespace,
                     )?;
                     let render_ns = trace::toc(render_start);
                     trace::emit_frame(
@@ -1567,6 +1738,39 @@ fn main() -> io::Result<()> {
                     PromptOutcome::Dismiss => continue,
                 }
             }
+            // Intercept the command palette: while it's open, every key
+            // filters/navigates/accepts it instead of reaching the buffer.
+            if let Some(mut pal) = palette.take() {
+                match handle_palette(&mut pal, k) {
+                    PaletteOutcome::Stay => {
+                        palette = Some(pal);
+                    }
+                    PaletteOutcome::Close => {}
+                    PaletteOutcome::Run(action) => {
+                        match run_palette_action(
+                            action,
+                            &mut show_whitespace,
+                            &mut buffers,
+                            &mut current,
+                            &mut lsp_clients,
+                            &highlighter,
+                            watcher.as_mut(),
+                            &mut prompt,
+                            &mut ex_message,
+                            &main_tx,
+                        ) {
+                            AfterAction::Quit => return Ok(()),
+                            AfterAction::Continue => {}
+                        }
+                    }
+                }
+                // Each palette keystroke changes the overlay, so force a
+                // repaint. `dirty` is the accumulator read at the top of the
+                // loop; set it directly since `continue` skips the
+                // bottom-of-loop `should_render` assignment.
+                dirty = true;
+                continue;
+            }
             if k.mods.contains(Mods::CTRL) && k.key == Key::Char('c') {
                 match attempt_quit(&buffers) {
                     QuitOutcome::Quit => return Ok(()),
@@ -1607,6 +1811,8 @@ fn main() -> io::Result<()> {
                         &mut registers,
                         &mut pending_g,
                         &mut pending_z,
+                        &mut pending_space,
+                        &mut open_palette,
                         &mut pending_object,
                         &mut pending_find,
                         &mut pending_bracket,
@@ -1661,6 +1867,12 @@ fn main() -> io::Result<()> {
                             &mut ex_message,
                             &main_tx,
                         );
+                    }
+                    // `<Space>p` raised the open-palette signal — bring up the
+                    // overlay; the next keystroke routes to `handle_palette`.
+                    if open_palette {
+                        palette = Some(medit::palette::CommandPalette::new());
+                        open_palette = false;
                     }
                 }
                 Mode::Insert => {
@@ -3285,6 +3497,96 @@ enum AfterAction {
     Quit,
 }
 
+/// Result of routing a keystroke to the open command palette.
+enum PaletteOutcome {
+    /// Palette stays open (filtered, navigated, or an inert key).
+    Stay,
+    /// Palette dismissed without running anything (Esc).
+    Close,
+    /// User accepted a command; run this action then close.
+    Run(medit::palette::PaletteAction),
+}
+
+/// Route one keystroke to the open command palette. Esc dismisses; Enter
+/// accepts the highlighted command (or dismisses when nothing matches);
+/// Up/`Ctrl-P` and Down/`Ctrl-N` move the highlight; Backspace edits the
+/// query; any other printable char extends the query.
+fn handle_palette(pal: &mut medit::palette::CommandPalette, k: KeyEvent) -> PaletteOutcome {
+    match k.key {
+        Key::Esc => PaletteOutcome::Close,
+        Key::Enter => match pal.selected_action() {
+            Some(action) => PaletteOutcome::Run(action.clone()),
+            None => PaletteOutcome::Close,
+        },
+        Key::Up => {
+            pal.move_up();
+            PaletteOutcome::Stay
+        }
+        Key::Down => {
+            pal.move_down();
+            PaletteOutcome::Stay
+        }
+        Key::Char('p') if k.mods.contains(Mods::CTRL) => {
+            pal.move_up();
+            PaletteOutcome::Stay
+        }
+        Key::Char('n') if k.mods.contains(Mods::CTRL) => {
+            pal.move_down();
+            PaletteOutcome::Stay
+        }
+        Key::Backspace => {
+            pal.backspace();
+            PaletteOutcome::Stay
+        }
+        Key::Char(c) if !k.mods.contains(Mods::CTRL) && !k.mods.contains(Mods::ALT) => {
+            pal.insert_char(c);
+            PaletteOutcome::Stay
+        }
+        _ => PaletteOutcome::Stay,
+    }
+}
+
+/// Execute a chosen palette action. Editor-view toggles are handled inline;
+/// everything backed by an `ExAction` is forwarded to `dispatch_ex_action`
+/// so there's one source of truth for those behaviors.
+#[allow(clippy::too_many_arguments)]
+fn run_palette_action(
+    action: medit::palette::PaletteAction,
+    show_whitespace: &mut bool,
+    buffers: &mut Vec<EditorBuffer>,
+    current: &mut usize,
+    lsp_clients: &mut HashMap<&'static str, LspClient>,
+    highlighter: &Highlighter,
+    watcher: Option<&mut FileWatcher>,
+    prompt: &mut Option<Prompt>,
+    ex_message: &mut String,
+    main_tx: &mpsc::Sender<MainEvent>,
+) -> AfterAction {
+    use medit::palette::PaletteAction;
+    match action {
+        PaletteAction::ToggleWhitespace => {
+            *show_whitespace = !*show_whitespace;
+            *ex_message = if *show_whitespace {
+                "whitespace display on".to_string()
+            } else {
+                "whitespace display off".to_string()
+            };
+            AfterAction::Continue
+        }
+        PaletteAction::Ex(a) => dispatch_ex_action(
+            a,
+            buffers,
+            current,
+            lsp_clients,
+            highlighter,
+            watcher,
+            prompt,
+            ex_message,
+            main_tx,
+        ),
+    }
+}
+
 /// Handle a buffer-list-level Ex action. Loads/switches/lists buffers,
 /// runs saves, raises prompts for dirty closes, and signals quit-related
 /// transitions back to the main loop.
@@ -3445,6 +3747,8 @@ fn render_all(
     hover: Option<&str>,
     spinner: Option<char>,
     comp: Option<&CompletionUi>,
+    palette: Option<&medit::palette::CommandPalette>,
+    show_whitespace: bool,
 ) -> io::Result<()> {
     let cur = &buffers[current];
     let buffer_count = buffers.len();
@@ -3510,6 +3814,8 @@ fn render_all(
         hover,
         spinner,
         comp,
+        palette,
+        show_whitespace,
     )
 }
 
@@ -3535,6 +3841,8 @@ fn render(
     hover: Option<&str>,
     spinner: Option<char>,
     comp: Option<&CompletionUi>,
+    palette: Option<&medit::palette::CommandPalette>,
+    show_whitespace: bool,
 ) -> io::Result<()> {
     screen.begin_frame();
     let cols = screen.cols;
@@ -3688,12 +3996,49 @@ fn render(
             }
             b'\t' => {
                 let advance = 4 - ((col as usize - 1) % 4);
-                // Tabs only need a visible body when there's something to
-                // paint (selection bg, search highlight, or a diagnostic
-                // underline); otherwise we just advance. Clip the run to the
-                // horizontal window so a partially-scrolled tab paints only
-                // its visible cells.
-                if let (true, Some((scol, w, _))) = (
+                // With the whitespace toggle on, draw a faint `→` in the
+                // tab's first cell followed by padding. Otherwise tabs only
+                // need a visible body when there's something to paint
+                // (selection bg, search highlight, or a diagnostic
+                // underline); without that we just advance. Clip the run to
+                // the horizontal window so a partially-scrolled tab paints
+                // only its visible cells.
+                if show_whitespace {
+                    if let Some((scol, w, off)) =
+                        clip_run(col, advance as u16, left_col, content_cols)
+                    {
+                        // `→` (U+2192) occupies the tab's first cell, spaces
+                        // fill the rest. `→` is 3 bytes but one display cell;
+                        // `off` accounts for cells scrolled past the left
+                        // edge, so the arrow only appears when cell 0 is
+                        // visible.
+                        let mut body: Vec<u8> = Vec::with_capacity(w as usize + 2);
+                        for cell in 0..w as usize {
+                            if off + cell == 0 {
+                                body.extend_from_slice("→".as_bytes());
+                            } else {
+                                body.push(b' ');
+                            }
+                        }
+                        let glyph_fg = if fg_seq.is_some() { fg_seq } else { Some(WS_FG) };
+                        emit_styled_cell(
+                            screen,
+                            &mut cursor_at,
+                            &mut style_fg,
+                            &mut style_bg,
+                            &mut style_ul,
+                            row,
+                            scol + gutter,
+                            w,
+                            glyph_fg,
+                            bg,
+                            ul_seq,
+                            &body,
+                        );
+                    } else {
+                        cursor_at = None;
+                    }
+                } else if let (true, Some((scol, w, _))) = (
                     bg.is_some() || ul_seq.is_some(),
                     clip_run(col, advance as u16, left_col, content_cols),
                 ) {
@@ -3740,6 +4085,32 @@ fn render(
                     cursor_at = None;
                 }
                 col = col.saturating_add(2);
+                i += 1;
+            }
+            b' ' if show_whitespace => {
+                // Visualize a space as a faint `·` (U+00B7, one cell). Keep
+                // any selection/match background so highlighted spaces still
+                // read as selected.
+                if let Some((scol, _, _)) = clip_run(col, 1, left_col, content_cols) {
+                    let glyph_fg = if fg_seq.is_some() { fg_seq } else { Some(WS_FG) };
+                    emit_styled_cell(
+                        screen,
+                        &mut cursor_at,
+                        &mut style_fg,
+                        &mut style_bg,
+                        &mut style_ul,
+                        row,
+                        scol + gutter,
+                        1,
+                        glyph_fg,
+                        bg,
+                        ul_seq,
+                        "·".as_bytes(),
+                    );
+                } else {
+                    cursor_at = None;
+                }
+                col = col.saturating_add(1);
                 i += 1;
             }
             _ => {
@@ -3883,6 +4254,12 @@ fn render(
     // frame and visually win.
     if let Some(p) = prompt {
         draw_prompt(screen, p, screen.rows, cols);
+    }
+
+    // Command palette overlays everything, including a modal prompt (the two
+    // are never open at once in practice, but draw it last so it wins).
+    if let Some(pal) = palette {
+        draw_command_palette(screen, pal, screen.rows, cols);
     }
 
     let block_cursor = mode == Mode::Normal;

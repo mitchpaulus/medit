@@ -66,6 +66,8 @@ fn run_test_file(path: &Path) -> Result<(), String> {
     let mut pending_j = false;
     let mut pending_g = false;
     let mut pending_z = false;
+    let mut pending_space = false;
+    let mut open_palette = false;
     let mut pending_find: Option<medit::core::FindOp> = None;
     let mut pending_bracket: Option<medit::core::BracketDir> = None;
     let mut pending_object: Option<ObjectKind> = None;
@@ -106,6 +108,8 @@ fn run_test_file(path: &Path) -> Result<(), String> {
                     &mut registers,
                     &mut pending_g,
                     &mut pending_z,
+                    &mut pending_space,
+                    &mut open_palette,
                     &mut pending_object,
                     &mut pending_find,
                     &mut pending_bracket,
